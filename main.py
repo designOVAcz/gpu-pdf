@@ -906,13 +906,39 @@ class GPUPDFWidget(QOpenGLWidget):
                 # Use lower priority for high-quality render so immediate render goes first
                 viewer.renderer.add_page_to_queue(current_page, priority=False, quality=final_quality)
     
-    def zoom_in(self):
+    def zoom_in(self, cursor_pos=None):
+        old_zoom = self.zoom_factor
         self.zoom_factor = min(self.zoom_factor * 1.2, 10.0)
+        
+        # If cursor position is provided, adjust pan to zoom towards cursor
+        if cursor_pos is not None:
+            zoom_ratio = self.zoom_factor / old_zoom
+            # Convert cursor position to normalized coordinates (-1 to 1)
+            cursor_x = (cursor_pos.x() / self.width()) * 2.0 - 1.0
+            cursor_y = 1.0 - (cursor_pos.y() / self.height()) * 2.0
+            
+            # Adjust pan to keep cursor point stable
+            self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
+            self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
+        
         self.check_quality_change()
         self.update()
     
-    def zoom_out(self):
+    def zoom_out(self, cursor_pos=None):
+        old_zoom = self.zoom_factor
         self.zoom_factor = max(self.zoom_factor / 1.2, 0.1)
+        
+        # If cursor position is provided, adjust pan to zoom towards cursor
+        if cursor_pos is not None:
+            zoom_ratio = self.zoom_factor / old_zoom
+            # Convert cursor position to normalized coordinates (-1 to 1)
+            cursor_x = (cursor_pos.x() / self.width()) * 2.0 - 1.0
+            cursor_y = 1.0 - (cursor_pos.y() / self.height()) * 2.0
+            
+            # Adjust pan to keep cursor point stable
+            self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
+            self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
+        
         self.check_quality_change()
         self.update()
     
@@ -924,12 +950,13 @@ class GPUPDFWidget(QOpenGLWidget):
         self.update()
     
     def wheelEvent(self, event):
-        # Zoom with mouse wheel
+        # Zoom with mouse wheel towards cursor position
+        cursor_pos = event.position()
         delta = event.angleDelta().y()
         if delta > 0:
-            self.zoom_in()
+            self.zoom_in(cursor_pos)
         else:
-            self.zoom_out()
+            self.zoom_out(cursor_pos)
     
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -967,6 +994,10 @@ class PDFViewer(QMainWindow):
         
         self.renderer = None
         self.thumbnail_worker = None
+        
+        # Enable drag and drop
+        self.setAcceptDrops(True)
+        
         self.setup_ui()
         self.setup_shortcuts()
     
@@ -1007,12 +1038,12 @@ class PDFViewer(QMainWindow):
         original_zoom_out = self.pdf_widget.zoom_out
         original_reset_zoom = self.pdf_widget.reset_zoom
         
-        def update_zoom_in():
-            original_zoom_in()
+        def update_zoom_in(cursor_pos=None):
+            original_zoom_in(cursor_pos)
             self.zoom_slider.setValue(int(self.pdf_widget.zoom_factor * 100))
         
-        def update_zoom_out():
-            original_zoom_out()
+        def update_zoom_out(cursor_pos=None):
+            original_zoom_out(cursor_pos)
             self.zoom_slider.setValue(int(self.pdf_widget.zoom_factor * 100))
             
         def update_reset_zoom():
@@ -1279,6 +1310,29 @@ Press 'L' to cycle through modes."""
             self.showNormal()
         else:
             self.showFullScreen()
+    
+    def dragEnterEvent(self, event):
+        """Handle drag enter events"""
+        if event.mimeData().hasUrls():
+            # Check if any of the dragged files is a PDF
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and url.toLocalFile().lower().endswith('.pdf'):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+    
+    def dropEvent(self, event):
+        """Handle drop events"""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    if file_path.lower().endswith('.pdf'):
+                        self.load_pdf(file_path)
+                        event.acceptProposedAction()
+                        self.status_bar.showMessage(f"Dropped: {os.path.basename(file_path)}", 3000)
+                        return
+        event.ignore()
     
     def open_pdf_direct(self):
         """Open PDF file with minimal dialog implementation"""
