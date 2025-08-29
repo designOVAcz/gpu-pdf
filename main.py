@@ -49,7 +49,7 @@ try:
                                 QSpinBox, QProgressBar, QTextEdit, QSplitter, QFrame,
                                 QListWidget, QListWidgetItem, QCheckBox, QComboBox,
                                 QGroupBox, QGridLayout, QScrollArea, QStatusBar,
-                                QToolBar, QMenuBar, QMenu, QMessageBox)
+                                QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
     from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
                             QShortcut, QAction, QPalette, QColor, QActionGroup)
@@ -66,6 +66,9 @@ try:
 except ImportError:
     print("Please install OpenGL: pip install PyOpenGL PyOpenGL_accelerate numpy")
     sys.exit(1)
+
+# Increase Qt image allocation limit for large PDF pages (default is 256MB)
+os.environ['QT_IMAGEIO_MAXALLOC'] = '1024'  # Set to 1GB
 
 
 class GPUTextureCache:
@@ -996,6 +999,9 @@ class PDFViewer(QMainWindow):
         self.create_menu()
         self.create_toolbar()
         
+        # Hide menu bar for cleaner look
+        self.menuBar().hide()
+        
         # Connect zoom methods to update slider
         original_zoom_in = self.pdf_widget.zoom_in
         original_zoom_out = self.pdf_widget.zoom_out
@@ -1023,21 +1029,20 @@ class PDFViewer(QMainWindow):
     
     def create_left_panel(self):
         panel = QWidget()
-        panel.setFixedWidth(250)
+        panel.setFixedWidth(200)
         layout = QVBoxLayout(panel)
         
-        # Thumbnails
-        thumbnails_group = QGroupBox("Pages")
-        thumbnails_layout = QVBoxLayout()
-        
+        # Thumbnails without title
         self.thumbnail_list = QListWidget()
+        self.thumbnail_list.setStyleSheet("QListWidget { background-color: rgb(51, 51, 51); border: none; }")
+        self.thumbnail_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.thumbnail_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.thumbnail_list.setMovement(QListWidget.Movement.Static)
         self.thumbnail_list.setIconSize(QSize(120, 160))  # Thumbnail size
-        self.thumbnail_list.setSpacing(5)
+        self.thumbnail_list.setSpacing(20)
         self.thumbnail_list.itemClicked.connect(self.thumbnail_clicked)
-        thumbnails_layout.addWidget(self.thumbnail_list)
-        thumbnails_group.setLayout(thumbnails_layout)
+        layout.addWidget(self.thumbnail_list)
         
-        layout.addWidget(thumbnails_group)
         return panel
     
     def create_menu(self):
@@ -1142,10 +1147,17 @@ class PDFViewer(QMainWindow):
 
         # Grid size selector for single-row view
         self.grid_size_combo = QComboBox()
-        self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x1"])
+        self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x1", "5x2"])
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         self.grid_size_combo.setEnabled(False)
         toolbar.addWidget(self.grid_size_combo)
+
+        # Fullscreen action with better matching icon
+        fullscreen_action = QAction("⛶", self)
+        fullscreen_action.setCheckable(True)
+        fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        fullscreen_action.setToolTip("Toggle Fullscreen Mode (F11)")
+        toolbar.addAction(fullscreen_action)
 
         toolbar.addSeparator()
 
@@ -1536,7 +1548,7 @@ Press 'L' to cycle through modes."""
                 thumb = qimage.scaled(120, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 pixmap = QPixmap.fromImage(thumb)
                 qt_icon = QIcon(pixmap)
-                item = QListWidgetItem(qt_icon, f"Page {page_num + 1}")
+                item = QListWidgetItem(qt_icon, f"{page_num + 1}")
                 item.setData(Qt.ItemDataRole.UserRole, page_num)
                 self.thumbnail_list.addItem(item)
                 # Only update status every few thumbnails to reduce UI chatter
@@ -1550,7 +1562,7 @@ Press 'L' to cycle through modes."""
                     else:
                         # Fallback: create an item with the provided icon
                         qt_icon = img_or_icon if isinstance(img_or_icon, QIcon) else QIcon()
-                        item = QListWidgetItem(qt_icon, f"Page {page_num + 1}")
+                        item = QListWidgetItem(qt_icon, f"{page_num + 1}")
                         item.setData(Qt.ItemDataRole.UserRole, page_num)
                         self.thumbnail_list.addItem(item)
                     # Only update status every few thumbnails to reduce UI chatter
@@ -1781,11 +1793,11 @@ Press 'L' to cycle through modes."""
         except ValueError:
             pass
     
-    def toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
-        else:
+    def toggle_fullscreen(self, checked):
+        if checked:
             self.showFullScreen()
+        else:
+            self.showNormal()
     
     def closeEvent(self, event):
         if self.renderer:
@@ -1827,7 +1839,7 @@ if __name__ == "__main__":
         # Dark theme colors
         palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
         palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
+        palette.setColor(QPalette.ColorRole.Base, QColor(53,   53, 53))
         palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
         palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
         palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
@@ -1848,5 +1860,8 @@ if __name__ == "__main__":
     # Load PDF from command line if provided
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) and sys.argv[1].endswith('.pdf'):
         viewer.load_pdf(sys.argv[1])
+    
+    # Hide the menu bar as per the change request
+    viewer.menuBar().hide()
     
     sys.exit(app.exec())
