@@ -421,10 +421,12 @@ class GPUPDFWidget(QOpenGLWidget):
         """Render a single page with loading state support"""
         glLoadIdentity()
         
-        # If no texture available, show loading state
+        # If no texture available, show loading state only if a document is loaded
         if not self.page_texture or not self.page_texture.isCreated():
-            # Show a subtle loading indicator instead of blank screen
-            self.render_loading_state()
+            viewer = self.window()
+            # Check if the main window has a document loaded
+            if hasattr(viewer, 'pdf_doc') and viewer.pdf_doc is not None:
+                self.render_loading_state()
             return
         
         # Calculate aspect ratio correction
@@ -1138,9 +1140,9 @@ class PDFViewer(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Grid size selector (remove 1x1, add 5x5)
+        # Grid size selector for single-row view
         self.grid_size_combo = QComboBox()
-        self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x5"])
+        self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x1"])
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         self.grid_size_combo.setEnabled(False)
         toolbar.addWidget(self.grid_size_combo)
