@@ -43,3 +43,7 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. It is
     *   Use the mouse wheel to scroll through pages in single-page view.
     *   Click and drag to pan the document when zoomed in.
     *   Use the buttons on the toolbar to switch between single-page and grid views, and to navigate pages.
+
+## License
+
+MIT License.
