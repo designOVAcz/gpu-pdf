@@ -1,0 +1,19 @@
+# GPU-Accelerated PDF Viewer Requirements
+# Install with: pip install -r requirements.txt
+
+# PDF processing
+PyMuPDF>=1.23.0
+
+# GUI Framework
+PyQt6>=6.5.0
+PyQt6-Qt6>=6.5.0
+
+# OpenGL support
+PyOpenGL>=3.1.6
+PyOpenGL-accelerate>=3.1.6
+
+# Numerical processing
+numpy>=1.24.0
+
+# Optional: For better performance
+Pillow>=10.0.0
