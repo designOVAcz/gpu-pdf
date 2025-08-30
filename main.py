@@ -1072,6 +1072,11 @@ class PDFViewer(QMainWindow):
         self.thumbnail_list.setIconSize(QSize(120, 160))  # Thumbnail size
         self.thumbnail_list.setSpacing(20)
         self.thumbnail_list.itemClicked.connect(self.thumbnail_clicked)
+        
+        # Connect scroll events to detect when user reaches edges
+        scroll_bar = self.thumbnail_list.verticalScrollBar()
+        scroll_bar.valueChanged.connect(self._on_thumbnail_scroll)
+        
         layout.addWidget(self.thumbnail_list)
         
         return panel
@@ -1416,6 +1421,10 @@ Press 'L' to cycle through modes."""
             # Generate thumbnails
             self.generate_thumbnails()
             
+            # Initialize tracking variables for selective loading
+            if not hasattr(self, '_current_thumb_range'):
+                self._current_thumb_range = (0, min(30, self.total_pages - 1))  # Initial range
+            
             # Show final loaded status
             self.status_bar.showMessage(f"Loaded: {os.path.basename(pdf_path)} ({self.total_pages} pages)")
             
@@ -1537,34 +1546,70 @@ Press 'L' to cycle through modes."""
         if len(grid_textures) < pages_needed:
             self.pdf_widget.update()
     
-    def generate_thumbnails(self, around_page=None, radius=10):
+    def generate_thumbnails(self, around_page=None, radius=15, preserve_scroll=True):
         """Generate thumbnails selectively around current page or specified page
         
         Args:
             around_page: Page number to center loading around (uses current_page if None)
             radius: Number of pages to load before/after the center page
+            preserve_scroll: Whether to preserve current scroll position in thumbnail list
         """
         if not self.pdf_doc:
             return
-        
-        # Determine center page
-        center_page = around_page if around_page is not None else self.current_page
-        
-        # Calculate page range to load
-        start_page = max(0, center_page - radius)
-        end_page = min(self.total_pages - 1, center_page + radius)
         
         # If this is first load or user explicitly requested all pages, load everything
         if not hasattr(self, '_selective_thumbnails_enabled'):
             self._selective_thumbnails_enabled = self.total_pages > 50  # Enable for large docs
         
+        # Store current scroll position before modifying thumbnails
+        current_scroll_pos = None
+        if preserve_scroll and self._selective_thumbnails_enabled and self.thumbnail_list.count() > 0:
+            current_scroll_pos = self.thumbnail_list.verticalScrollBar().value()
+        
+        # Determine center page and calculate page range to load
+        center_page = around_page if around_page is not None else self.current_page
+        
         if not self._selective_thumbnails_enabled:
             # Load all thumbnails for smaller documents
             start_page = 0
             end_page = self.total_pages - 1
+            preserve_scroll = False  # No need to preserve scroll for small docs
+        else:
+            # Calculate selective page range
+            start_page = max(0, center_page - radius)
+            end_page = min(self.total_pages - 1, center_page + radius)
         
-        # Clear existing thumbnails if doing selective loading
-        if self._selective_thumbnails_enabled:
+        # Store range for scroll restoration and loading indicators
+        prev_range = getattr(self, '_current_thumb_range', None)
+        self._current_thumb_range = (start_page, end_page)
+        
+        # For selective loading, check if we can extend current range instead of full reload
+        if (self._selective_thumbnails_enabled and preserve_scroll and prev_range):
+            prev_start, prev_end = prev_range
+            
+            # If new range overlaps significantly with current range, extend instead of clearing
+            overlap_start = max(start_page, prev_start)
+            overlap_end = min(end_page, prev_end)
+            overlap_size = max(0, overlap_end - overlap_start + 1)
+            current_size = prev_end - prev_start + 1
+            
+            # If 70% or more overlap, extend range instead of full reload
+            if overlap_size >= current_size * 0.7:
+                # Load additional pages only
+                pages_to_add = []
+                for p in range(start_page, end_page + 1):
+                    if p < prev_start or p > prev_end:
+                        pages_to_add.append(p)
+                
+                if pages_to_add:
+                    # Load additional thumbnails without clearing existing ones
+                    self._load_additional_thumbnails(pages_to_add)
+                    return
+            else:
+                # Clear existing thumbnails for full reload
+                self.thumbnail_list.clear()
+        elif self._selective_thumbnails_enabled:
+            # Clear existing thumbnails if doing selective loading
             self.thumbnail_list.clear()
         
         try:
@@ -1582,7 +1627,7 @@ Press 'L' to cycle through modes."""
                 parent=self
             )
             self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
-            self.thumbnail_worker.finished.connect(self._on_thumbnails_finished)
+            self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(current_scroll_pos))
             
             if self._selective_thumbnails_enabled:
                 self.status_bar.showMessage(f"Loading thumbnails {start_page+1}-{end_page+1}...")
@@ -1592,6 +1637,27 @@ Press 'L' to cycle through modes."""
             self.thumbnail_worker.start()
         except Exception as e:
             print(f"Error starting thumbnail generation: {e}")
+    
+    def _load_additional_thumbnails(self, page_list):
+        """Load additional thumbnails without clearing existing ones"""
+        try:
+            if self.thumbnail_worker:
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker.wait()
+            
+            self.thumbnail_worker = ThumbnailWorker(
+                self.pdf_doc, 
+                page_list=page_list, 
+                limit=len(page_list), 
+                parent=self
+            )
+            self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+            self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(None))
+            
+            self.status_bar.showMessage(f"Loading {len(page_list)} additional thumbnails...")
+            self.thumbnail_worker.start()
+        except Exception as e:
+            print(f"Error loading additional thumbnails: {e}")
     
     def _on_thumbnail_ready(self, page_num, img_or_icon, item=None):
         # Accept either (page_num, QImage) from the new worker
@@ -1604,10 +1670,37 @@ Press 'L' to cycle through modes."""
                 qt_icon = QIcon(pixmap)
                 item = QListWidgetItem(qt_icon, f"{page_num + 1}")
                 item.setData(Qt.ItemDataRole.UserRole, page_num)
-                self.thumbnail_list.addItem(item)
+                
+                # Insert at correct position if we have a range, otherwise just append
+                if (hasattr(self, '_current_thumb_range') and 
+                    hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled):
+                    # Find correct position to insert
+                    inserted = False
+                    for i in range(self.thumbnail_list.count()):
+                        existing_item = self.thumbnail_list.item(i)
+                        existing_page = existing_item.data(Qt.ItemDataRole.UserRole)
+                        if existing_page is not None and existing_page > page_num:
+                            self.thumbnail_list.insertItem(i, item)
+                            inserted = True
+                            break
+                        elif existing_page == -2:  # "Load More Below" indicator
+                            self.thumbnail_list.insertItem(i, item)
+                            inserted = True
+                            break
+                    if not inserted:
+                        # Remove "Load More Below" indicator temporarily if it exists
+                        for i in range(self.thumbnail_list.count()):
+                            test_item = self.thumbnail_list.item(i)
+                            if test_item and test_item.data(Qt.ItemDataRole.UserRole) == -2:
+                                self.thumbnail_list.takeItem(i)
+                                break
+                        self.thumbnail_list.addItem(item)
+                else:
+                    self.thumbnail_list.addItem(item)
+                
                 # Only update status every few thumbnails to reduce UI chatter
-                if page_num % 3 == 0 or page_num < 3:
-                    self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1}/{self.total_pages})")
+                if page_num % 5 == 0 or page_num < 5:
+                    self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1})")
             else:
                 # Assume img_or_icon is a QIcon and item may be provided
                 try:
@@ -1620,23 +1713,74 @@ Press 'L' to cycle through modes."""
                         item.setData(Qt.ItemDataRole.UserRole, page_num)
                         self.thumbnail_list.addItem(item)
                     # Only update status every few thumbnails to reduce UI chatter
-                    if page_num % 3 == 0 or page_num < 3:
-                        self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1}/{self.total_pages})")
+                    if page_num % 5 == 0 or page_num < 5:
+                        self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1})")
                 except Exception:
                     pass
         except Exception:
             pass
     
-    def _on_thumbnails_finished(self):
+    def _on_thumbnails_finished(self, restore_scroll_pos=None):
+        """Handle thumbnail generation completion with optional scroll restoration"""
         try:
+            # Restore scroll position if provided
+            if restore_scroll_pos is not None and self.thumbnail_list.count() > 0:
+                QTimer.singleShot(50, lambda: self.thumbnail_list.verticalScrollBar().setValue(restore_scroll_pos))
+            
+            # Add loading indicators if in selective mode
+            if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
+                hasattr(self, '_current_thumb_range')):
+                self._add_loading_indicators()
+            
             self.status_bar.showMessage("Ready")
         except Exception:
-            pass
+            self.status_bar.showMessage("Ready")
+    
+    def _add_loading_indicators(self):
+        """Add visual indicators for more thumbnails above/below current range"""
+        if not hasattr(self, '_current_thumb_range'):
+            return
+        
+        start_page, end_page = self._current_thumb_range
+        
+        # Add "Load More Above" indicator if there are pages before current range
+        if start_page > 0:
+            load_above_item = QListWidgetItem("⬆️ Load Earlier Pages")
+            load_above_item.setData(Qt.ItemDataRole.UserRole, -1)  # Special marker
+            load_above_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            load_above_item.setBackground(QColor(70, 70, 70))
+            load_above_item.setForeground(QColor(200, 200, 200))
+            self.thumbnail_list.insertItem(0, load_above_item)
+        
+        # Add "Load More Below" indicator if there are pages after current range
+        if end_page < self.total_pages - 1:
+            load_below_item = QListWidgetItem("⬇️ Load Later Pages")
+            load_below_item.setData(Qt.ItemDataRole.UserRole, -2)  # Special marker
+            load_below_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            load_below_item.setBackground(QColor(70, 70, 70))
+            load_below_item.setForeground(QColor(200, 200, 200))
+            self.thumbnail_list.addItem(load_below_item)
     
     def thumbnail_clicked(self, item):
-        """Handle thumbnail click to navigate to page"""
+        """Handle thumbnail click to navigate to page or trigger loading"""
         if item:
             page_num = item.data(Qt.ItemDataRole.UserRole)
+            
+            # Handle special loading indicators
+            if page_num == -1:  # Load Earlier Pages
+                if hasattr(self, '_current_thumb_range'):
+                    start_page, end_page = self._current_thumb_range
+                    new_start = max(0, start_page - 20)  # Load 20 pages before
+                    self.generate_thumbnails(around_page=(new_start + end_page) // 2, radius=25, preserve_scroll=True)
+                return
+            elif page_num == -2:  # Load Later Pages
+                if hasattr(self, '_current_thumb_range'):
+                    start_page, end_page = self._current_thumb_range
+                    new_end = min(self.total_pages - 1, end_page + 20)  # Load 20 pages after
+                    self.generate_thumbnails(around_page=(start_page + new_end) // 2, radius=25, preserve_scroll=True)
+                return
+            
+            # Handle regular page navigation
             if page_num is not None and 0 <= page_num < self.total_pages:
                 # Store the requested page
                 old_page = self.current_page
@@ -1697,6 +1841,60 @@ Press 'L' to cycle through modes."""
                         self.pdf_widget.process_pending_images(max_items=5)
                     except Exception:
                         pass
+                            # Check if we need to load more thumbnails around the new page
+                if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
+                    hasattr(self, '_current_thumb_range')):
+                    start_page, end_page = self._current_thumb_range
+                    # If navigating near the edge of loaded range, preload more
+                    if page_num <= start_page + 3 or page_num >= end_page - 3:
+                        self.generate_thumbnails(around_page=page_num, radius=20, preserve_scroll=True)
+    
+    def _on_thumbnail_scroll(self, value):
+        """Handle thumbnail list scrolling to trigger loading more thumbnails"""
+        if not (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled):
+            return
+        
+        if not hasattr(self, '_current_thumb_range'):
+            return
+        
+        scroll_bar = self.thumbnail_list.verticalScrollBar()
+        max_value = scroll_bar.maximum()
+        
+        # Prevent excessive loading by using a timer
+        if not hasattr(self, '_scroll_load_timer'):
+            self._scroll_load_timer = QTimer()
+            self._scroll_load_timer.setSingleShot(True)
+            self._scroll_load_timer.timeout.connect(self._handle_edge_scroll)
+        
+        if self._scroll_load_timer.isActive():
+            self._scroll_load_timer.stop()
+        
+        # Check if scrolled near top or bottom (within 10% of edges)
+        near_top = value <= max_value * 0.1 and value < 50
+        near_bottom = value >= max_value * 0.9 and value > max_value - 50
+        
+        if near_top or near_bottom:
+            self._edge_scroll_direction = 'up' if near_top else 'down'
+            self._scroll_load_timer.start(300)  # Delay to avoid excessive loading
+    
+    def _handle_edge_scroll(self):
+        """Handle loading more thumbnails when scrolled to edge"""
+        if not hasattr(self, '_current_thumb_range') or not hasattr(self, '_edge_scroll_direction'):
+            return
+        
+        start_page, end_page = self._current_thumb_range
+        
+        if self._edge_scroll_direction == 'up' and start_page > 0:
+            # Load earlier pages
+            new_start = max(0, start_page - 15)
+            center_page = (new_start + end_page) // 2
+            self.generate_thumbnails(around_page=center_page, radius=20, preserve_scroll=True)
+            
+        elif self._edge_scroll_direction == 'down' and end_page < self.total_pages - 1:
+            # Load later pages
+            new_end = min(self.total_pages - 1, end_page + 15)
+            center_page = (start_page + new_end) // 2
+            self.generate_thumbnails(around_page=center_page, radius=20, preserve_scroll=True)
     
     def on_page_rendered(self, page_num: int, image: QImage, quality: float = 2.0):
         # Get actual page dimensions from PDF document for accurate aspect ratios
@@ -1757,7 +1955,12 @@ Press 'L' to cycle through modes."""
         
         # Update thumbnails around new current page if selective loading is enabled
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
-            self.generate_thumbnails(around_page=self.current_page, radius=15)
+            # Check if we need to extend thumbnail range
+            if hasattr(self, '_current_thumb_range'):
+                start_page, end_page = self._current_thumb_range
+                # If we're near the beginning of loaded range, load more earlier pages
+                if self.current_page <= start_page + 5 and start_page > 0:
+                    self.generate_thumbnails(around_page=self.current_page, radius=20, preserve_scroll=True)
         
         # Clean up distant textures to save memory
         self.pdf_widget.cleanup_distant_textures()
@@ -1785,7 +1988,12 @@ Press 'L' to cycle through modes."""
         
         # Update thumbnails around new current page if selective loading is enabled
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
-            self.generate_thumbnails(around_page=self.current_page, radius=15)
+            # Check if we need to extend thumbnail range
+            if hasattr(self, '_current_thumb_range'):
+                start_page, end_page = self._current_thumb_range
+                # If we're near the end of loaded range, load more later pages
+                if self.current_page >= end_page - 5 and end_page < self.total_pages - 1:
+                    self.generate_thumbnails(around_page=self.current_page, radius=20, preserve_scroll=True)
         
         # Clean up distant textures to save memory
         self.pdf_widget.cleanup_distant_textures()
