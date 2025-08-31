@@ -1119,6 +1119,9 @@ class PDFViewer(QMainWindow):
         # Enable drag and drop
         self.setAcceptDrops(True)
         
+        # Ensure all child widgets also accept drops
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptDrops, True)
+        
         self.setup_ui()
         self.setup_shortcuts()
     
@@ -1362,15 +1365,15 @@ class PDFViewer(QMainWindow):
 
         # Zoom controls
         zoom_in_action = QAction("🔍+", self)
-        zoom_in_action.triggered.connect(self.pdf_widget.zoom_in)
+        zoom_in_action.triggered.connect(self.zoom_in_clicked)
         toolbar.addAction(zoom_in_action)
 
         zoom_out_action = QAction("🔍-", self)
-        zoom_out_action.triggered.connect(self.pdf_widget.zoom_out)
+        zoom_out_action.triggered.connect(self.zoom_out_clicked)
         toolbar.addAction(zoom_out_action)
 
         reset_zoom_action = QAction("⌂", self)
-        reset_zoom_action.triggered.connect(self.pdf_widget.reset_zoom)
+        reset_zoom_action.triggered.connect(self.reset_zoom_clicked)
         toolbar.addAction(reset_zoom_action)
 
         toolbar.addSeparator()
@@ -1542,25 +1545,34 @@ Press 'L' to cycle through modes."""
     
     def dragEnterEvent(self, event):
         """Handle drag enter events"""
+        print(f"Drag enter detected with {len(event.mimeData().urls())} URLs")
         if event.mimeData().hasUrls():
             # Check if any of the dragged files is a PDF
             for url in event.mimeData().urls():
-                if url.isLocalFile() and url.toLocalFile().lower().endswith('.pdf'):
+                file_path = url.toLocalFile()
+                print(f"Checking file: {file_path}")
+                if url.isLocalFile() and file_path.lower().endswith('.pdf'):
+                    print("PDF file detected - accepting drag")
                     event.acceptProposedAction()
                     return
+        print("No PDF files found - ignoring drag")
         event.ignore()
     
     def dropEvent(self, event):
         """Handle drop events"""
+        print("Drop event received")
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     file_path = url.toLocalFile()
+                    print(f"Processing dropped file: {file_path}")
                     if file_path.lower().endswith('.pdf'):
+                        print(f"Loading PDF: {file_path}")
                         self.load_pdf(file_path)
                         event.acceptProposedAction()
                         self.status_bar.showMessage(f"Dropped: {os.path.basename(file_path)}", 3000)
                         return
+        print("Drop event ignored")
         event.ignore()
     
     def open_pdf_direct(self):
@@ -2252,9 +2264,44 @@ Press 'L' to cycle through modes."""
             self.page_label.setText(f"Page: {self.current_page + 1} / {self.total_pages}")
     
     def zoom_changed(self, value):
+        """Handle zoom slider changes"""
         zoom_factor = value / 100.0
-        self.pdf_widget.zoom_factor = zoom_factor
+        if self.pdf_widget.grid_mode and self.pdf_widget.is_temp_zoomed:
+            # Update temp zoom factor
+            self.pdf_widget.temp_zoom_factor = zoom_factor
+        else:
+            # Update normal zoom factor
+            self.pdf_widget.zoom_factor = zoom_factor
         self.pdf_widget.update()
+    
+    def zoom_in_clicked(self):
+        """Handle zoom in button click"""
+        if self.pdf_widget.grid_mode and self.pdf_widget.is_temp_zoomed:
+            # If in temp zoom mode, use temp zoom
+            self.pdf_widget.temp_zoom_factor = min(self.pdf_widget.temp_zoom_factor * 1.2, 10.0)
+            self.pdf_widget.update()
+        else:
+            # Normal zoom
+            self.pdf_widget.zoom_in()
+    
+    def zoom_out_clicked(self):
+        """Handle zoom out button click"""
+        if self.pdf_widget.grid_mode and self.pdf_widget.is_temp_zoomed:
+            # If in temp zoom mode, use temp zoom
+            self.pdf_widget.temp_zoom_factor = max(self.pdf_widget.temp_zoom_factor / 1.2, 0.1)
+            self.pdf_widget.update()
+        else:
+            # Normal zoom
+            self.pdf_widget.zoom_out()
+    
+    def reset_zoom_clicked(self):
+        """Handle reset zoom/center button click"""
+        if self.pdf_widget.grid_mode and self.pdf_widget.is_temp_zoomed:
+            # Reset temp zoom
+            self.pdf_widget.reset_grid_zoom()
+        else:
+            # Normal reset
+            self.pdf_widget.reset_zoom()
     
     def set_grid_size(self, size_text):
         """Set grid size via keyboard shortcut"""
