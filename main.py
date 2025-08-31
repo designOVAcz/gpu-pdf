@@ -11,7 +11,12 @@ Features:
   * Proportional: Row heights strictly follow page aspect ratios
 - Responsive gap sizing based on widget dimensions
 - Priority rendering queue for improved performance
-- Keyboard shortcuts: 'L' to cycle layout modes, 'Shift+L' for info
+- Keyboard shortcuts: 
+  * 'G' to toggle grid view
+  * '1-5' to set specific grid size (2x2, 3x3, 4x4, 5x1, 5x2)
+  * 'Tab' to cycle through grid sizes
+  * 'L' to cycle layout modes, 'Shift+L' for info
+  * 'F11' to toggle fullscreen mode
 - Zoom-adaptive image quality: Higher quality at higher zoom levels
 - Selective thumbnail loading: Only loads thumbnails around current page for large documents
 - Smart memory management: Automatically cleans up distant textures
@@ -353,31 +358,34 @@ class GPUPDFWidget(QOpenGLWidget):
         self.page_width = 1.0
         self.page_height = 1.0
         
+        # Quality threshold for zoom level
+        self.quality_zoom_threshold = 2.0  # Example value, adjust as needed
+        self.base_quality = 2.0 # Default rendering quality
+        self.max_quality = 6.0  # Maximum rendering quality to prevent excessive memory usage
+        self.last_zoom_quality = 2.0  # Track last quality used for zoom change detection
+
         # Grid view attributes
         self.grid_mode = False
         self.grid_cols = 1
         self.grid_rows = 1
-        self.grid_textures = {}  # page_num -> texture
-        # Cached grid layout: list of dicts with pixel positions and inner sizes
-        self._grid_cells = []
-        self._grid_cached_size = (0, 0, 0, 0)  # (w_px, h_px, cols, rows)
-        # Queue of (page_num, QImage, page_width, page_height, quality) to convert to textures
-        self._pending_images = []
+        self.grid_layout_mode = 'adaptive'  # 'adaptive', 'uniform', 'proportional'
+        self._grid_layout_cache = []
+        self._grid_cached_size = (0, 0, 0, 0)  # (width, height, cols, rows)
+        self.grid_textures = {}
         
         # Grid layout configuration
-        self.grid_layout_mode = 'adaptive'  # 'uniform', 'adaptive', or 'proportional'
         self.grid_gap_ratio = 0.01  # Gap as percentage of widget size (1% instead of 2%)
         self.grid_min_gap = 5.0     # Minimum gap in pixels (reduced from 10)
         self.grid_max_gap = 15.0    # Maximum gap in pixels (reduced from 30)
         self.grid_aspect_weight = 0.7  # How much to weight aspect ratios (0.0-1.0)
         
-        # Quality management based on zoom
-        self.base_quality = 2.0     # Base rendering quality
-        self.quality_zoom_threshold = 1.5  # Zoom level where quality starts increasing
-        self.max_quality = 4.0      # Maximum quality at high zoom levels
-        self.last_zoom_quality = self.base_quality  # Track quality changes
-            
-        # Mouse interaction
+        # Temporary zoom state for grid view
+        self.is_temp_zoomed = False
+        self.temp_zoom_factor = 1.0
+        self.temp_pan_x = 0.0
+        self.temp_pan_y = 0.0
+        
+        # Rendering and threading
         self.last_mouse_pos = QPointF()
         self.is_panning = False
         
@@ -416,7 +424,12 @@ class GPUPDFWidget(QOpenGLWidget):
             pass
         
         if self.grid_mode:
-            self.render_grid_view()
+            # Always call the grid renderer; let it decide which transform to apply
+            try:
+                self.render_grid_view(temp=self.is_temp_zoomed)
+            except TypeError:
+                # Fallback for older signature (defensive)
+                self.render_grid_view()
         else:
             self.render_single_page()
     
@@ -522,15 +535,24 @@ class GPUPDFWidget(QOpenGLWidget):
         # Keep animating by requesting another frame
         self.update()
     
-    def render_grid_view(self):
-        """Render multiple pages in a grid layout with proper aspect ratios"""
+    def render_grid_view(self, temp=False):
+        """Render multiple pages in a grid layout with proper aspect ratios
+
+        Args:
+            temp: if True, apply temporary zoom/pan (used when a thumbnail is focused)
+        """
         # Allow rendering even if textures dict is empty; slots are reserved and filled as textures arrive
         
         glLoadIdentity()
-        
-        # Apply zoom and pan transformations for grid view
-        glTranslatef(self.pan_x, self.pan_y, 0.0)
-        glScalef(self.zoom_factor, self.zoom_factor, 1.0)
+
+        # If a temporary zoom is requested, apply it instead of the regular pan/zoom
+        if temp and getattr(self, 'is_temp_zoomed', False):
+            glTranslatef(self.temp_pan_x, self.temp_pan_y, 0.0)
+            glScalef(self.temp_zoom_factor, self.temp_zoom_factor, 1.0)
+        else:
+            # Apply zoom and pan transformations for grid view
+            glTranslatef(self.pan_x, self.pan_y, 0.0)
+            glScalef(self.zoom_factor, self.zoom_factor, 1.0)
         
         # Prefer the viewer's current_page/total_pages when available
         viewer = self.window()
@@ -667,7 +689,8 @@ class GPUPDFWidget(QOpenGLWidget):
             page_aspects.append(aspect)
         avg_aspect = sum(page_aspects) / len(page_aspects) if page_aspects else 0.75
 
-        gap = 20.0
+        # Calculate responsive gap based on widget size and configuration
+        gap = min(max(self.grid_gap_ratio * min(w_px, h_px), self.grid_min_gap), self.grid_max_gap)
         
         # Calculate cell dimensions based on average aspect ratio
         avail_w = w_px - (cols + 1) * gap
@@ -949,14 +972,100 @@ class GPUPDFWidget(QOpenGLWidget):
         self.check_quality_change()
         self.update()
     
+    def zoom_to_grid_page(self, page_num):
+        """
+        Temporarily zooms to a specific page within the grid view to fit the window.
+        """
+        if not self.grid_mode or not self._grid_cells:
+            return
+
+        # Find the target page in the current grid
+        viewer = self.window()
+        start_page = getattr(viewer, 'current_page', self.current_page)
+        
+        # Calculate which cell contains this page
+        page_index = page_num - start_page
+        if page_index < 0 or page_index >= len(self._grid_cells):
+            return
+        
+        cell = self._grid_cells[page_index]
+        
+        # Get cell position and dimensions
+        page_x_px = cell['page_x_px']
+        page_y_px = cell['page_y_px']
+        inner_w_px = cell['inner_w_px']
+        inner_h_px = cell['inner_h_px']
+        
+        # Calculate the center of the target page in widget coordinates
+        page_center_x = page_x_px + inner_w_px / 2
+        page_center_y = page_y_px + inner_h_px / 2
+        
+        # Calculate the zoom factor needed to make the page fill the window with some margin
+        # Use 90% of window size to leave a small margin
+        zoom_x = (self.width() * 0.9) / inner_w_px
+        zoom_y = (self.height() * 0.9) / inner_h_px
+        # Use the smaller zoom factor to ensure the entire page fits
+        self.temp_zoom_factor = min(zoom_x, zoom_y)
+
+        # Calculate pan so the page center ends up at the widget center in GL coords.
+        w_px = max(1, self.width())
+        h_px = max(1, self.height())
+
+        # Page center in GL coords before any transforms
+        page_gl_x = (page_center_x / w_px) * 2.0 - 1.0
+        page_gl_y = 1.0 - (page_center_y / h_px) * 2.0
+
+        # The widget center in GL coords is (0,0). After scaling by temp_zoom_factor,
+        # the page_gl_x * temp_zoom_factor + pan_x should equal 0 -> pan_x = -page_gl_x * temp_zoom
+        self.temp_pan_x = -page_gl_x * self.temp_zoom_factor
+        self.temp_pan_y = -page_gl_y * self.temp_zoom_factor
+
+        self.is_temp_zoomed = True
+        self.update()
+
+    def reset_grid_zoom(self):
+        """Resets the temporary zoom on the grid view."""
+        if self.is_temp_zoomed:
+            self.is_temp_zoomed = False
+            self.temp_zoom_factor = 1.0
+            self.temp_pan_x = 0.0
+            self.temp_pan_y = 0.0
+            self.update()
+
     def wheelEvent(self, event):
         # Zoom with mouse wheel towards cursor position
         cursor_pos = event.position()
         delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoom_in(cursor_pos)
+        
+        if self.grid_mode and self.is_temp_zoomed:
+            # If in temp zoom mode, adjust the temp zoom factor instead of regular zoom
+            old_temp_zoom = self.temp_zoom_factor
+            if delta > 0:
+                self.temp_zoom_factor = min(self.temp_zoom_factor * 1.2, 10.0)
+            else:
+                self.temp_zoom_factor = max(self.temp_zoom_factor / 1.2, 0.1)
+            
+            # Adjust temp pan to zoom towards cursor position
+            if cursor_pos is not None:
+                zoom_ratio = self.temp_zoom_factor / old_temp_zoom
+                # Convert cursor position to normalized coordinates (-1 to 1)
+                cursor_x = (cursor_pos.x() / self.width()) * 2.0 - 1.0
+                cursor_y = 1.0 - (cursor_pos.y() / self.height()) * 2.0
+                
+                # Adjust temp pan to keep cursor point stable
+                self.temp_pan_x = cursor_x + (self.temp_pan_x - cursor_x) * zoom_ratio
+                self.temp_pan_y = cursor_y + (self.temp_pan_y - cursor_y) * zoom_ratio
+            
+            self.update()
         else:
-            self.zoom_out(cursor_pos)
+            # Normal zoom behavior
+            if delta > 0:
+                self.zoom_in(cursor_pos)
+            else:
+                self.zoom_out(cursor_pos)
+            
+            if self.grid_mode:
+                self.reset_grid_zoom()
     
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -969,10 +1078,22 @@ class GPUPDFWidget(QOpenGLWidget):
                 viewer.next_page()
     
     def mouseMoveEvent(self, event):
+        """Handle mouse move for panning"""
         if self.is_panning:
             delta = event.position() - self.last_mouse_pos
-            self.pan_x += delta.x() / self.width() * 2.0
-            self.pan_y -= delta.y() / self.height() * 2.0
+            
+            if self.grid_mode and self.is_temp_zoomed:
+                # Pan in temp zoom mode - adjust temp pan values
+                self.temp_pan_x += delta.x() / self.width() * 2.0
+                self.temp_pan_y -= delta.y() / self.height() * 2.0
+            else:
+                # Normal panning behavior
+                if self.grid_mode:
+                    self.reset_grid_zoom()
+                
+                self.pan_x += delta.x() / self.width() * 2.0
+                self.pan_y -= delta.y() / self.height() * 2.0
+            
             self.last_mouse_pos = event.position()
             self.update()
     
@@ -1109,6 +1230,45 @@ class PDFViewer(QMainWindow):
         
         view_menu.addSeparator()
         
+        # Grid view toggle in menu
+        grid_view_menu_action = QAction("Grid View", self)
+        grid_view_menu_action.setShortcut(QKeySequence("G"))
+        grid_view_menu_action.setCheckable(True)
+        grid_view_menu_action.triggered.connect(self.toggle_grid_view_from_menu)
+        view_menu.addAction(grid_view_menu_action)
+        # Keep reference to sync with toolbar action
+        self.grid_view_menu_action = grid_view_menu_action
+        
+        # Grid size submenu
+        grid_size_menu = view_menu.addMenu("Grid Size")
+        
+        size_2x2_action = QAction("2x2", self)
+        size_2x2_action.setShortcut(QKeySequence("1"))
+        size_2x2_action.triggered.connect(lambda: self.set_grid_size("2x2"))
+        grid_size_menu.addAction(size_2x2_action)
+        
+        size_3x3_action = QAction("3x3", self)
+        size_3x3_action.setShortcut(QKeySequence("2"))
+        size_3x3_action.triggered.connect(lambda: self.set_grid_size("3x3"))
+        grid_size_menu.addAction(size_3x3_action)
+        
+        size_4x4_action = QAction("4x4", self)
+        size_4x4_action.setShortcut(QKeySequence("3"))
+        size_4x4_action.triggered.connect(lambda: self.set_grid_size("4x4"))
+        grid_size_menu.addAction(size_4x4_action)
+        
+        size_5x1_action = QAction("5x1", self)
+        size_5x1_action.setShortcut(QKeySequence("4"))
+        size_5x1_action.triggered.connect(lambda: self.set_grid_size("5x1"))
+        grid_size_menu.addAction(size_5x1_action)
+        
+        size_5x2_action = QAction("5x2", self)
+        size_5x2_action.setShortcut(QKeySequence("5"))
+        size_5x2_action.triggered.connect(lambda: self.set_grid_size("5x2"))
+        grid_size_menu.addAction(size_5x2_action)
+        
+        view_menu.addSeparator()
+        
         # Grid layout submenu
         layout_menu = view_menu.addMenu("Grid Layout")
         
@@ -1177,6 +1337,7 @@ class PDFViewer(QMainWindow):
         self.grid_view_action = QAction("⊞ Grid View", self)
         self.grid_view_action.setCheckable(True)
         self.grid_view_action.triggered.connect(self.toggle_grid_view)
+        self.grid_view_action.setToolTip("Toggle Grid View (G)")
         toolbar.addAction(self.grid_view_action)
 
         toolbar.addSeparator()
@@ -1186,6 +1347,8 @@ class PDFViewer(QMainWindow):
         self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x1", "5x2"])
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         self.grid_size_combo.setEnabled(False)
+        self.grid_size_combo.setMaxVisibleItems(10)
+        self.grid_size_combo.setToolTip("Grid Size (1-5 keys or Tab to cycle)")
         toolbar.addWidget(self.grid_size_combo)
 
         # Fullscreen action with better matching icon
@@ -1238,6 +1401,17 @@ class PDFViewer(QMainWindow):
         # Grid layout mode shortcuts
         QShortcut(QKeySequence("L"), self, self.cycle_grid_layout_mode)
         QShortcut(QKeySequence("Shift+L"), self, self.show_layout_mode_info)
+        
+        # Grid view toggle shortcut
+        QShortcut(QKeySequence("G"), self, self.toggle_grid_view_shortcut)
+        
+        # Grid size shortcuts
+        QShortcut(QKeySequence("1"), self, lambda: self.set_grid_size("2x2"))
+        QShortcut(QKeySequence("2"), self, lambda: self.set_grid_size("3x3"))
+        QShortcut(QKeySequence("3"), self, lambda: self.set_grid_size("4x4"))
+        QShortcut(QKeySequence("4"), self, lambda: self.set_grid_size("5x1"))
+        QShortcut(QKeySequence("5"), self, lambda: self.set_grid_size("5x2"))
+        QShortcut(QKeySequence("Tab"), self, self.cycle_grid_size)
     
     def cycle_grid_layout_mode(self):
         """Cycle through grid layout modes: adaptive -> uniform -> proportional -> adaptive"""
@@ -1309,12 +1483,62 @@ Press 'L' to cycle through modes."""
             if self.pdf_widget.grid_mode:
                 self.pdf_widget.update()
     
-    def toggle_fullscreen(self):
+    def _rebuild_grid_size_combo(self, current_text=None):
+        """
+        Safely clears and rebuilds the grid size combo box items.
+        This is the most robust way to prevent item duplication after state changes.
+        """
+        # Disconnect signal to prevent unwanted triggers during rebuild
+        try:
+            self.grid_size_combo.currentTextChanged.disconnect(self.change_grid_size)
+        except TypeError:
+            # Signal was not connected, which is fine
+            pass
+
+        self.grid_size_combo.clear()
+        self.grid_size_combo.addItems(["2x2", "3x3", "4x4", "5x1", "5x2"])
+        
+        if current_text:
+            index = self.grid_size_combo.findText(current_text)
+            if index >= 0:
+                self.grid_size_combo.setCurrentIndex(index)
+        
+        # Reconnect the signal
+        self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
+
+    def restore_combo_box_state(self, grid_size, enabled):
+        """Restore combo box state after fullscreen transition"""
+        try:
+            self._rebuild_grid_size_combo(grid_size)
+            self.grid_size_combo.setEnabled(enabled)
+            
+            # Show helpful message
+            if self.isFullScreen():
+                self.status_bar.showMessage("Fullscreen: Use keys 1-5 or Tab to change grid size", 3000)
+        except Exception as e:
+            print(f"Error restoring combo box state: {e}")
+
+    def toggle_fullscreen(self, checked=None):
         """Toggle fullscreen mode"""
-        if self.isFullScreen():
-            self.showNormal()
+        # Save combo box state before fullscreen transition
+        current_grid_size = self.grid_size_combo.currentText()
+        grid_enabled = self.grid_size_combo.isEnabled()
+        
+        if checked is None:
+            # Called from menu or keyboard shortcut - toggle based on current state
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
         else:
-            self.showFullScreen()
+            # Called from checkable toolbar action - use the checked state
+            if checked:
+                self.showFullScreen()
+            else:
+                self.showNormal()
+        
+        # Restore combo box state after fullscreen transition
+        QTimer.singleShot(100, lambda: self.restore_combo_box_state(current_grid_size, grid_enabled))
     
     def dragEnterEvent(self, event):
         """Handle drag enter events"""
@@ -1665,6 +1889,7 @@ Press 'L' to cycle through modes."""
         try:
             if isinstance(img_or_icon, QImage):
                 qimage = img_or_icon
+
                 thumb = qimage.scaled(120, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 pixmap = QPixmap.fromImage(thumb)
                 qt_icon = QIcon(pixmap)
@@ -1782,72 +2007,55 @@ Press 'L' to cycle through modes."""
             
             # Handle regular page navigation
             if page_num is not None and 0 <= page_num < self.total_pages:
-                # Store the requested page
-                old_page = self.current_page
-                self.current_page = page_num
-                
-                # Switch to single page mode if in grid mode
                 if self.pdf_widget.grid_mode:
-                    self.pdf_widget.grid_mode = False
-                    self.pdf_widget.grid_textures.clear()
-                    # Update UI to reflect mode change
-                    self.grid_view_action.setChecked(False)
-                    self.grid_size_combo.setEnabled(False)
-                    self.pdf_widget.grid_cols = 1
-                    self.pdf_widget.grid_rows = 1
-                
-                # Update page label immediately
-                self.update_page_label()
-                
-                # Check if we already have any texture for this page (any quality)
-                existing_texture = self.pdf_widget.texture_cache.get_texture(page_num)
-                if existing_texture:
-                    # We have the texture, set it immediately
-                    if self.pdf_doc:
-                        page = self.pdf_doc[page_num]
-                        page_width = page.rect.width
-                        page_height = page.rect.height
-                        self.pdf_widget.set_page_texture(existing_texture, page_width, page_height)
-                    
-                    # If zoomed in significantly, queue a higher quality version in background
-                    if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
-                        final_quality = self.pdf_widget.get_zoom_adjusted_quality()
-                        current_best_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
-                        if final_quality > current_best_quality + 0.3:  # Only re-render if significantly better quality needed
-                            if self.renderer:
-                                self.renderer.add_page_to_queue(page_num, priority=False, quality=final_quality)
+                    # In grid mode, only change the grid start if the clicked page is outside
+                    # the current visible grid range. Otherwise keep the same start so the
+                    # clicked page maps to the correct cell index.
+                    pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                    start_page = getattr(self, 'current_page', 0)
+
+                    if not (start_page <= page_num < start_page + pages_needed):
+                        # Compute a new start such that the clicked page becomes visible.
+                        # Prefer making the clicked page the first visible page but clamp
+                        # so we don't run past the end of the document.
+                        new_start = min(max(0, page_num), max(0, self.total_pages - pages_needed))
+                        self.current_page = new_start
+                        self.update_page_label()
+
+                        # Queue textures for the new visible range
+                        try:
+                            for i in range(pages_needed):
+                                p = new_start + i
+                                if p < self.total_pages and self.renderer:
+                                    try:
+                                        self.renderer.add_page_to_queue(p, priority=True, quality=self.pdf_widget.get_immediate_quality())
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                        # Force recompute of layout and repaint
+                        try:
+                            self.pdf_widget._grid_cached_size = (0, 0, 0, 0)
+                            self.pdf_widget.compute_grid_layout()
+                        except Exception:
+                            pass
+
+                        self.pdf_widget.update()
+                        # Now zoom to the requested page (it is within the new visible range)
+                        self.pdf_widget.zoom_to_grid_page(page_num)
+                    else:
+                        # Page already visible in the current grid range - just ensure texture
+                        if page_num not in self.pdf_widget.grid_textures and self.renderer:
+                            try:
+                                self.renderer.add_page_to_queue(page_num, priority=True, quality=self.pdf_widget.get_immediate_quality())
+                            except Exception:
+                                pass
+                        # Zoom to the page within the existing grid layout
+                        self.pdf_widget.zoom_to_grid_page(page_num)
                 else:
-                    # No texture exists - keep current display if possible and render in background
-                    # Only clear texture if we're switching pages
-                    if old_page != page_num:
-                        self.pdf_widget.set_page_texture(None)
-                    
-                    if self.renderer:
-                        # Add with high priority for immediate response
-                        immediate_quality = self.pdf_widget.get_immediate_quality()
-                        self.renderer.add_page_to_queue(page_num, priority=True, quality=immediate_quality)
-                        
-                        # Also queue high quality if zoomed
-                        if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
-                            final_quality = self.pdf_widget.get_zoom_adjusted_quality()
-                            self.renderer.add_page_to_queue(page_num, priority=False, quality=final_quality)
-                
-                # Trigger repaint to show changes
-                self.pdf_widget.update()
-                
-                # Force immediate processing of pending images if any exist
-                if self.pdf_widget._pending_images:
-                    try:
-                        self.pdf_widget.process_pending_images(max_items=5)
-                    except Exception:
-                        pass
-                            # Check if we need to load more thumbnails around the new page
-                if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
-                    hasattr(self, '_current_thumb_range')):
-                    start_page, end_page = self._current_thumb_range
-                    # If navigating near the edge of loaded range, preload more
-                    if page_num <= start_page + 3 or page_num >= end_page - 3:
-                        self.generate_thumbnails(around_page=page_num, radius=20, preserve_scroll=True)
+                    # In single-page mode, navigate to the page
+                    self.go_to_page(page_num)
     
     def _on_thumbnail_scroll(self, value):
         """Handle thumbnail list scrolling to trigger loading more thumbnails"""
@@ -1895,6 +2103,33 @@ Press 'L' to cycle through modes."""
             new_end = min(self.total_pages - 1, end_page + 15)
             center_page = (start_page + new_end) // 2
             self.generate_thumbnails(around_page=center_page, radius=20, preserve_scroll=True)
+    
+    def go_to_page(self, page_num):
+        """Navigate to a specific page."""
+        if not self.pdf_doc or not (0 <= page_num < self.total_pages):
+            return
+            
+        self.current_page = page_num
+        self.update_page_label()
+        self.render_current_page()
+        
+        # Clean up distant textures to save memory
+        self.pdf_widget.cleanup_distant_textures()
+        
+        # Preload adjacent pages for smoother navigation
+        if self.renderer:
+            if self.current_page > 0:
+                self.renderer.add_page_to_queue(self.current_page - 1)
+            if self.current_page < self.total_pages - 1:
+                self.renderer.add_page_to_queue(self.current_page + 1)
+                
+        # Check if we need to load more thumbnails around the new page
+        if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
+            hasattr(self, '_current_thumb_range')):
+            start_page, end_page = self._current_thumb_range
+            # If navigating near the edge of loaded range, preload more
+            if page_num <= start_page + 3 or page_num >= end_page - 3:
+                self.generate_thumbnails(around_page=page_num, radius=20, preserve_scroll=True)
     
     def on_page_rendered(self, page_num: int, image: QImage, quality: float = 2.0):
         # Get actual page dimensions from PDF document for accurate aspect ratios
@@ -2021,12 +2256,81 @@ Press 'L' to cycle through modes."""
         self.pdf_widget.zoom_factor = zoom_factor
         self.pdf_widget.update()
     
+    def set_grid_size(self, size_text):
+        """Set grid size via keyboard shortcut"""
+        if not self.grid_view_action.isChecked():
+            # Auto-enable grid view if not already enabled
+            self.grid_view_action.setChecked(True)
+            self.grid_view_menu_action.setChecked(True)
+            self.toggle_grid_view()
+        
+        # Set the combo box selection
+        index = self.grid_size_combo.findText(size_text)
+        if index >= 0:
+            self.grid_size_combo.setCurrentIndex(index)
+            self.change_grid_size(size_text)
+            # Show feedback to user
+            self.status_bar.showMessage(f"Grid Size: {size_text}", 2000)
+
+    def cycle_grid_size(self):
+        """Cycle through available grid sizes"""
+        if not self.grid_view_action.isChecked():
+            # Auto-enable grid view if not already enabled
+            self.grid_view_action.setChecked(True)
+            self.grid_view_menu_action.setChecked(True)
+            self.toggle_grid_view()
+        
+        # Ensure combo box has items
+        self._rebuild_grid_size_combo(self.grid_size_combo.currentText())
+        
+        # Get current index and move to next
+        current_index = self.grid_size_combo.currentIndex()
+        if current_index < 0:  # Handle invalid index
+            current_index = 0
+        next_index = (current_index + 1) % self.grid_size_combo.count()
+        self.grid_size_combo.setCurrentIndex(next_index)
+        size_text = self.grid_size_combo.currentText()
+        self.change_grid_size(size_text)
+        # Show feedback to user
+        self.status_bar.showMessage(f"Grid Size: {size_text}", 2000)
+
+    def toggle_grid_view_from_menu(self):
+        """Toggle grid view from menu action"""
+        # Sync toolbar action with menu action
+        checked_state = self.grid_view_menu_action.isChecked()
+        self.grid_view_action.setChecked(checked_state)
+        # Call the main toggle method
+        self.toggle_grid_view()
+
+    def toggle_grid_view_shortcut(self):
+        """Toggle grid view via keyboard shortcut"""
+        # Toggle the action's checked state for both toolbar and menu
+        new_state = not self.grid_view_action.isChecked()
+        self.grid_view_action.setChecked(new_state)
+        self.grid_view_menu_action.setChecked(new_state)
+        # Call the toggle method to update the UI
+        self.toggle_grid_view()
+
     def toggle_grid_view(self):
         """Toggle between single page and grid view"""
-        if self.grid_view_action.isChecked():
+        # Ensure both toolbar and menu actions are in sync
+        checked_state = self.grid_view_action.isChecked()
+        self.grid_view_menu_action.setChecked(checked_state)
+        
+        if checked_state:
+            # Ensure combo box has items before enabling
+            self._rebuild_grid_size_combo(self.grid_size_combo.currentText())
+            
             self.grid_size_combo.setEnabled(True)
             self.pdf_widget.grid_mode = True
-            self.change_grid_size(self.grid_size_combo.currentText())
+            
+            # Get current text, with fallback if empty
+            current_text = self.grid_size_combo.currentText()
+            if not current_text or current_text.strip() == "":
+                current_text = "2x2"  # Default
+                self.grid_size_combo.setCurrentText(current_text)
+                
+            self.change_grid_size(current_text)
         else:
             self.grid_size_combo.setEnabled(False)
             self.pdf_widget.grid_mode = False
@@ -2038,6 +2342,14 @@ Press 'L' to cycle through modes."""
         """Change the grid layout size"""
         if not self.grid_view_action.isChecked():
             return
+        
+        # Handle empty or invalid size_text
+        if not size_text or size_text.strip() == "":
+            # Fallback to default size if combo box is empty
+            size_text = "2x2"
+            # Try to restore combo box if it's empty
+            self._rebuild_grid_size_combo()
+            self.grid_size_combo.setCurrentText(size_text)
         
         # Parse grid size (e.g., "2x2" -> 2, 2)
         try:
@@ -2054,12 +2366,6 @@ Press 'L' to cycle through modes."""
             self.render_current_page()
         except ValueError:
             pass
-    
-    def toggle_fullscreen(self, checked):
-        if checked:
-            self.showFullScreen()
-        else:
-            self.showNormal()
     
     def closeEvent(self, event):
         if self.renderer:
