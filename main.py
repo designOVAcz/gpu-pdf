@@ -79,13 +79,14 @@ os.environ['QT_IMAGEIO_MAXALLOC'] = '1024'  # Set to 1GB
 class GPUTextureCache:
     """Manages GPU textures for PDF pages"""
     
-    def __init__(self, max_textures=20):
+    def __init__(self, max_textures=25):  # Increased cache size for high-quality textures
         self.textures = {}  # (page_num, quality) -> QOpenGLTexture
         self.page_textures = {}  # page_num -> best_quality_texture (for backwards compatibility)
         self.dimensions = {}  # page_num -> (width, height)
         self.qualities = {}  # (page_num, quality) -> quality_value
         self.max_textures = max_textures
         self.access_order = []  # LRU tracking for (page_num, quality) keys
+        self.priority_textures = set()  # High-quality textures to keep longer
     
     def get_texture(self, page_num: int, preferred_quality: float = None) -> Optional[QOpenGLTexture]:
         """Get texture for page, optionally preferring a specific quality"""
@@ -96,6 +97,24 @@ class GPUTextureCache:
                 self.access_order.remove(key)
                 self.access_order.append(key)
                 return self.textures[key]
+            
+            # If we need high quality, also check if we have a texture that's close enough
+            if preferred_quality > 2.0:
+                best_texture = None
+                best_quality = 0.0
+                for (p, q), texture in self.textures.items():
+                    if p == page_num and q >= preferred_quality * 0.8:  # Accept 80% of requested quality
+                        if q > best_quality:
+                            best_quality = q
+                            best_texture = texture
+                if best_texture:
+                    # Update access order
+                    for key, texture in self.textures.items():
+                        if key[0] == page_num and texture == best_texture:
+                            self.access_order.remove(key)
+                            self.access_order.append(key)
+                            break
+                    return best_texture
         
         # Fallback to backwards compatibility - get best available texture for page
         if page_num in self.page_textures:
@@ -113,16 +132,29 @@ class GPUTextureCache:
         """Get the dimensions (width, height) for a page"""
         return self.dimensions.get(page_num)
     
-    def add_texture(self, page_num: int, image: QImage, width: float = None, height: float = None, quality: float = 2.0) -> QOpenGLTexture:
+    def add_texture(self, page_num: int, image: QImage, width: float = None, height: float = None, quality: float = 4.0) -> QOpenGLTexture:
         """Add texture with quality tracking"""
         key = (page_num, quality)
         
-        # Remove oldest if at capacity
+        # Remove oldest if at capacity - but prefer to keep high-quality textures
         if len(self.textures) >= self.max_textures and key not in self.textures:
-            oldest_key = self.access_order.pop(0)
+            # Try to remove non-priority textures first
+            oldest_key = None
+            for candidate_key in self.access_order:
+                if candidate_key not in self.priority_textures:
+                    oldest_key = candidate_key
+                    break
+            
+            # If all textures are priority, remove the oldest one anyway
+            if oldest_key is None:
+                oldest_key = self.access_order.pop(0)
+            else:
+                self.access_order.remove(oldest_key)
+                
             if oldest_key in self.textures:
                 self.textures[oldest_key].destroy()
                 del self.textures[oldest_key]
+                self.priority_textures.discard(oldest_key)
                 if oldest_key in self.qualities:
                     del self.qualities[oldest_key]
                 # Update page_textures if this was the best quality for this page
@@ -152,6 +184,10 @@ class GPUTextureCache:
         if key in self.access_order:
             self.access_order.remove(key)
         self.access_order.append(key)
+        
+        # Mark high-quality textures as priority (keep them longer)
+        if quality >= 6.0:  # High-quality threshold
+            self.priority_textures.add(key)
         
         # Update best texture for this page
         if page_num not in self.page_textures or quality > self.get_best_quality_for_page(page_num):
@@ -189,6 +225,7 @@ class GPUTextureCache:
                 self.access_order.remove(key)
             if key in self.qualities:
                 del self.qualities[key]
+            self.priority_textures.discard(key)  # Remove from priority set
         
         if page_num in self.page_textures:
             del self.page_textures[page_num]
@@ -203,6 +240,7 @@ class GPUTextureCache:
         self.qualities.clear()
         self.dimensions.clear()
         self.access_order.clear()
+        self.priority_textures.clear()  # Clear priority set
 
 
 class ThumbnailWorker(QThread):
@@ -234,8 +272,9 @@ class ThumbnailWorker(QThread):
                     if page_num < 0 or page_num >= self.pdf_doc.page_count:
                         continue
                     page = self.pdf_doc[page_num]
-                    mat = fitz.Matrix(0.25, 0.25)  # Reduced from 0.3 for faster rendering
-                    pix = page.get_pixmap(matrix=mat)
+                    mat = fitz.Matrix(0.5, 0.5)  # Increased from 0.25 to 0.5 for sharper thumbnails
+                    # Enable anti-aliasing for sharper thumbnail text
+                    pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
                     img_data = pix.tobytes("png")
                     qimage = QImage.fromData(img_data, "PNG")
                     if not qimage.isNull():
@@ -258,7 +297,7 @@ class PDFPageRenderer(QThread):
     """Background page renderer that converts PDF pages to QImage and emits pageRendered."""
     pageRendered = pyqtSignal(int, QImage, float)  # Added quality parameter
 
-    def __init__(self, pdf_path: str, quality: float = 2.0, parent=None):
+    def __init__(self, pdf_path: str, quality: float = 4.0, parent=None):
         super().__init__(parent)
         self.pdf_path = pdf_path
         self.quality = quality
@@ -325,7 +364,15 @@ class PDFPageRenderer(QThread):
 
                     page = self.pdf_doc[page_num]
                     mat = fitz.Matrix(render_quality, render_quality)  # Use per-page quality
-                    pix = page.get_pixmap(matrix=mat)
+                    
+                    # Ultra-high quality rendering for high zoom levels
+                    if render_quality >= 8.0:
+                        # Use advanced settings for ultra-sharp rendering
+                        pix = page.get_pixmap(matrix=mat, alpha=False, annots=True, clip=None)
+                    else:
+                        # Standard high-quality rendering
+                        pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
+                        
                     # Use PNG bytes which QImage understands reliably
                     img_data = pix.tobytes("png")
                     qimage = QImage.fromData(img_data, "PNG")
@@ -358,11 +405,11 @@ class GPUPDFWidget(QOpenGLWidget):
         self.page_width = 1.0
         self.page_height = 1.0
         
-        # Quality threshold for zoom level
-        self.quality_zoom_threshold = 2.0  # Example value, adjust as needed
-        self.base_quality = 2.0 # Default rendering quality
-        self.max_quality = 6.0  # Maximum rendering quality to prevent excessive memory usage
-        self.last_zoom_quality = 2.0  # Track last quality used for zoom change detection
+        # Zoom-adaptive quality settings
+        self.base_quality = 4.0  # Much higher base quality for sharp text at all levels
+        self.quality_zoom_threshold = 1.0  # Start high quality immediately when zooming
+        self.max_quality = 12.0  # Ultra-high maximum quality for razor-sharp high zoom text
+        self.last_zoom_quality = self.base_quality
 
         # Grid view attributes
         self.grid_mode = False
@@ -576,7 +623,31 @@ class GPUPDFWidget(QOpenGLWidget):
             # If page index is beyond document end, leave cell empty
             if page_num >= total_pages:
                 continue
-            texture = self.grid_textures.get(page_num)
+            
+            # ALWAYS prioritize highest quality textures for grid view - same as single page
+            # Calculate the quality we need based on current zoom
+            needed_quality = self.get_zoom_adjusted_quality()
+            
+            # First try to get the highest quality texture available for this page
+            best_available_texture = self.texture_cache.get_texture(page_num)
+            current_best_quality = self.texture_cache.get_best_quality_for_page(page_num)
+            
+            # If we have a texture but need much higher quality, use the best we have
+            # but also queue for even better quality
+            if best_available_texture and current_best_quality > 0:
+                texture = best_available_texture
+                # If current quality is significantly lower than needed, queue improvement
+                if needed_quality > current_best_quality + 0.5:
+                    viewer = self.window()
+                    if viewer and hasattr(viewer, 'renderer') and viewer.renderer:
+                        viewer.renderer.add_page_to_queue(page_num, priority=True, quality=needed_quality)
+            else:
+                # Fall back to grid texture if no high-quality texture available
+                texture = self.grid_textures.get(page_num)
+                # Queue for high-quality render if we don't have one
+                viewer = self.window()
+                if viewer and hasattr(viewer, 'renderer') and viewer.renderer:
+                    viewer.renderer.add_page_to_queue(page_num, priority=True, quality=needed_quality)
 
             # Get cached cell (pixel coords)
             if idx < len(self._grid_cells):
@@ -860,12 +931,33 @@ class GPUPDFWidget(QOpenGLWidget):
         Args:
             progressive: If True, returns a lower quality for immediate display
         """
-        if self.zoom_factor <= self.quality_zoom_threshold:
+        # Calculate effective zoom including temporary zoom
+        effective_zoom = self.zoom_factor
+        if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+            effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+            
+        if effective_zoom <= self.quality_zoom_threshold:
             return self.base_quality
         
-        # Scale quality with zoom above threshold, but more conservatively
-        zoom_excess = self.zoom_factor - self.quality_zoom_threshold
-        quality_boost = zoom_excess * 0.3  # Reduced from 0.5 to 0.3 for faster rendering
+        # Ultra-aggressive quality scaling for highest zoom quality
+        zoom_excess = effective_zoom - self.quality_zoom_threshold
+        
+        # Enhanced quality scaling with different tiers
+        if effective_zoom <= 2.0:
+            # Normal zoom: moderate scaling
+            quality_boost = zoom_excess * 1.0
+        elif effective_zoom <= 4.0:
+            # High zoom: aggressive scaling
+            base_boost = (2.0 - self.quality_zoom_threshold) * 1.0
+            high_boost = (effective_zoom - 2.0) * 1.5
+            quality_boost = base_boost + high_boost
+        else:
+            # Ultra-high zoom: maximum quality with performance consideration
+            base_boost = (2.0 - self.quality_zoom_threshold) * 1.0
+            high_boost = 2.0 * 1.5
+            ultra_boost = (effective_zoom - 4.0) * 2.0
+            quality_boost = base_boost + high_boost + ultra_boost
+            
         adjusted_quality = min(self.base_quality + quality_boost, self.max_quality)
         
         # For progressive loading, return a lower quality first
@@ -882,7 +974,7 @@ class GPUPDFWidget(QOpenGLWidget):
     def check_quality_change(self):
         """Check if quality needs updating due to zoom change and re-render if needed"""
         new_quality = self.get_zoom_adjusted_quality()
-        if abs(new_quality - self.last_zoom_quality) > 0.2:  # Reduced threshold for more responsive updates
+        if abs(new_quality - self.last_zoom_quality) > 0.05:  # Even more sensitive for ultra-high zoom
             self.last_zoom_quality = new_quality
             # Re-render current content with progressive quality
             viewer = self.window()
@@ -894,9 +986,19 @@ class GPUPDFWidget(QOpenGLWidget):
                     # For single page mode, implement progressive rendering
                     current_page = getattr(viewer, 'current_page', 0)
                     
-                    # Don't clear existing texture if we're zooming in - keep it for immediate display
+                    # Calculate effective zoom including temporary zoom
+                    effective_zoom = self.zoom_factor
+                    if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+                        effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+                    
+                    # For ultra-high zoom levels, prioritize immediate high-quality rendering
                     existing_texture = self.texture_cache.get_texture(current_page)
-                    if existing_texture and self.zoom_factor > self.quality_zoom_threshold:
+                    if existing_texture and effective_zoom > self.quality_zoom_threshold:
+                        current_quality = self.texture_cache.get_best_quality_for_page(current_page)
+                        # If zoom is very high and current quality is much lower, clear texture
+                        if effective_zoom > 5.0 and new_quality > current_quality + 2.0:
+                            self.texture_cache.remove_texture(current_page)
+                            self.set_page_texture(None)
                         # Keep current texture visible while rendering higher quality in background
                         pass  # Don't clear the texture
                     else:
@@ -1021,6 +1123,26 @@ class GPUPDFWidget(QOpenGLWidget):
         self.temp_pan_y = -page_gl_y * self.temp_zoom_factor
 
         self.is_temp_zoomed = True
+        
+        # Trigger quality check and high-quality re-render for the zoomed page
+        self.check_quality_change()
+        
+        # Request high-quality texture for the focused page if needed
+        viewer = self.window()
+        if viewer and hasattr(viewer, 'renderer') and viewer.renderer:
+            effective_zoom = self.zoom_factor * self.temp_zoom_factor
+            final_quality = self.get_zoom_adjusted_quality()
+            current_best_quality = self.texture_cache.get_best_quality_for_page(page_num)
+            
+            # Always force re-render when zooming thumbnails if quality can be improved
+            if final_quality > current_best_quality + 0.1:  # Very low threshold
+                # Always remove existing texture to force high-quality re-render
+                self.texture_cache.remove_texture(page_num)
+                if page_num in self.grid_textures:
+                    del self.grid_textures[page_num]
+                # Request immediate high-quality render
+                viewer.renderer.add_page_to_queue(page_num, priority=True, quality=final_quality)
+        
         self.update()
 
     def reset_grid_zoom(self):
@@ -1055,6 +1177,9 @@ class GPUPDFWidget(QOpenGLWidget):
                 # Adjust temp pan to keep cursor point stable
                 self.temp_pan_x = cursor_x + (self.temp_pan_x - cursor_x) * zoom_ratio
                 self.temp_pan_y = cursor_y + (self.temp_pan_y - cursor_y) * zoom_ratio
+            
+            # CRITICAL: Trigger quality check for grid temp zoom - same as single page!
+            self.check_quality_change()
             
             self.update()
         else:
@@ -1111,7 +1236,7 @@ class PDFViewer(QMainWindow):
         self.pdf_doc = None
         self.current_page = 0
         self.total_pages = 0
-        self.render_quality = 2.0
+        self.render_quality = 4.0
         
         self.renderer = None
         self.thumbnail_worker = None
@@ -1615,7 +1740,7 @@ Press 'L' to cycle through modes."""
                 print(f"Fallback dialog also failed: {e2}")
                 self.status_bar.showMessage("File dialog unavailable", 5000)
     
-    def load_pdf(self, pdf_path: str, quality: float = 2.0):
+    def load_pdf(self, pdf_path: str, quality: float = 4.0):
         try:
             # Clean up previous document
             if self.pdf_doc:
@@ -1747,18 +1872,15 @@ Press 'L' to cycle through modes."""
                 self.pdf_widget.update()
     
     def render_grid_pages(self):
-        """Render multiple pages for grid view with zoom-adjusted quality"""
+        """Render multiple pages for grid view with SAME ultra-high quality as single page"""
         if not self.pdf_doc:
             return
         
         grid_textures = {}
         pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
         
-        # Get zoom-adjusted quality from the widget
+        # Use EXACTLY the same quality system as single page view - no reductions!
         grid_quality = self.pdf_widget.get_zoom_adjusted_quality()
-        # For grid view, use slightly lower quality for performance unless zoomed in
-        if self.pdf_widget.zoom_factor < 1.5:
-            grid_quality = max(1.0, grid_quality * 0.8)  # 80% of calculated quality
         
         # Collect pages starting from current page
         for i in range(pages_needed):
@@ -1766,13 +1888,26 @@ Press 'L' to cycle through modes."""
             if page_num >= self.total_pages:
                 break
             
-            # Check cache first
-            texture = self.pdf_widget.texture_cache.get_texture(page_num)
-            if texture:
-                grid_textures[page_num] = texture
-            else:
-                # Queue for high-priority rendering with zoom-adjusted quality
+            # For grid view, always prefer high-quality textures when available
+            # Check if we need higher quality than what we have
+            current_best_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
+            texture = None
+            
+            # If we need much higher quality, force re-render
+            if grid_quality > current_best_quality + 0.5:
+                # Remove low-quality texture to force high-quality re-render
+                if current_best_quality > 0:
+                    self.pdf_widget.texture_cache.remove_texture(page_num)
+                # Queue for immediate high-quality rendering
                 if self.renderer:
+                    self.renderer.add_page_to_queue(page_num, priority=True, quality=grid_quality)
+            else:
+                # Use existing texture if quality is adequate
+                texture = self.pdf_widget.texture_cache.get_texture(page_num)
+                if texture:
+                    grid_textures[page_num] = texture
+                elif self.renderer:
+                    # Queue for high-quality rendering
                     self.renderer.add_page_to_queue(page_num, priority=True, quality=grid_quality)
         
         # Set grid textures
