@@ -42,6 +42,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import math
 
+# Essential imports for startup
 try:
     import fitz  # PyMuPDF
 except ImportError:
@@ -60,6 +61,7 @@ try:
                             QShortcut, QAction, QPalette, QColor, QActionGroup)
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture
+    from PyQt6.QtWidgets import QDialog, QSlider, QHBoxLayout, QFrame, QPushButton
 except ImportError:
     print("Please install PyQt6: pip install PyQt6 PyQt6-Qt6")
     sys.exit(1)
@@ -72,8 +74,8 @@ except ImportError:
     print("Please install OpenGL: pip install PyOpenGL PyOpenGL_accelerate numpy")
     sys.exit(1)
 
-# Increase Qt image allocation limit for large PDF pages (default is 256MB)
-os.environ['QT_IMAGEIO_MAXALLOC'] = '1024'  # Set to 1GB
+# Reduce Qt image allocation for faster startup
+os.environ['QT_IMAGEIO_MAXALLOC'] = '256'  # Minimal allocation for fastest startup
 
 
 class GPUTextureCache:
@@ -117,6 +119,57 @@ class GPUTextureCache:
                     return best_texture
         
         # Fallback to backwards compatibility - get best available texture for page
+
+
+class BackgroundMatchDialog(QDialog):
+    """Simple dialog to tune background RGB luminance so thumbnails and page match."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Background match")
+        self.setModal(True)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 255)
+        # Default to 38
+        self.slider.setValue(38)
+
+        self.preview_thumb = QFrame()
+        self.preview_thumb.setFixedSize(80, 40)
+        self.preview_page = QFrame()
+        self.preview_page.setFixedSize(160, 80)
+
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self.save_and_close)
+
+        layout = QHBoxLayout(self)
+        layout.addWidget(self.slider)
+        layout.addWidget(self.preview_thumb)
+        layout.addWidget(self.preview_page)
+        layout.addWidget(self.save_btn)
+
+        self.slider.valueChanged.connect(self.on_change)
+        self.on_change(self.slider.value())
+
+    def on_change(self, v: int):
+        col = f"rgb({v},{v},{v})"
+        self.preview_thumb.setStyleSheet(f"QFrame {{ background: {col}; }}")
+        self.preview_page.setStyleSheet(f"QFrame {{ background: {col}; }}")
+        viewer = self.parent()
+        if viewer and hasattr(viewer, 'thumbnail_list'):
+            viewer.thumbnail_list.setStyleSheet(f"QListWidget {{ background-color: {col}; border: none; }}")
+        # update GL clear color if pdf_widget present
+        if viewer and hasattr(viewer, 'pdf_widget'):
+            # convert to float 0-1
+            f = v / 255.0
+            try:
+                viewer.pdf_widget.set_clear_color(f, f, f, 1.0)
+            except Exception:
+                pass
+
+    def save_and_close(self):
+        # Just close; current settings applied live
+        self.accept()
         if page_num in self.page_textures:
             # Find the key for this texture to update access order
             best_texture = self.page_textures[page_num]
@@ -429,6 +482,10 @@ class GPUPDFWidget(QOpenGLWidget):
     
     def __init__(self):
         super().__init__()
+        
+        # Set widget attributes for transparency
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        
         self.texture_cache = GPUTextureCache()
         self.current_page = 0
         self.zoom_factor = 1.0
@@ -437,7 +494,9 @@ class GPUPDFWidget(QOpenGLWidget):
         self.page_texture = None
         self.page_width = 1.0
         self.page_height = 1.0
-        
+
+    # Remove Qt palette/stylesheet background for OpenGL widget to avoid blending issues
+
         # Zoom-adaptive quality settings - optimized for performance vs quality balance
         self.base_quality = 3.0  # Restore readable quality 
         self.quality_zoom_threshold = 1.5  # Start high quality at reasonable zoom level
@@ -486,19 +545,14 @@ class GPUPDFWidget(QOpenGLWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     
     def initializeGL(self):
+        """Initialize OpenGL context - minimal setup for fast startup"""
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # Standard alpha blending
         glEnable(GL_MULTISAMPLE)  # Enable multisampling if available
         
-        # Set background color based on theme
-        app = QApplication.instance()
-        if app and app.palette().color(QPalette.ColorRole.Window).lightness() < 128:
-            # Dark theme
-            glClearColor(0.2, 0.2, 0.2, 1.0)
-        else:
-            # Light theme
-            glClearColor(0.9, 0.9, 0.9, 1.0)
+        # Match container background color exactly: rgb(38, 38, 38)
+        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
     
     def update(self, *args, **kwargs):
         """Frame rate limited update method for better performance"""
@@ -528,6 +582,8 @@ class GPUPDFWidget(QOpenGLWidget):
         super().update()
     
     def paintGL(self):
+        # Clear with the same dark gray as the container background
+        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)  # rgb(38, 38, 38) converted to OpenGL floats
         glClear(GL_COLOR_BUFFER_BIT)
         
         # Update animation time for loading indicators
@@ -1006,14 +1062,9 @@ class GPUPDFWidget(QOpenGLWidget):
             pass
     
     def update_background_color(self):
-        """Update OpenGL background color based on current theme"""
-        app = QApplication.instance()
-        if app and app.palette().color(QPalette.ColorRole.Window).lightness() < 128:
-            # Dark theme
-            glClearColor(0.2, 0.2, 0.2, 1.0)
-        else:
-            # Light theme
-            glClearColor(0.9, 0.9, 0.9, 1.0)
+        """Set OpenGL background to match container color exactly"""
+        # Always use the same dark gray as the container: rgb(38, 38, 38)
+        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
         self.update()
     
     def get_zoom_adjusted_quality(self, progressive=False, fast_zoom=False):
@@ -1432,6 +1483,7 @@ class PDFViewer(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        # Basic initialization only - defer heavy setup
         self.pdf_path = ""
         self.pdf_doc = None
         self.current_page = 0
@@ -1443,46 +1495,116 @@ class PDFViewer(QMainWindow):
         
         # Enable drag and drop
         self.setAcceptDrops(True)
-        
-        # Ensure all child widgets also accept drops
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptDrops, True)
         
+        # Defer UI setup to after window is shown
+        QTimer.singleShot(0, self.setup_ui_deferred)
+        
+        # Show basic window immediately
+        self.setWindowTitle("GPU-Accelerated PDF Viewer")
+        self.setGeometry(100, 100, 1200, 800)
+    
+    def setup_ui_deferred(self):
+        """Deferred UI setup for faster startup"""
         self.setup_ui()
         self.setup_shortcuts()
     
     def setup_ui(self):
         self.setWindowTitle("GPU-Accelerated PDF Viewer")
         self.setGeometry(100, 100, 1200, 800)
+        self.setStyleSheet("""
+            QMainWindow { 
+                background-color: rgb(38, 38, 38); 
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }
+        """)
+        self.setContentsMargins(0, 0, 0, 0)
         
         # Central widget
         central_widget = QWidget()
+        central_widget.setStyleSheet("""
+            QWidget { 
+                background-color: rgb(38, 38, 38); 
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }
+        """)
         self.setCentralWidget(central_widget)
         
         # Main layout
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
         # Left panel (thumbnails, bookmarks)
         left_panel = self.create_left_panel()
         
-        # PDF viewer widget
+        # PDF viewer widget - create with container for consistent background
         self.pdf_widget = GPUPDFWidget()
+        # Remove any background styling from the OpenGL widget itself
+        self.pdf_widget.setStyleSheet("QOpenGLWidget { border: none; }")
+        
+        # Create container widget with the background color
+        pdf_container = QWidget()
+        pdf_container.setStyleSheet("""
+            QWidget { 
+                background-color: rgb(38, 38, 38); 
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }
+        """)
+        
+        # Layout to hold the PDF widget inside the container
+        pdf_layout = QVBoxLayout(pdf_container)
+        pdf_layout.setContentsMargins(0, 0, 0, 0)
+        pdf_layout.setSpacing(0)
+        pdf_layout.addWidget(self.pdf_widget)
+        
+        # Defer OpenGL context creation
+        self.pdf_widget.setUpdatesEnabled(False)  # Disable updates during startup
         
         # Splitter for resizable panels
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("""
+            QSplitter { 
+                background-color: rgb(38, 38, 38); 
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            } 
+            QSplitter::handle { 
+                background-color: rgb(60, 60, 60); 
+                border: none;
+                margin: 0px;
+                width: 2px;
+            }
+        """)
+        splitter.setHandleWidth(2)
         splitter.addWidget(left_panel)
-        splitter.addWidget(self.pdf_widget)
+        splitter.addWidget(pdf_container)
         splitter.setSizes([250, 1000])
         
         main_layout.addWidget(splitter)
         
-        # Create menu and toolbar
+        # Defer heavy UI creation
+        QTimer.singleShot(50, self.create_menu_deferred)
+        QTimer.singleShot(100, self.finalize_ui_setup)
+    
+    def create_menu_deferred(self):
+        """Create menu and toolbar after initial window is shown"""
         self.create_menu()
         self.create_toolbar()
+    
+    def finalize_ui_setup(self):
+        """Finalize UI setup after window is visible"""
+        # Re-enable updates on PDF widget
+        self.pdf_widget.setUpdatesEnabled(True)
         
-        # Hide menu bar for cleaner look
-        self.menuBar().hide()
-        
-        # Connect zoom methods to update slider
+        # Setup zoom connections - moved from setup_ui for faster startup
         original_zoom_in = self.pdf_widget.zoom_in
         original_zoom_out = self.pdf_widget.zoom_out
         original_reset_zoom = self.pdf_widget.reset_zoom
@@ -1503,18 +1625,45 @@ class PDFViewer(QMainWindow):
         self.pdf_widget.zoom_out = update_zoom_out
         self.pdf_widget.reset_zoom = update_reset_zoom
         
-        # Status bar
+        # Setup status bar
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("Ready - Use File menu or wizard to open a PDF")
-    
+        
+        # Hide menu bar for cleaner look  
+        self.menuBar().hide()
+
     def create_left_panel(self):
         panel = QWidget()
         panel.setFixedWidth(200)
+        panel.setStyleSheet("""
+            QWidget { 
+                background-color: rgb(38, 38, 38); 
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }
+        """)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
         # Thumbnails without title
         self.thumbnail_list = QListWidget()
-        self.thumbnail_list.setStyleSheet("QListWidget { background-color: rgb(51, 51, 51); border: none; }")
+        self.thumbnail_list.setStyleSheet("""
+            QListWidget { 
+                background-color: rgb(38, 38, 38); 
+                border: none; 
+                margin: 0px;
+                padding: 2px;
+            }
+            QListWidget::item {
+                background-color: rgb(38, 38, 38);
+                border: none;
+            }
+            QListWidget::item:selected {
+                background-color: rgb(60, 60, 60);
+            }
+        """)
         self.thumbnail_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.thumbnail_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.thumbnail_list.setMovement(QListWidget.Movement.Static)
@@ -1972,13 +2121,27 @@ Press 'L' to cycle through modes."""
             self.renderer = PDFPageRenderer(pdf_path, quality)
             self.renderer.pageRendered.connect(self.on_page_rendered)
             
-            # Render first page
+            # Render first page immediately for fast display
             self.render_current_page()
             self.renderer.start()
             
             # Update background color for current theme
             self.pdf_widget.update_background_color()
             
+            # Defer thumbnail generation for faster startup
+            QTimer.singleShot(200, self.generate_thumbnails_deferred)
+            
+            # Show immediate status
+            self.status_bar.showMessage(f"Loading: {os.path.basename(pdf_path)} ({self.total_pages} pages)")
+            
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Show the exception and include a copyable traceback for debugging
+            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}\n\nTraceback:\n{tb}")
+    
+    def generate_thumbnails_deferred(self):
+        """Generate thumbnails after main view is ready"""
+        try:
             # Generate thumbnails
             self.generate_thumbnails()
             
@@ -1987,10 +2150,12 @@ Press 'L' to cycle through modes."""
                 self._current_thumb_range = (0, min(30, self.total_pages - 1))  # Initial range
             
             # Show final loaded status
-            self.status_bar.showMessage(f"Loaded: {os.path.basename(pdf_path)} ({self.total_pages} pages)")
+            self.status_bar.showMessage(f"Loaded: {os.path.basename(self.pdf_path)} ({self.total_pages} pages)")
             
             # Clear status to "Ready" after a brief moment
             QTimer.singleShot(2000, lambda: self.status_bar.showMessage("Ready"))
+        except Exception as e:
+            print(f"Thumbnail generation error: {e}")
             
         except Exception as e:
             tb = traceback.format_exc()
@@ -2316,7 +2481,7 @@ Press 'L' to cycle through modes."""
             load_above_item = QListWidgetItem("⬆️ Load Earlier Pages")
             load_above_item.setData(Qt.ItemDataRole.UserRole, -1)  # Special marker
             load_above_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            load_above_item.setBackground(QColor(70, 70, 70))
+            load_above_item.setBackground(QColor(38, 38, 38))
             load_above_item.setForeground(QColor(200, 200, 200))
             self.thumbnail_list.insertItem(0, load_above_item)
         
@@ -2325,7 +2490,7 @@ Press 'L' to cycle through modes."""
             load_below_item = QListWidgetItem("⬇️ Load Later Pages")
             load_below_item.setData(Qt.ItemDataRole.UserRole, -2)  # Special marker
             load_below_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            load_below_item.setBackground(QColor(70, 70, 70))
+            load_below_item.setBackground(QColor(38, 38, 38))
             load_below_item.setForeground(QColor(200, 200, 200))
             self.thumbnail_list.addItem(load_below_item)
     
@@ -2758,54 +2923,27 @@ Press 'L' to cycle through modes."""
 
 
 if __name__ == "__main__":
+    # Fast startup: Create QApplication immediately to show window
     app = QApplication(sys.argv)
     
-    # Set application properties
+    # Set basic application properties quickly
     app.setApplicationName("GPU PDF Viewer")
-    app.setApplicationVersion("1.0")
-    app.setOrganizationName("FastPDF")
+    app.setStyle("Fusion")  # Skip version and organization for faster startup
     
-    # Apply OS dark mode theme
-    app.setStyle("Fusion")
-    palette = app.palette()
+    # Skip dark mode detection for faster startup - use default theme
+    # (Dark mode can be applied later if needed)
     
-    # Check for dark mode preference
-    try:
-        import winreg
-        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
-        key = winreg.OpenKey(registry, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        dark_mode_value = winreg.QueryValueEx(key, "AppsUseLightTheme")[0]
-        is_dark_mode = dark_mode_value == 0  # 0 = dark mode, 1 = light mode
-        winreg.CloseKey(key)
-    except:
-        # Fallback: check if system uses dark mode
-        is_dark_mode = False
-    
-    if is_dark_mode:
-        # Dark theme colors
-        palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-        palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.Base, QColor(53,   53, 53))
-        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-        palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-        palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
-        palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-        palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-        palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
-    
-    app.setPalette(palette)
-    
-    # Create and show main window
+    # Show main window immediately with minimal initialization
     viewer = PDFViewer()
     viewer.show()
     
-    # Load PDF from command line if provided
+    # Process events to make window visible immediately
+    app.processEvents()
+    
+    # Load PDF from command line if provided (after window is shown)
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) and sys.argv[1].endswith('.pdf'):
-        viewer.load_pdf(sys.argv[1])
+        # Use QTimer to load PDF after window is shown
+        QTimer.singleShot(100, lambda: viewer.load_pdf(sys.argv[1]))
     
     # Hide the menu bar as per the change request
     viewer.menuBar().hide()
