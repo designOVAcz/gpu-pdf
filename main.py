@@ -79,7 +79,7 @@ os.environ['QT_IMAGEIO_MAXALLOC'] = '1024'  # Set to 1GB
 class GPUTextureCache:
     """Manages GPU textures for PDF pages"""
     
-    def __init__(self, max_textures=25):  # Increased cache size for high-quality textures
+    def __init__(self, max_textures=12):  # Increase slightly for better quality retention
         self.textures = {}  # (page_num, quality) -> QOpenGLTexture
         self.page_textures = {}  # page_num -> best_quality_texture (for backwards compatibility)
         self.dimensions = {}  # page_num -> (width, height)
@@ -185,8 +185,8 @@ class GPUTextureCache:
             self.access_order.remove(key)
         self.access_order.append(key)
         
-        # Mark high-quality textures as priority (keep them longer)
-        if quality >= 6.0:  # High-quality threshold
+        # Mark high-quality textures as priority (keep them longer) - but with higher threshold
+        if quality >= 4.5:  # Increased threshold to reduce priority textures
             self.priority_textures.add(key)
         
         # Update best texture for this page
@@ -310,13 +310,37 @@ class PDFPageRenderer(QThread):
         # (initialized in __init__ above)
 
     def add_page_to_queue(self, page_num: int, priority=False, quality=None):
+        # Skip queueing entirely during fast operations to prevent lag
+        viewer = self.parent() if hasattr(self, 'parent') else None
+        if viewer and hasattr(viewer, 'pdf_widget'):
+            # Allow priority renders but block regular renders during interactions
+            if (getattr(viewer.pdf_widget, '_fast_zoom_mode', False) or 
+                getattr(viewer.pdf_widget, 'is_panning', False) or
+                getattr(viewer.pdf_widget, '_interaction_mode', False)):
+                # During interactions, only allow priority rendering of current page with readable quality
+                if not priority:
+                    return  # Block all non-priority renders
+                # For priority renders during interaction, ensure minimum readable quality
+                if quality and quality < 2.8:
+                    quality = 2.8  # Ensure readable quality even during interactions
+        
         with self._lock:
+            # Limit queue sizes for better performance - balanced for quality and speed  
+            max_priority_queue = 4  # Small but allows essential quality updates
+            max_regular_queue = 6  # Small but allows background processing
+            
             # Check if page is already in either queue
             priority_pages = [p[0] if isinstance(p, tuple) else p for p in self._priority_queue]
             regular_pages = [p[0] if isinstance(p, tuple) else p for p in self._queue]
             
             if page_num in priority_pages or page_num in regular_pages:
                 return  # Already queued
+                
+            # Check queue limits
+            if priority and len(self._priority_queue) >= max_priority_queue:
+                return  # Priority queue full - skip to avoid lag
+            elif not priority and len(self._queue) >= max_regular_queue:
+                return  # Regular queue full - skip to avoid lag
                 
             if priority:
                 # Add to priority queue (for grid pages) with lower quality for speed
@@ -337,6 +361,15 @@ class PDFPageRenderer(QThread):
                 print(f"PDFPageRenderer: failed to open {self.pdf_path}: {e}")
                 self.pdf_doc = None
             while self._running:
+                # Allow limited processing during interactions but with reduced priority
+                viewer = self.parent() if hasattr(self, 'parent') else None
+                if viewer and hasattr(viewer, 'pdf_widget'):
+                    if (getattr(viewer.pdf_widget, '_fast_zoom_mode', False) or 
+                        getattr(viewer.pdf_widget, 'is_panning', False) or
+                        getattr(viewer.pdf_widget, '_interaction_mode', False)):
+                        time.sleep(0.03)  # Slightly longer sleep during interactions
+                        continue
+                
                 page_info = None
                 with self._lock:
                     # Process priority queue first (grid pages)
@@ -346,8 +379,8 @@ class PDFPageRenderer(QThread):
                         page_info = self._queue.pop(0)
 
                 if page_info is None:
-                    # Sleep much less when there's nothing to do - check queue more frequently
-                    time.sleep(0.005)  # Reduced from 0.02 to 0.005
+                    # Sleep longer for better performance when no work to do
+                    time.sleep(0.016)  # ~60 FPS equivalent for better CPU usage
                     continue
 
                 # Extract page number and quality
@@ -405,10 +438,10 @@ class GPUPDFWidget(QOpenGLWidget):
         self.page_width = 1.0
         self.page_height = 1.0
         
-        # Zoom-adaptive quality settings
-        self.base_quality = 4.0  # Much higher base quality for sharp text at all levels
-        self.quality_zoom_threshold = 1.0  # Start high quality immediately when zooming
-        self.max_quality = 12.0  # Ultra-high maximum quality for razor-sharp high zoom text
+        # Zoom-adaptive quality settings - optimized for performance vs quality balance
+        self.base_quality = 3.0  # Restore readable quality 
+        self.quality_zoom_threshold = 1.5  # Start high quality at reasonable zoom level
+        self.max_quality = 5.0  # Good quality limit for readable text
         self.last_zoom_quality = self.base_quality
 
         # Grid view attributes
@@ -431,6 +464,16 @@ class GPUPDFWidget(QOpenGLWidget):
         self.temp_zoom_factor = 1.0
         self.temp_pan_x = 0.0
         self.temp_pan_y = 0.0
+        
+        # Performance optimization
+        self._last_update_time = 0
+        self._min_update_interval = 16  # ~60 FPS limit (16ms between updates)
+        
+        # Fast zoom optimization variables
+        self._fast_zoom_mode = False
+        self._fast_zoom_start_time = 0
+        self._fast_zoom_timeout = 600  # Faster timeout for quicker quality recovery
+        self._interaction_mode = False  # Track any user interaction
         
         # Rendering and threading
         self.last_mouse_pos = QPointF()
@@ -457,6 +500,33 @@ class GPUPDFWidget(QOpenGLWidget):
             # Light theme
             glClearColor(0.9, 0.9, 0.9, 1.0)
     
+    def update(self, *args, **kwargs):
+        """Frame rate limited update method for better performance"""
+        import time
+        current_time = time.time() * 1000  # Convert to milliseconds
+        
+        # Dynamic frame rate limiting based on zoom level for close zoom optimization
+        effective_zoom = self.zoom_factor
+        if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+            effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+        
+        # Increase minimum interval for high zoom to reduce lag
+        if effective_zoom > 5.0:
+            min_interval = 32  # ~30 FPS for very high zoom
+        elif effective_zoom > 3.0:
+            min_interval = 24  # ~40 FPS for high zoom
+        else:
+            min_interval = self._min_update_interval  # ~60 FPS for normal zoom
+        
+        # Only update if enough time has passed since last update
+        if current_time - self._last_update_time >= min_interval:
+            self._last_update_time = current_time
+            super().update(*args, **kwargs)
+    
+    def force_update(self):
+        """Force immediate update bypassing frame rate limiting"""
+        super().update()
+    
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT)
         
@@ -464,9 +534,30 @@ class GPUPDFWidget(QOpenGLWidget):
         import time
         self.animation_time = time.time()
         
-        # Process more pending images per frame for faster grid loading
+        # Process fewer pending images per frame for better responsiveness
+        # Allow minimal texture processing during interactions for acceptable quality
+        # But prioritize responsiveness over quality updates
+        if (getattr(self, '_fast_zoom_mode', False) or 
+            getattr(self, 'is_panning', False) or 
+            getattr(self, '_interaction_mode', False)):
+            # Very minimal processing during interactions - just maintain existing quality
+            max_items = 1  # Allow 1 texture per frame to maintain some quality
+        else:
+            # Normal processing when not interacting - restore reasonable processing
+            effective_zoom = self.zoom_factor
+            if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+                effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+            
+            if effective_zoom > 4.0:
+                max_items = 2  # Process 2 textures per frame during high zoom
+            elif effective_zoom > 2.0:
+                max_items = 3  # Process 3 textures per frame during medium zoom
+            else:
+                max_items = 4  # Normal processing for low zoom - increased for quality
+        
         try:
-            self.process_pending_images(max_items=8)  # Increased from 1 to 8
+            if max_items > 0:
+                self.process_pending_images(max_items=max_items)
         except Exception:
             pass
         
@@ -925,11 +1016,12 @@ class GPUPDFWidget(QOpenGLWidget):
             glClearColor(0.9, 0.9, 0.9, 1.0)
         self.update()
     
-    def get_zoom_adjusted_quality(self, progressive=False):
+    def get_zoom_adjusted_quality(self, progressive=False, fast_zoom=False):
         """Calculate rendering quality based on current zoom level
         
         Args:
             progressive: If True, returns a lower quality for immediate display
+            fast_zoom: If True, use optimized quality for responsive zooming
         """
         # Calculate effective zoom including temporary zoom
         effective_zoom = self.zoom_factor
@@ -939,23 +1031,28 @@ class GPUPDFWidget(QOpenGLWidget):
         if effective_zoom <= self.quality_zoom_threshold:
             return self.base_quality
         
-        # Ultra-aggressive quality scaling for highest zoom quality
+        # For fast zoom at high levels, use readable quality but limited processing
+        if fast_zoom and effective_zoom > 2.0:
+            # Use decent quality during fast zoom but cap it for performance
+            return min(self.base_quality * 1.2, 4.0)  # Readable quality during fast zoom
+        
+        # Optimized quality scaling for performance - more conservative at high zoom
         zoom_excess = effective_zoom - self.quality_zoom_threshold
         
-        # Enhanced quality scaling with different tiers
-        if effective_zoom <= 2.0:
+        # Performance-focused quality scaling
+        if effective_zoom <= 3.0:
             # Normal zoom: moderate scaling
-            quality_boost = zoom_excess * 1.0
-        elif effective_zoom <= 4.0:
-            # High zoom: aggressive scaling
-            base_boost = (2.0 - self.quality_zoom_threshold) * 1.0
-            high_boost = (effective_zoom - 2.0) * 1.5
+            quality_boost = zoom_excess * 0.4  # Reduced for better performance
+        elif effective_zoom <= 8.0:
+            # High zoom: very conservative scaling to avoid lag
+            base_boost = (3.0 - self.quality_zoom_threshold) * 0.4
+            high_boost = (effective_zoom - 3.0) * 0.2  # Much more conservative
             quality_boost = base_boost + high_boost
         else:
-            # Ultra-high zoom: maximum quality with performance consideration
-            base_boost = (2.0 - self.quality_zoom_threshold) * 1.0
-            high_boost = 2.0 * 1.5
-            ultra_boost = (effective_zoom - 4.0) * 2.0
+            # Ultra-high zoom: minimal additional quality to prevent lag
+            base_boost = (3.0 - self.quality_zoom_threshold) * 0.4
+            high_boost = 5.0 * 0.2
+            ultra_boost = min((effective_zoom - 8.0) * 0.1, 0.5)  # Very limited boost
             quality_boost = base_boost + high_boost + ultra_boost
             
         adjusted_quality = min(self.base_quality + quality_boost, self.max_quality)
@@ -968,13 +1065,27 @@ class GPUPDFWidget(QOpenGLWidget):
     
     def get_immediate_quality(self):
         """Get quality for immediate display (faster rendering)"""
-        # Always use base quality for immediate display, regardless of zoom
-        return self.base_quality
+        # Use better immediate quality to maintain readability
+        return max(self.base_quality, 2.8)  # Ensure readable immediate quality
     
     def check_quality_change(self):
         """Check if quality needs updating due to zoom change and re-render if needed"""
         new_quality = self.get_zoom_adjusted_quality()
-        if abs(new_quality - self.last_zoom_quality) > 0.05:  # Even more sensitive for ultra-high zoom
+        
+        # Dynamic quality sensitivity based on zoom level - be less sensitive at high zoom
+        effective_zoom = self.zoom_factor
+        if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+            effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+        
+        # Much higher sensitivity threshold for high zoom to prevent lag - be very conservative
+        if effective_zoom > 4.0:
+            sensitivity = 2.0  # Very insensitive at high zoom - only major changes
+        elif effective_zoom > 2.0:
+            sensitivity = 1.5  # Less sensitive at medium zoom
+        else:
+            sensitivity = 1.0  # Still less sensitive than before for low zoom
+        
+        if abs(new_quality - self.last_zoom_quality) > sensitivity:
             self.last_zoom_quality = new_quality
             # Re-render current content with progressive quality
             viewer = self.window()
@@ -991,12 +1102,12 @@ class GPUPDFWidget(QOpenGLWidget):
                     if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
                         effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
                     
-                    # For ultra-high zoom levels, prioritize immediate high-quality rendering
+                    # For ultra-high zoom levels, be more selective about clearing textures
                     existing_texture = self.texture_cache.get_texture(current_page)
                     if existing_texture and effective_zoom > self.quality_zoom_threshold:
                         current_quality = self.texture_cache.get_best_quality_for_page(current_page)
-                        # If zoom is very high and current quality is much lower, clear texture
-                        if effective_zoom > 5.0 and new_quality > current_quality + 2.0:
+                        # Only clear texture if zoom is very high and current quality is much lower
+                        if effective_zoom > 8.0 and new_quality > current_quality + 3.0:  # Much higher thresholds
                             self.texture_cache.remove_texture(current_page)
                             self.set_page_texture(None)
                         # Keep current texture visible while rendering higher quality in background
@@ -1008,6 +1119,49 @@ class GPUPDFWidget(QOpenGLWidget):
                 
                 # Trigger progressive re-render
                 viewer.render_current_page_progressive()
+    
+    def _schedule_delayed_quality_check(self):
+        """Schedule a delayed quality check to avoid lag during rapid zoom changes"""
+        if not hasattr(self, '_delayed_quality_timer'):
+            self._delayed_quality_timer = QTimer()
+            self._delayed_quality_timer.setSingleShot(True)
+            self._delayed_quality_timer.timeout.connect(self.check_quality_change)
+        
+        # Use longer delay for high zoom to reduce processing load
+        effective_zoom = self.zoom_factor
+        if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+            effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+        
+        # Use shorter delays for faster quality recovery while still preventing lag during interaction
+        if effective_zoom > 5.0:
+            delay = 600  # 600ms for very high zoom
+        elif effective_zoom > 3.0:
+            delay = 400  # 400ms for high zoom  
+        else:
+            delay = 300  # 300ms for moderate zoom
+            
+        self._delayed_quality_timer.start(delay)
+    
+    def _enable_fast_zoom_mode(self):
+        """Enable fast zoom mode to reduce processing during rapid zoom changes"""
+        import time
+        self._fast_zoom_mode = True
+        self._fast_zoom_start_time = time.time() * 1000
+        
+        # Auto-disable fast zoom mode after timeout
+        if not hasattr(self, '_fast_zoom_timer'):
+            self._fast_zoom_timer = QTimer()
+            self._fast_zoom_timer.setSingleShot(True)
+            self._fast_zoom_timer.timeout.connect(self._disable_fast_zoom_mode)
+        
+        self._fast_zoom_timer.start(self._fast_zoom_timeout)
+    
+    def _disable_fast_zoom_mode(self):
+        """Disable fast zoom mode and trigger quality update"""
+        self._fast_zoom_mode = False
+        # Trigger quality check now that zooming has stabilized - but only if not panning
+        if not getattr(self, 'is_panning', False):
+            self.check_quality_change()
     
     def render_current_page_progressive(self):
         """Render current page with progressive quality loading"""
@@ -1046,7 +1200,12 @@ class GPUPDFWidget(QOpenGLWidget):
             self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
             self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
         
-        self.check_quality_change()
+        # For high zoom levels, enable fast zoom mode and use delayed quality check
+        if self.zoom_factor > 3.0:
+            self._enable_fast_zoom_mode()
+            self._schedule_delayed_quality_check()
+        else:
+            self.check_quality_change()
         self.update()
     
     def zoom_out(self, cursor_pos=None):
@@ -1064,7 +1223,12 @@ class GPUPDFWidget(QOpenGLWidget):
             self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
             self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
         
-        self.check_quality_change()
+        # For high zoom levels, enable fast zoom mode and use delayed quality check
+        if old_zoom > 3.0:  # Use old_zoom to catch zoom out from high levels
+            self._enable_fast_zoom_mode()
+            self._schedule_delayed_quality_check()
+        else:
+            self.check_quality_change()
         self.update()
     
     def reset_zoom(self):
@@ -1124,24 +1288,29 @@ class GPUPDFWidget(QOpenGLWidget):
 
         self.is_temp_zoomed = True
         
-        # Trigger quality check and high-quality re-render for the zoomed page
-        self.check_quality_change()
+        # Enable fast zoom mode for grid temp zoom to improve responsiveness
+        self._enable_fast_zoom_mode()
         
-        # Request high-quality texture for the focused page if needed
+        # Trigger quality check with delay to avoid immediate lag
+        if not hasattr(self, '_zoom_quality_timer'):
+            self._zoom_quality_timer = QTimer()
+            self._zoom_quality_timer.setSingleShot(True)
+            self._zoom_quality_timer.timeout.connect(lambda: self.check_quality_change())
+        
+        # Longer delay for grid zoom to prevent lag during rapid zooming
+        self._zoom_quality_timer.start(400)  # 400ms delay for smoother grid zoom
+        
+        # Request high-quality texture for the focused page if needed - but more performance conscious
         viewer = self.window()
         if viewer and hasattr(viewer, 'renderer') and viewer.renderer:
             effective_zoom = self.zoom_factor * self.temp_zoom_factor
             final_quality = self.get_zoom_adjusted_quality()
             current_best_quality = self.texture_cache.get_best_quality_for_page(page_num)
             
-            # Always force re-render when zooming thumbnails if quality can be improved
-            if final_quality > current_best_quality + 0.1:  # Very low threshold
-                # Always remove existing texture to force high-quality re-render
-                self.texture_cache.remove_texture(page_num)
-                if page_num in self.grid_textures:
-                    del self.grid_textures[page_num]
-                # Request immediate high-quality render
-                viewer.renderer.add_page_to_queue(page_num, priority=True, quality=final_quality)
+            # Only queue better quality if gap is significant and don't force immediate render
+            if final_quality > current_best_quality + 2.0:  # Higher threshold for performance
+                # Use background priority for smooth zooming
+                viewer.renderer.add_page_to_queue(page_num, priority=False, quality=final_quality)
         
         self.update()
 
@@ -1155,6 +1324,17 @@ class GPUPDFWidget(QOpenGLWidget):
             self.update()
 
     def wheelEvent(self, event):
+        # Enable interaction mode during wheel zoom for better performance
+        self._interaction_mode = True
+        
+        # Auto-disable interaction mode after a delay
+        if not hasattr(self, '_interaction_timer'):
+            self._interaction_timer = QTimer()
+            self._interaction_timer.setSingleShot(True)
+            self._interaction_timer.timeout.connect(lambda: setattr(self, '_interaction_mode', False))
+        
+        self._interaction_timer.start(500)  # 500ms timeout
+        
         # Zoom with mouse wheel towards cursor position
         cursor_pos = event.position()
         delta = event.angleDelta().y()
@@ -1178,8 +1358,18 @@ class GPUPDFWidget(QOpenGLWidget):
                 self.temp_pan_x = cursor_x + (self.temp_pan_x - cursor_x) * zoom_ratio
                 self.temp_pan_y = cursor_y + (self.temp_pan_y - cursor_y) * zoom_ratio
             
-            # CRITICAL: Trigger quality check for grid temp zoom - same as single page!
-            self.check_quality_change()
+            # Enable fast zoom mode for rapid temp zoom changes
+            self._enable_fast_zoom_mode()
+            
+            # CRITICAL: Trigger quality check for grid temp zoom - but with delay to avoid lag
+            # Use a timer to debounce quality checks during rapid zoom changes
+            if not hasattr(self, '_quality_check_timer'):
+                self._quality_check_timer = QTimer()
+                self._quality_check_timer.setSingleShot(True)
+                self._quality_check_timer.timeout.connect(self.check_quality_change)
+            
+            # Longer delay for wheel zoom to prevent lag during rapid zooming
+            self._quality_check_timer.start(400)  # 400ms delay for better responsiveness
             
             self.update()
         else:
@@ -1195,6 +1385,7 @@ class GPUPDFWidget(QOpenGLWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = True
+            self._interaction_mode = True  # Enable interaction mode for performance
             self.last_mouse_pos = event.position()
         elif event.button() == Qt.MouseButton.MiddleButton:
             # Middle mouse click goes to next page
@@ -1225,6 +1416,15 @@ class GPUPDFWidget(QOpenGLWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = False
+            self._interaction_mode = False  # Disable interaction mode
+            # Re-enable rendering after panning stops, but with delay
+            if not hasattr(self, '_pan_end_timer'):
+                self._pan_end_timer = QTimer()
+                self._pan_end_timer.setSingleShot(True)
+                self._pan_end_timer.timeout.connect(self.check_quality_change)
+            
+            # Small delay before quality check to ensure smooth pan end
+            self._pan_end_timer.start(250)  # Reduced delay for faster quality recovery
 
 
 class PDFViewer(QMainWindow):
@@ -1236,7 +1436,7 @@ class PDFViewer(QMainWindow):
         self.pdf_doc = None
         self.current_page = 0
         self.total_pages = 0
-        self.render_quality = 4.0
+        self.render_quality = 3.0
         
         self.renderer = None
         self.thumbnail_worker = None
@@ -1872,14 +2072,14 @@ Press 'L' to cycle through modes."""
                 self.pdf_widget.update()
     
     def render_grid_pages(self):
-        """Render multiple pages for grid view with SAME ultra-high quality as single page"""
+        """Render multiple pages for grid view with optimized high quality"""
         if not self.pdf_doc:
             return
         
         grid_textures = {}
         pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
         
-        # Use EXACTLY the same quality system as single page view - no reductions!
+        # Use same quality system as single page view but with performance optimization
         grid_quality = self.pdf_widget.get_zoom_adjusted_quality()
         
         # Collect pages starting from current page
@@ -1888,33 +2088,29 @@ Press 'L' to cycle through modes."""
             if page_num >= self.total_pages:
                 break
             
-            # For grid view, always prefer high-quality textures when available
-            # Check if we need higher quality than what we have
+            # Check if we have adequate quality texture available
             current_best_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
-            texture = None
+            texture = self.pdf_widget.texture_cache.get_texture(page_num)
             
-            # If we need much higher quality, force re-render
-            if grid_quality > current_best_quality + 0.5:
-                # Remove low-quality texture to force high-quality re-render
-                if current_best_quality > 0:
-                    self.pdf_widget.texture_cache.remove_texture(page_num)
-                # Queue for immediate high-quality rendering
-                if self.renderer:
-                    self.renderer.add_page_to_queue(page_num, priority=True, quality=grid_quality)
-            else:
-                # Use existing texture if quality is adequate
-                texture = self.pdf_widget.texture_cache.get_texture(page_num)
-                if texture:
+            if texture and current_best_quality > 0:
+                # Use existing texture if quality is reasonable (within 1.0 of target)
+                if grid_quality <= current_best_quality + 1.0:
                     grid_textures[page_num] = texture
-                elif self.renderer:
-                    # Queue for high-quality rendering
+                else:
+                    # Quality gap is significant - queue for improvement but use current texture
+                    grid_textures[page_num] = texture
+                    if self.renderer:
+                        self.renderer.add_page_to_queue(page_num, priority=False, quality=grid_quality)
+            else:
+                # No texture available - queue for rendering
+                if self.renderer:
                     self.renderer.add_page_to_queue(page_num, priority=True, quality=grid_quality)
         
         # Set grid textures
         self.pdf_widget.set_grid_textures(grid_textures)
         
-        # If we don't have all textures, they will be added when rendering completes
-        if len(grid_textures) < pages_needed:
+        # Update if we have textures to show
+        if len(grid_textures) > 0:
             self.pdf_widget.update()
     
     def generate_thumbnails(self, around_page=None, radius=15, preserve_scroll=True):
