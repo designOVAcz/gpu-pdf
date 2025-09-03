@@ -594,9 +594,9 @@ class GPUPDFWidget(QOpenGLWidget):
     # Remove Qt palette/stylesheet background for OpenGL widget to avoid blending issues
 
         # Zoom-adaptive quality settings - optimized for performance vs quality balance
-        self.base_quality = 3.0  # Restore readable quality 
+        self.base_quality = 2.5  # Reduced from 3.0 for better performance
         self.quality_zoom_threshold = 1.5  # Start high quality at reasonable zoom level
-        self.max_quality = 5.0  # Good quality limit for readable text
+        self.max_quality = 4.0  # Reduced from 5.0 to limit memory usage
         self.last_zoom_quality = self.base_quality
 
         # Grid view attributes
@@ -1088,7 +1088,15 @@ class GPUPDFWidget(QOpenGLWidget):
         count = 0
         while self._pending_images and count < max_items:
             try:
-                page_num, qimage, page_w, page_h, quality = self._pending_images.pop(0)
+                item = self._pending_images.pop(0)
+                
+                # Check if this is a tuple with the expected structure
+                if not isinstance(item, tuple) or len(item) < 5:
+                    print(f"Invalid pending image format: {item}")
+                    count += 1
+                    continue
+                
+                page_num, qimage, page_w, page_h, quality = item
                 
                 # Check if this is new dimension info for grid layout
                 had_dimensions = self.texture_cache.get_dimensions(page_num) is not None
@@ -1189,18 +1197,18 @@ class GPUPDFWidget(QOpenGLWidget):
         # Performance-focused quality scaling
         if effective_zoom <= 3.0:
             # Normal zoom: moderate scaling
-            quality_boost = zoom_excess * 0.4  # Reduced for better performance
-        elif effective_zoom <= 8.0:
+            quality_boost = zoom_excess * 0.3  # Reduced for better performance
+        elif effective_zoom <= 6.0:
             # High zoom: very conservative scaling to avoid lag
-            base_boost = (3.0 - self.quality_zoom_threshold) * 0.4
-            high_boost = (effective_zoom - 3.0) * 0.2  # Much more conservative
+            base_boost = (3.0 - self.quality_zoom_threshold) * 0.3
+            high_boost = (effective_zoom - 3.0) * 0.15  # More conservative
             quality_boost = base_boost + high_boost
         else:
             # Ultra-high zoom: minimal additional quality to prevent lag
-            base_boost = (3.0 - self.quality_zoom_threshold) * 0.4
-            high_boost = 5.0 * 0.2
-            ultra_boost = min((effective_zoom - 8.0) * 0.1, 0.5)  # Very limited boost
-            quality_boost = base_boost + high_boost + ultra_boost
+            base_boost = (3.0 - self.quality_zoom_threshold) * 0.3
+            high_boost = 3.0 * 0.15
+            # Cap ultra-high zoom quality to avoid excessive memory usage
+            quality_boost = base_boost + high_boost
             
         adjusted_quality = min(self.base_quality + quality_boost, self.max_quality)
         
@@ -1309,6 +1317,33 @@ class GPUPDFWidget(QOpenGLWidget):
         # Trigger quality check now that zooming has stabilized - but only if not panning
         if not getattr(self, 'is_panning', False):
             self.check_quality_change()
+        
+        # Update status bar with current zoom level
+        self.update_status()
+    
+    def update_status(self):
+        """Update status bar with current info"""
+        viewer = self.window()
+        if not viewer or not hasattr(viewer, 'status_bar'):
+            return
+            
+        # Format zoom as percentage with 0 decimal places
+        zoom_percent = int(self.zoom_factor * 100)
+        quality = self.get_zoom_adjusted_quality()
+        
+        # Include page info if available
+        if hasattr(viewer, 'current_page') and hasattr(viewer, 'total_pages'):
+            page_info = f"Page {viewer.current_page + 1}/{viewer.total_pages}"
+        else:
+            page_info = ""
+            
+        # Create status message
+        if page_info:
+            status_message = f"{page_info} | Zoom: {zoom_percent}% | Quality: {quality:.1f}"
+        else:
+            status_message = f"Zoom: {zoom_percent}% | Quality: {quality:.1f}"
+            
+        viewer.status_bar.showMessage(status_message)
     
     def render_current_page_progressive(self):
         """Render current page with progressive quality loading"""
@@ -1347,6 +1382,9 @@ class GPUPDFWidget(QOpenGLWidget):
             self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
             self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
         
+        # Update status bar with new zoom level
+        self.update_status()
+        
         # For high zoom levels, enable fast zoom mode and use delayed quality check
         if self.zoom_factor > 3.0:
             self._enable_fast_zoom_mode()
@@ -1369,6 +1407,9 @@ class GPUPDFWidget(QOpenGLWidget):
             # Adjust pan to keep cursor point stable
             self.pan_x = cursor_x + (self.pan_x - cursor_x) * zoom_ratio
             self.pan_y = cursor_y + (self.pan_y - cursor_y) * zoom_ratio
+            
+        # Update status bar with new zoom level
+        self.update_status()
         
         # For high zoom levels, enable fast zoom mode and use delayed quality check
         if old_zoom > 3.0:  # Use old_zoom to catch zoom out from high levels
@@ -1383,6 +1424,7 @@ class GPUPDFWidget(QOpenGLWidget):
         self.pan_x = 0.0
         self.pan_y = 0.0
         self.check_quality_change()
+        self.update_status()
         self.update()
     
     def zoom_to_grid_page(self, page_num):
@@ -2263,9 +2305,13 @@ Press 'L' to cycle through modes."""
                 self._current_thumb_range = (0, min(30, self.total_pages - 1))  # Initial range
             
             # Show final loaded status
-            self.status_bar.showMessage(f"Loaded: {os.path.basename(self.pdf_path)} ({self.total_pages} pages)")
+            file_name = os.path.basename(self.pdf_path)
+            zoom_percent = int(self.pdf_widget.zoom_factor * 100)
+            quality = self.pdf_widget.get_zoom_adjusted_quality()
+            self.status_bar.showMessage(f"Loaded: {file_name} | Page 1/{self.total_pages} | Zoom: {zoom_percent}% | Quality: {quality:.1f}")
             
-            # Clear status to "Ready" after a brief moment
+            # Update PDF widget status
+            self.pdf_widget.update_status()
             QTimer.singleShot(2000, lambda: self.status_bar.showMessage("Ready"))
         except Exception as e:
             print(f"Thumbnail generation error: {e}")
