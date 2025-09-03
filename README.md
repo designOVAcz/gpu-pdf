@@ -44,6 +44,22 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. It is
     *   Click and drag to pan the document when zoomed in.
     *   Use the buttons on the toolbar to switch between single-page and grid views, and to navigate pages.
 
+## Compiling to a Standalone Binary
+
+You can compile this app to a standalone executable for Windows, Linux, or Mac using [PyInstaller](https://pyinstaller.org/).
+
+1. **Install PyInstaller:**
+   ```sh
+   pip install pyinstaller
+   ```
+2. **Build the Executable:**
+   ```sh
+   pyinstaller --noconfirm --onefile --windowed main.py
+   ```
+   - The binary will be in the `dist/` folder.
+   - For cross-compiling, build on the target OS or use a cross-compilation toolchain.
+   - 
 ## License
 
 MIT License.
+
