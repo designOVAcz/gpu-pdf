@@ -119,6 +119,101 @@ class GPUTextureCache:
                     return best_texture
         
         # Fallback to backwards compatibility - get best available texture for page
+        if page_num in self.page_textures:
+            return self.page_textures[page_num]
+        return None
+        
+    def add_texture(self, page_num, image, page_width, page_height, quality=1.0):
+        """Add a new texture to the cache"""
+        # Create a new OpenGL texture from the QImage
+        texture = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
+        texture.create()
+        texture.setSize(image.width(), image.height())
+        texture.setFormat(QOpenGLTexture.TextureFormat.RGBA8_UNorm)
+        texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+        texture.setWrapMode(QOpenGLTexture.CoordinateDirection.DirectionS, QOpenGLTexture.WrapMode.ClampToEdge)
+        texture.setWrapMode(QOpenGLTexture.CoordinateDirection.DirectionT, QOpenGLTexture.WrapMode.ClampToEdge)
+        texture.setData(image)
+        
+        # Store the texture and update LRU
+        key = (page_num, quality)
+        self.textures[key] = texture
+        self.dimensions[page_num] = (page_width, page_height)
+        self.qualities[key] = quality
+        self.page_textures[page_num] = texture
+        
+        # Update access order for LRU
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+        
+        # Enforce cache size limit
+        self._enforce_cache_limit()
+        
+        return texture
+        
+    def get_dimensions(self, page_num):
+        """Get the dimensions of a page"""
+        if page_num in self.dimensions:
+            return self.dimensions[page_num]
+        return None
+        
+    def get_best_quality_for_page(self, page_num):
+        """Get the best quality available for a page"""
+        best_quality = 0.0
+        for (p, q), quality_val in self.qualities.items():
+            if p == page_num and quality_val > best_quality:
+                best_quality = quality_val
+        return best_quality if best_quality > 0.0 else None
+        
+    def remove_texture(self, page_num):
+        """Remove a texture from the cache"""
+        keys_to_remove = []
+        for (p, q) in self.textures.keys():
+            if p == page_num:
+                keys_to_remove.append((p, q))
+        
+        for key in keys_to_remove:
+            self.textures[key].destroy()
+            del self.textures[key]
+            if key in self.access_order:
+                self.access_order.remove(key)
+            if key in self.qualities:
+                del self.qualities[key]
+        
+        if page_num in self.page_textures:
+            del self.page_textures[page_num]
+        if page_num in self.dimensions:
+            del self.dimensions[page_num]
+            
+    def clear(self):
+        """Clear all textures from the cache"""
+        for texture in self.textures.values():
+            texture.destroy()
+        self.textures.clear()
+        self.page_textures.clear()
+        self.dimensions.clear()
+        self.qualities.clear()
+        self.access_order.clear()
+        self.priority_textures.clear()
+        
+    def _enforce_cache_limit(self):
+        """Remove least recently used textures if cache exceeds max size"""
+        while len(self.textures) > self.max_textures:
+            # Find the least recently used texture that's not priority
+            for key in self.access_order:
+                if key not in self.priority_textures:
+                    # Remove this texture
+                    self.textures[key].destroy()
+                    del self.textures[key]
+                    self.access_order.remove(key)
+                    del self.qualities[key]
+                    # Also remove from page_textures if it's there
+                    page_num = key[0]
+                    if page_num in self.page_textures and self.page_textures[page_num] == self.textures[key]:
+                        del self.page_textures[page_num]
+                    break
 
 
 class BackgroundMatchDialog(QDialog):
@@ -494,6 +589,7 @@ class GPUPDFWidget(QOpenGLWidget):
         self.page_texture = None
         self.page_width = 1.0
         self.page_height = 1.0
+        self._pending_images = []  # Queue for pending texture creation
 
     # Remove Qt palette/stylesheet background for OpenGL widget to avoid blending issues
 
@@ -2102,8 +2198,25 @@ Press 'L' to cycle through modes."""
                 self.thumbnail_worker.wait()
             
             # Clear texture cache and grid textures when loading new document
-            self.pdf_widget.texture_cache.clear()
-            self.pdf_widget.grid_textures.clear()
+            try:
+                if hasattr(self.pdf_widget, 'texture_cache') and self.pdf_widget.texture_cache:
+                    if hasattr(self.pdf_widget.texture_cache, 'clear'):
+                        self.pdf_widget.texture_cache.clear()
+                    else:
+                        # Recreate texture cache if methods are missing
+                        print("Warning: Recreating texture cache due to missing methods")
+                        self.pdf_widget.texture_cache = GPUTextureCache()
+            except Exception as e:
+                print(f"Warning: Could not clear texture cache: {e}")
+                # Fallback: recreate texture cache
+                self.pdf_widget.texture_cache = GPUTextureCache()
+            
+            try:
+                if hasattr(self.pdf_widget, 'grid_textures'):
+                    self.pdf_widget.grid_textures.clear()
+            except Exception as e:
+                print(f"Warning: Could not clear grid textures: {e}")
+                
             self.pdf_widget.set_page_texture(None)  # Clear current page texture
             
             # Open new document
@@ -2652,17 +2765,40 @@ Press 'L' to cycle through modes."""
             self.pdf_widget._pending_images.append((page_num, image, page_width, page_height, quality))
             # Trigger a repaint so the widget can process pending images
             self.pdf_widget.update()
-        except Exception:
+        except AttributeError:
+            # Fix missing _pending_images attribute
+            print("Adding missing _pending_images attribute to GPUPDFWidget")
+            self.pdf_widget._pending_images = [(page_num, image, page_width, page_height, quality)]
+            self.pdf_widget.update()
+        except Exception as e:
+            print(f"Error in pending images queue: {e}")
             # Fallback: synchronous path (if something unexpected)
-            texture = self.pdf_widget.texture_cache.add_texture(page_num, image, page_width, page_height, quality)
-            if self.pdf_widget.grid_mode:
-                pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
-                start_page = self.current_page
-                end_page = min(start_page + pages_needed, self.total_pages)
-                if start_page <= page_num < end_page:
-                    self.pdf_widget.grid_textures[page_num] = texture
-                    self.pdf_widget.update()
-            else:
+            try:
+                texture = self.pdf_widget.texture_cache.add_texture(page_num, image, page_width, page_height, quality)
+                if self.pdf_widget.grid_mode:
+                    pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                    start_page = self.current_page
+                    end_page = min(start_page + pages_needed, self.total_pages)
+                    if start_page <= page_num < end_page:
+                        self.pdf_widget.grid_textures[page_num] = texture
+                        self.pdf_widget.update()
+                else:
+                    if page_num == self.current_page:
+                        self.pdf_widget.set_page_texture(texture, image.width(), image.height())
+            except AttributeError as e:
+                print(f"Warning: Texture cache method missing: {e}")
+                # Recreate texture cache if it's missing the add_texture method
+                print("Recreating texture cache with missing methods")
+                self.pdf_widget.texture_cache = GPUTextureCache()
+                # Try again with the new cache
+                try:
+                    texture = self.pdf_widget.texture_cache.add_texture(page_num, image, page_width, page_height, quality)
+                    if page_num == self.current_page:
+                        self.pdf_widget.set_page_texture(texture, page_width, page_height)
+                except Exception as e2:
+                    print(f"Error creating texture after cache recreation: {e2}")
+            except Exception as e:
+                print(f"Error creating texture: {e}")
                 if page_num == self.current_page:
                     self.pdf_widget.set_page_texture(texture, image.width(), image.height())
                     self.pdf_widget.update()
