@@ -43,3 +43,22 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. It is
     *   Use the mouse wheel to scroll through pages in single-page view.
     *   Click and drag to pan the document when zoomed in.
     *   Use the buttons on the toolbar to switch between single-page and grid views, and to navigate pages.
+
+---
+
+## Compiling to a Standalone Binary
+
+You can compile this app to a standalone executable for Windows, Linux, or Mac using [PyInstaller](https://pyinstaller.org/).
+
+1. **Install PyInstaller:**
+   ```sh
+   pip install pyinstaller
+   ```
+2. **Build the Executable:**
+   ```sh
+   python -m PyInstaller --onefile --windowed --icon=pdf_viewer_icon.ico --name="GPU PDF Viewer" --clean --noconfirm main.py
+   ```
+   - The binary will be in the `dist/` folder.
+   - For cross-compiling, build on the target OS or use a cross-compilation toolchain.
+
+---
