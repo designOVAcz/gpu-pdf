@@ -56,7 +56,7 @@ try:
                                 QListWidget, QListWidgetItem, QCheckBox, QComboBox,
                                 QGroupBox, QGridLayout, QScrollArea, QStatusBar,
                                 QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF, QEvent
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
                             QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon,
                             QMouseEvent, QResizeEvent)
@@ -4109,7 +4109,7 @@ Press 'L' to cycle through modes."""
         QTimer.singleShot(100, lambda: self.restore_combo_box_state(current_grid_size, grid_enabled))
     
     def enter_fullscreen(self):
-        """Enter fullscreen mode with click simulation workaround"""
+        """Enter fullscreen mode with mouse click simulation workaround"""
         # Store the current window state
         if not hasattr(self, '_normal_geometry'):
             self._normal_geometry = self.saveGeometry()
@@ -4120,56 +4120,67 @@ Press 'L' to cycle through modes."""
         # Create fullscreen control overlay (delayed to avoid interference)
         QTimer.singleShot(50, self.create_fullscreen_overlay)
         
-        # WORKAROUND: Simulate click after transition to fix white screen
-        QTimer.singleShot(150, self.simulate_click_workaround)
+        # WORKAROUND: Single well-timed mouse click simulation
+        QTimer.singleShot(300, self.simulate_click_workaround)
         
         # Show helpful message
         if hasattr(self, 'status_bar'):
             self.status_bar.showMessage("Fullscreen Mode: Press F11 or Esc to exit, drag top area to move", 4000)
     
     def simulate_click_workaround(self):
-        """WORKAROUND: Force OpenGL repaint through multiple methods"""
+        """WORKAROUND: Force OpenGL repaint through actual mouse event simulation"""
         if not hasattr(self, 'pdf_widget'):
             return
             
         try:
-            print("🔧 WORKAROUND: Attempting to fix white screen...")
+            print("🔧 WORKAROUND: Simulating actual mouse click for white screen fix...")
             
-            # APPROACH 1: Force immediate paintGL call by invalidating the widget
-            self.pdf_widget.makeCurrent()
+            # Get the center of the PDF widget
+            widget_center = self.pdf_widget.rect().center()
+            global_pos = self.pdf_widget.mapToGlobal(widget_center)
             
-            # Force the widget to think it needs repainting
-            self.pdf_widget.update()
+            # Convert QPoint to QPointF for mouse events
+            local_pos = QPointF(widget_center)
+            global_pos_f = QPointF(global_pos)
             
-            # Trigger a manual repaint cycle
-            self.pdf_widget.repaint()
+            # Create actual mouse press and release events
+            press_event = QMouseEvent(
+                QMouseEvent.Type.MouseButtonPress,
+                local_pos,
+                global_pos_f,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier
+            )
             
-            # Process all events to ensure paint happens
+            release_event = QMouseEvent(
+                QMouseEvent.Type.MouseButtonRelease,
+                local_pos,
+                global_pos_f,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier
+            )
+            
+            # Send the actual mouse events
+            QApplication.postEvent(self.pdf_widget, press_event)
             QApplication.processEvents()
             
-            # APPROACH 2: Try to trigger the same path as mouse interaction
-            # Simulate the internal state that mouse events create
-            if hasattr(self.pdf_widget, 'is_panning'):
-                # Briefly set panning state and then clear it to trigger refresh
-                old_panning = self.pdf_widget.is_panning
-                self.pdf_widget.is_panning = True
-                self.pdf_widget.update()
+            # Small delay between press and release
+            QTimer.singleShot(10, lambda: [
+                QApplication.postEvent(self.pdf_widget, release_event),
                 QApplication.processEvents()
-                self.pdf_widget.is_panning = old_panning
-                self.pdf_widget.update()
-                QApplication.processEvents()
+            ])
             
-            # APPROACH 3: Force texture cache refresh for current content
-            if hasattr(self, 'render_current_page'):
-                self.render_current_page()
-            
-            print("✓ Workaround executed - forced OpenGL refresh")
+            print("✓ Mouse click simulation executed")
             
         except Exception as e:
-            print(f"✗ Error in workaround: {e}")
-            # Final fallback - just force update
+            print(f"✗ Error in mouse click simulation: {e}")
+            # Fallback to simple update
             if hasattr(self, 'pdf_widget'):
                 self.pdf_widget.update()
+                self.pdf_widget.repaint()
+                QApplication.processEvents()
     
     def _nuclear_content_refresh(self):
         """Nuclear option: Force complete PDF content refresh"""
@@ -4289,7 +4300,7 @@ Press 'L' to cycle through modes."""
             print(f"⚠️ Aggressive normal mode refresh error: {e}")
     
     def exit_fullscreen(self):
-        """Exit fullscreen mode with click simulation workaround"""
+        """Exit fullscreen mode with mouse click simulation workaround"""
         # Remove fullscreen overlay
         if hasattr(self, '_fullscreen_overlay'):
             self._fullscreen_overlay.hide()
@@ -4303,8 +4314,8 @@ Press 'L' to cycle through modes."""
         if hasattr(self, '_normal_geometry'):
             self.restoreGeometry(self._normal_geometry)
         
-        # WORKAROUND: Simulate click after transition to fix white screen
-        QTimer.singleShot(150, self.simulate_click_workaround)
+        # WORKAROUND: Single well-timed mouse click simulation
+        QTimer.singleShot(300, self.simulate_click_workaround)
     
     def create_fullscreen_overlay(self):
         """Create a small overlay with window controls in fullscreen mode"""
