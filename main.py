@@ -58,7 +58,8 @@ try:
                                 QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
     from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
-                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon)
+                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon,
+                            QMouseEvent, QResizeEvent)
     from PyQt6.QtCore import QPoint
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture
@@ -2763,6 +2764,11 @@ class GPUPDFWidget(QOpenGLWidget):
         
         self._zoom_interaction_timer.start(300)  # 300ms interaction window
         self.update()
+        
+        # WORKAROUND: If in fullscreen and high zoom, simulate click to fix white screen
+        viewer = self.window()
+        if viewer and viewer.isFullScreen() and self.zoom_factor > 2.0:
+            QTimer.singleShot(200, viewer.simulate_click_workaround)
     
     def zoom_out(self, cursor_pos=None):
         # Enable interaction mode during zoom
@@ -2800,6 +2806,11 @@ class GPUPDFWidget(QOpenGLWidget):
         
         self._zoom_interaction_timer.start(300)  # 300ms interaction window
         self.update()
+        
+        # WORKAROUND: If in fullscreen, simulate click to fix white screen
+        viewer = self.window()
+        if viewer and viewer.isFullScreen():
+            QTimer.singleShot(200, viewer.simulate_click_workaround)
     
     def reset_zoom(self):
         self.zoom_factor = 1.0
@@ -3350,6 +3361,14 @@ class PDFViewer(QMainWindow):
         elif key == Qt.Key.Key_G:
             # Toggle grid view
             self.toggle_grid_view()
+        
+        # Fullscreen shortcuts
+        elif key == Qt.Key.Key_F11:
+            # Toggle fullscreen
+            self.toggle_fullscreen()
+        elif key == Qt.Key.Key_Escape and self.isFullScreen():
+            # Exit fullscreen with Escape key
+            self.toggle_fullscreen()
         
         # 🚀 LAYER 3: Performance stats shortcut
         elif key == Qt.Key.Key_F12:
@@ -4068,7 +4087,7 @@ Press 'L' to cycle through modes."""
             print(f"Error restoring combo box state: {e}")
 
     def toggle_fullscreen(self, checked=None):
-        """Toggle fullscreen mode"""
+        """Enhanced fullscreen mode with window movement capability"""
         # Save combo box state before fullscreen transition
         current_grid_size = self.grid_size_combo.currentText()
         grid_enabled = self.grid_size_combo.isEnabled()
@@ -4076,18 +4095,368 @@ Press 'L' to cycle through modes."""
         if checked is None:
             # Called from menu or keyboard shortcut - toggle based on current state
             if self.isFullScreen():
-                self.showNormal()
+                self.exit_fullscreen()
             else:
-                self.showFullScreen()
+                self.enter_fullscreen()
         else:
             # Called from checkable toolbar action - use the checked state
             if checked:
-                self.showFullScreen()
+                self.enter_fullscreen()
             else:
-                self.showNormal()
+                self.exit_fullscreen()
         
         # Restore combo box state after fullscreen transition
         QTimer.singleShot(100, lambda: self.restore_combo_box_state(current_grid_size, grid_enabled))
+    
+    def enter_fullscreen(self):
+        """Enter fullscreen mode with click simulation workaround"""
+        # Store the current window state
+        if not hasattr(self, '_normal_geometry'):
+            self._normal_geometry = self.saveGeometry()
+        
+        # Enter fullscreen
+        self.showFullScreen()
+        
+        # Create fullscreen control overlay (delayed to avoid interference)
+        QTimer.singleShot(50, self.create_fullscreen_overlay)
+        
+        # WORKAROUND: Simulate click after transition to fix white screen
+        QTimer.singleShot(150, self.simulate_click_workaround)
+        
+        # Show helpful message
+        if hasattr(self, 'status_bar'):
+            self.status_bar.showMessage("Fullscreen Mode: Press F11 or Esc to exit, drag top area to move", 4000)
+    
+    def simulate_click_workaround(self):
+        """WORKAROUND: Force OpenGL repaint through multiple methods"""
+        if not hasattr(self, 'pdf_widget'):
+            return
+            
+        try:
+            print("🔧 WORKAROUND: Attempting to fix white screen...")
+            
+            # APPROACH 1: Force immediate paintGL call by invalidating the widget
+            self.pdf_widget.makeCurrent()
+            
+            # Force the widget to think it needs repainting
+            self.pdf_widget.update()
+            
+            # Trigger a manual repaint cycle
+            self.pdf_widget.repaint()
+            
+            # Process all events to ensure paint happens
+            QApplication.processEvents()
+            
+            # APPROACH 2: Try to trigger the same path as mouse interaction
+            # Simulate the internal state that mouse events create
+            if hasattr(self.pdf_widget, 'is_panning'):
+                # Briefly set panning state and then clear it to trigger refresh
+                old_panning = self.pdf_widget.is_panning
+                self.pdf_widget.is_panning = True
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                self.pdf_widget.is_panning = old_panning
+                self.pdf_widget.update()
+                QApplication.processEvents()
+            
+            # APPROACH 3: Force texture cache refresh for current content
+            if hasattr(self, 'render_current_page'):
+                self.render_current_page()
+            
+            print("✓ Workaround executed - forced OpenGL refresh")
+            
+        except Exception as e:
+            print(f"✗ Error in workaround: {e}")
+            # Final fallback - just force update
+            if hasattr(self, 'pdf_widget'):
+                self.pdf_widget.update()
+    
+    def _nuclear_content_refresh(self):
+        """Nuclear option: Force complete PDF content refresh"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                print("💥 NUCLEAR CONTENT REFRESH - Clearing all caches...")
+                
+                # Clear GPU texture cache if it exists
+                if hasattr(self.pdf_widget, 'gpu_cache'):
+                    cache = self.pdf_widget.gpu_cache
+                    if hasattr(cache, 'clear_all'):
+                        cache.clear_all()
+                    elif hasattr(cache, 'textures'):
+                        cache.textures.clear()
+                        cache.page_textures.clear()
+                        print("💥 GPU cache cleared")
+                
+                # Force re-render current page immediately
+                if hasattr(self, 'render_current_page'):
+                    self.render_current_page()
+                
+                # Force OpenGL context refresh
+                self.pdf_widget.makeCurrent()
+                for i in range(3):
+                    self.pdf_widget.update()
+                    self.pdf_widget.repaint()
+                    QApplication.processEvents()
+                
+                print("💥 NUCLEAR REFRESH COMPLETED")
+        except Exception as e:
+            print(f"⚠️ Nuclear refresh error: {e}")
+    
+    def _refresh_fullscreen_content(self):
+        """Force refresh of PDF content when entering fullscreen - AGGRESSIVE APPROACH"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                print("🔥 AGGRESSIVE fullscreen refresh starting...")
+                
+                # STEP 1: Force immediate OpenGL context refresh
+                self.pdf_widget.makeCurrent()
+                
+                # STEP 2: Force OpenGL widget updates (multiple calls for insurance)
+                self.pdf_widget.update()
+                self.pdf_widget.repaint()
+                
+                # STEP 3: Process all pending events immediately
+                QApplication.processEvents()
+                
+                # STEP 4: Force grid layout recalculation FIRST
+                if hasattr(self.pdf_widget, 'compute_grid_layout'):
+                    self.pdf_widget.compute_grid_layout()
+                
+                # STEP 5: Force immediate re-render of current content
+                if hasattr(self, 'render_current_page'):
+                    self.render_current_page()
+                
+                # STEP 6: Multiple staged updates with immediate processing
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                
+                # STEP 7: Force paintGL call directly if possible
+                if hasattr(self.pdf_widget, 'paintGL'):
+                    QTimer.singleShot(5, lambda: self.pdf_widget.update())
+                
+                # STEP 8: Final update with delay
+                QTimer.singleShot(10, lambda: self._force_final_update())
+                
+                print("� AGGRESSIVE fullscreen refresh completed")
+        except Exception as e:
+            print(f"⚠️ Aggressive fullscreen refresh error: {e}")
+    
+    def _force_final_update(self):
+        """Final forced update to ensure content is visible"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                self.pdf_widget.makeCurrent()
+                self.pdf_widget.update()
+                self.pdf_widget.repaint()
+                QApplication.processEvents()
+                print("🎯 Final update completed")
+        except Exception as e:
+            print(f"⚠️ Final update error: {e}")
+    
+    def _refresh_normal_content(self):
+        """Force refresh of PDF content when exiting fullscreen - AGGRESSIVE APPROACH"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                print("🔥 AGGRESSIVE normal mode refresh starting...")
+                
+                # STEP 1: Force immediate OpenGL context refresh
+                self.pdf_widget.makeCurrent()
+                
+                # STEP 2: Force OpenGL widget updates
+                self.pdf_widget.update()
+                self.pdf_widget.repaint()
+                
+                # STEP 3: Process all pending events
+                QApplication.processEvents()
+                
+                # STEP 4: Force grid layout recalculation for normal dimensions
+                if hasattr(self.pdf_widget, 'compute_grid_layout'):
+                    self.pdf_widget.compute_grid_layout()
+                
+                # STEP 5: Force immediate re-render
+                if hasattr(self, 'render_current_page'):
+                    self.render_current_page()
+                
+                # STEP 6: Multiple updates
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                
+                # STEP 7: Final delayed update
+                QTimer.singleShot(10, lambda: self._force_final_update())
+                
+                print("� AGGRESSIVE normal mode refresh completed")
+        except Exception as e:
+            print(f"⚠️ Aggressive normal mode refresh error: {e}")
+    
+    def exit_fullscreen(self):
+        """Exit fullscreen mode with click simulation workaround"""
+        # Remove fullscreen overlay
+        if hasattr(self, '_fullscreen_overlay'):
+            self._fullscreen_overlay.hide()
+            self._fullscreen_overlay.deleteLater()
+            delattr(self, '_fullscreen_overlay')
+        
+        # Restore normal window
+        self.showNormal()
+        
+        # Restore previous geometry if available
+        if hasattr(self, '_normal_geometry'):
+            self.restoreGeometry(self._normal_geometry)
+        
+        # WORKAROUND: Simulate click after transition to fix white screen
+        QTimer.singleShot(150, self.simulate_click_workaround)
+    
+    def create_fullscreen_overlay(self):
+        """Create a small overlay with window controls in fullscreen mode"""
+        if hasattr(self, '_fullscreen_overlay'):
+            return
+        
+        # Create semi-transparent overlay widget
+        self._fullscreen_overlay = QWidget(self)
+        self._fullscreen_overlay.setStyleSheet("""
+            QWidget {
+                background-color: rgba(0, 0, 0, 150);
+                border-radius: 5px;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 200);
+                border: 1px solid #ccc;
+                border-radius: 3px;
+                padding: 5px 10px;
+                color: black;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 255);
+            }
+        """)
+        
+        # Create layout for overlay
+        overlay_layout = QHBoxLayout(self._fullscreen_overlay)
+        overlay_layout.setContentsMargins(5, 5, 5, 5)
+        overlay_layout.setSpacing(5)
+        
+        # Add exit fullscreen button
+        exit_btn = QPushButton("Exit Fullscreen (F11)")
+        exit_btn.clicked.connect(self.exit_fullscreen)
+        overlay_layout.addWidget(exit_btn)
+        
+        # Add minimize button for window management
+        minimize_btn = QPushButton("Minimize")
+        minimize_btn.clicked.connect(self.showMinimized)
+        overlay_layout.addWidget(minimize_btn)
+        
+        # Position overlay at top-right corner
+        self._fullscreen_overlay.resize(300, 40)
+        self._fullscreen_overlay.move(self.width() - 310, 10)
+        self._fullscreen_overlay.show()
+        
+        # Make overlay draggable for window movement
+        self._fullscreen_overlay.mousePressEvent = self._overlay_mouse_press
+        self._fullscreen_overlay.mouseMoveEvent = self._overlay_mouse_move
+        
+        # Auto-hide overlay after 3 seconds, show on mouse movement
+        self._overlay_hide_timer = QTimer()
+        self._overlay_hide_timer.timeout.connect(self._auto_hide_overlay)
+        self._overlay_hide_timer.start(3000)
+        
+        # Track mouse movement to show overlay
+        self.setMouseTracking(True)
+    
+    def _overlay_mouse_press(self, event):
+        """Handle mouse press on overlay for dragging"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+    
+    def _overlay_mouse_move(self, event):
+        """Handle mouse move on overlay for dragging window"""
+        if (event.buttons() == Qt.MouseButton.LeftButton and 
+            hasattr(self, '_drag_position')):
+            self.move(event.globalPosition().toPoint() - self._drag_position)
+            event.accept()
+    
+    def _auto_hide_overlay(self):
+        """Auto-hide overlay after timeout"""
+        if hasattr(self, '_fullscreen_overlay') and self._fullscreen_overlay.isVisible():
+            self._fullscreen_overlay.hide()
+    
+    def mouseMoveEvent(self, event):
+        """Show overlay on mouse movement in fullscreen"""
+        super().mouseMoveEvent(event)
+        if (self.isFullScreen() and hasattr(self, '_fullscreen_overlay')):
+            # Show overlay when mouse moves to top area
+            if event.position().y() < 50:
+                self._fullscreen_overlay.show()
+                # Reset auto-hide timer
+                if hasattr(self, '_overlay_hide_timer'):
+                    self._overlay_hide_timer.start(3000)
+    
+    def resizeEvent(self, event):
+        """Reposition overlay and refresh content on window resize"""
+        super().resizeEvent(event)
+        
+        # Handle fullscreen overlay repositioning
+        if (self.isFullScreen() and hasattr(self, '_fullscreen_overlay')):
+            # Reposition overlay at top-right
+            self._fullscreen_overlay.move(self.width() - 310, 10)
+        
+        # Force content refresh on significant size changes (like fullscreen transitions)
+        if hasattr(self, 'pdf_widget') and self.pdf_widget and event.size().isValid():
+            old_size = event.oldSize()
+            new_size = event.size()
+            
+            # Check if this is a significant size change (like fullscreen toggle)
+            if (old_size.isValid() and 
+                (abs(new_size.width() - old_size.width()) > 200 or 
+                 abs(new_size.height() - old_size.height()) > 200)):
+                
+                # Trigger content refresh with a small delay
+                QTimer.singleShot(25, self._refresh_content_after_resize)
+    
+    def _refresh_content_after_resize(self):
+        """Refresh PDF content after significant window size changes"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                # Force grid layout recalculation for new dimensions
+                if hasattr(self.pdf_widget, 'compute_grid_layout'):
+                    self.pdf_widget.compute_grid_layout()
+                
+                # Update the OpenGL widget
+                self.pdf_widget.update()
+                
+                # Process events
+                QApplication.processEvents()
+                
+                print(f"🔄 Content refreshed after resize to {self.size().width()}x{self.size().height()}")
+        except Exception as e:
+            print(f"⚠️ Resize refresh error: {e}")
+    
+    def showEvent(self, event):
+        """Handle window show events to ensure proper rendering"""
+        super().showEvent(event)
+        
+        # Force content refresh when window becomes visible
+        # This is especially important for fullscreen transitions
+        if hasattr(self, 'pdf_widget') and self.pdf_widget:
+            QTimer.singleShot(30, self._refresh_on_show)
+    
+    def _refresh_on_show(self):
+        """Refresh content when window is shown"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget and self.isVisible():
+                # Update OpenGL widget
+                self.pdf_widget.update()
+                
+                # Force repaint
+                self.pdf_widget.repaint()
+                
+                # Process events
+                QApplication.processEvents()
+                
+                print(f"🖥️ Content refreshed on window show (fullscreen: {self.isFullScreen()})")
+        except Exception as e:
+            print(f"⚠️ Show refresh error: {e}")
     
     def dragEnterEvent(self, event):
         """Handle drag enter events"""
@@ -4105,7 +4474,7 @@ Press 'L' to cycle through modes."""
         event.ignore()
     
     def dropEvent(self, event):
-        """Handle drop events"""
+        """Handle drop events with progress indicator"""
         print("Drop event received")
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
@@ -4114,52 +4483,432 @@ Press 'L' to cycle through modes."""
                     print(f"Processing dropped file: {file_path}")
                     if file_path.lower().endswith('.pdf'):
                         print(f"Loading PDF: {file_path}")
-                        self.load_pdf(file_path)
+                        self.load_pdf_with_progress(file_path)
                         event.acceptProposedAction()
-                        self.status_bar.showMessage(f"Dropped: {os.path.basename(file_path)}", 3000)
                         return
         print("Drop event ignored")
         event.ignore()
     
     def open_pdf_direct(self):
-        """Open PDF file with minimal dialog implementation"""
+        """Open PDF with loading indicator"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open PDF", "", "PDF Files (*.pdf)"
+        )
+        if file_path:
+            self.load_pdf_with_progress(file_path)
+    
+    def load_pdf_with_progress(self, file_path):
+        """Load PDF with minimal progress indicator"""
+        # Create minimal loading widget - thin line with text
+        self.loading_widget = QWidget(self)
+        self.loading_widget.setFixedSize(300, 25)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Style the loading widget - very minimal light grey with white text
+        self.loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(200, 200, 200, 100);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(180, 180, 180, 255);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(150, 150, 150, 255);
+                font-size: 11px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Layout for loading widget - label and progress bar
+        layout = QVBoxLayout(self.loading_widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(3)
+        
+        # Status label
+        self.loading_label = QLabel("Loading PDF...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+        
+        # Only the slim progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(1)  # 1px height
+        self.progress_bar.setTextVisible(False)  # No text
+        layout.addWidget(self.progress_bar)
+        
+        # Position loading widget at center of main window
+        self.center_loading_widget()
+        
+        # Show loading widget
+        self.loading_widget.show()
+        
+        # Re-center after showing to ensure proper positioning
+        QApplication.processEvents()
+        self.center_loading_widget()
+        
+        # Start loading process
+        self.load_pdf_step_by_step(file_path)
+    
+    def center_loading_widget(self):
+        """Center the loading widget on the main window (both horizontally and vertically)"""
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            # Get current main window geometry
+            main_rect = self.geometry()
+            loading_size = self.loading_widget.size()
+            
+            # Calculate center position
+            x = main_rect.x() + (main_rect.width() - loading_size.width()) // 2
+            y = main_rect.y() + (main_rect.height() - loading_size.height()) // 2
+            
+            # Move to center position
+            self.loading_widget.move(x, y)
+    
+    def load_pdf_step_by_step(self, file_path):
+        """Load PDF in steps with progress updates"""
         try:
-            # Process any pending events to ensure clean state
+            # Step 1: Open PDF document (10%)
+            self.update_loading_progress("Opening PDF document...", 10)
+            
+            # Close existing document
+            if self.pdf_doc:
+                self.pdf_doc.close()
+            
+            # Open new document
+            self.pdf_doc = fitz.open(file_path)
+            self.pdf_path = file_path
+            self.total_pages = len(self.pdf_doc)
+            self.current_page = 0
+            
+            # Step 2: Initialize renderer (25%)
+            self.update_loading_progress("Initializing renderer...", 25)
             QApplication.processEvents()
             
-            # Try the static method first (most compatible)
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select PDF File",
-                "",  # Let system choose default directory
-                "PDF Files (*.pdf);;All Files (*.*)",
-                options=QFileDialog.Option.DontUseNativeDialog  # Force Qt dialog
+            # Stop existing renderer
+            if self.renderer:
+                self.renderer.stop()
+                self.renderer.wait()
+            
+            # Create new renderer
+            self.renderer = PDFPageRenderer(file_path, parent=self)
+            self.renderer.pageRendered.connect(self.on_page_rendered)
+            self.renderer.start()
+            
+            # Step 3: Clear old data (40%)
+            self.update_loading_progress("Clearing previous data...", 40)
+            QApplication.processEvents()
+            
+            # Clear thumbnail list and textures
+            self.thumbnail_list.clear()
+            if hasattr(self.pdf_widget, 'texture_cache'):
+                self.pdf_widget.texture_cache.clear()
+            
+            # Step 4: Render first page (60%)
+            self.update_loading_progress("Rendering first page...", 60)
+            QApplication.processEvents()
+            
+            # Render first page immediately for quick preview
+            self.render_current_page()
+            
+            # Step 5: Update UI (75%)
+            self.update_loading_progress("Updating interface...", 75)
+            QApplication.processEvents()
+            
+            # Update UI elements
+            self.update_page_info()
+            filename = os.path.basename(file_path)
+            self.setWindowTitle(f"GPU PDF Viewer - {filename}")
+            
+            # Step 6: Start thumbnail generation (90%)
+            self.update_loading_progress("Generating thumbnails...", 90)
+            QApplication.processEvents()
+            
+            # Start thumbnail generation in background
+            QTimer.singleShot(100, self.start_thumbnail_generation)
+            
+        except Exception as e:
+            self.close_loading_widget()
+            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}")
+    
+    def start_thumbnail_generation(self):
+        """Start thumbnail generation with progress tracking"""
+        try:
+            # Stop existing thumbnail worker
+            if self.thumbnail_worker:
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker.wait()
+            
+            # Create new thumbnail worker with progress tracking
+            self.thumbnail_worker = ThumbnailWorker(
+                self.pdf_doc, 
+                limit=min(50, self.total_pages),
+                parent=self,
+                gpu_widget=self.pdf_widget
             )
             
-            if file_path:
-                print(f"Selected file: {file_path}")
-                self.load_pdf(file_path)
-            else:
-                print("No file selected")
-                
-        except Exception as e:
-            print(f"Error in file dialog: {e}")
-            self.status_bar.showMessage(f"File dialog error: {str(e)}", 5000)
+            # Connect signals for progress tracking
+            self.thumbnail_worker.thumbnailReady.connect(self.on_thumbnail_ready)
+            self.thumbnail_worker.finished.connect(self.on_thumbnail_generation_complete)
             
-            # Fallback: try with native dialog
-            try:
-                print("Trying fallback native dialog...")
-                file_path, _ = QFileDialog.getOpenFileName(
-                    self,
-                    "Select PDF File", 
-                    "",
-                    "PDF Files (*.pdf)"
-                )
-                if file_path:
-                    self.load_pdf(file_path)
-            except Exception as e2:
-                print(f"Fallback dialog also failed: {e2}")
-                self.status_bar.showMessage("File dialog unavailable", 5000)
+            # Start thumbnail generation
+            self.thumbnail_worker.start()
+            
+            # Update progress
+            self.update_loading_progress(f"Generating thumbnails (0/{min(50, self.total_pages)})...", 90)
+            
+            # Track thumbnail progress
+            self.thumbnails_generated = 0
+            self.total_thumbnails = min(50, self.total_pages)
+            
+        except Exception as e:
+            print(f"Error starting thumbnail generation: {e}")
+            self.close_loading_widget()
+    
+    def on_thumbnail_ready(self, page_num, qimage):
+        """Handle thumbnail ready with progress update"""
+        try:
+            # Create thumbnail item
+            item = QListWidgetItem()
+            
+            # Scale image to fit icon size while maintaining aspect ratio
+            icon_size = self.thumbnail_list.iconSize()
+            scaled_image = qimage.scaled(
+                icon_size, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            # Create pixmap and set as icon
+            pixmap = QPixmap.fromImage(scaled_image)
+            item.setIcon(QIcon(pixmap))
+            item.setText(f"Page {page_num + 1}")
+            item.setData(Qt.ItemDataRole.UserRole, page_num)
+            
+            # Add to list
+            self.thumbnail_list.addItem(item)
+            
+            # Update progress
+            self.thumbnails_generated += 1
+            progress = 90 + (self.thumbnails_generated / self.total_thumbnails) * 8  # 90-98%
+            self.update_loading_progress(
+                f"Generating thumbnails ({self.thumbnails_generated}/{self.total_thumbnails})...", 
+                int(progress)
+            )
+            
+        except Exception as e:
+            print(f"Error processing thumbnail {page_num}: {e}")
+    
+    def on_thumbnail_generation_complete(self):
+        """Handle completion of thumbnail generation"""
+        # Final progress update
+        self.update_loading_progress("Complete!", 100)
+        QApplication.processEvents()
+        
+        # Close loading widget after a brief delay
+        QTimer.singleShot(800, self.close_loading_widget)
+        
+        # Show completion message in status bar
+        filename = os.path.basename(self.pdf_path)
+        self.status_bar.showMessage(f"✓ Loaded: {filename} - {self.total_pages} pages, {self.thumbnails_generated} thumbnails generated", 5000)
+        
+        print(f"✓ PDF loading complete: {filename}")
+    
+    def update_loading_progress(self, message, percentage):
+        """Update loading widget with progress"""
+        if hasattr(self, 'loading_label') and self.loading_label:
+            self.loading_label.setText(message)
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(percentage)
+        QApplication.processEvents()
+    
+    def close_loading_widget(self):
+        """Close the loading widget"""
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.loading_widget.hide()
+            self.loading_widget.deleteLater()
+            self.loading_widget = None
+        if hasattr(self, 'loading_label'):
+            self.loading_label = None
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar = None
+    
+    def show_grid_loading_progress(self, grid_size):
+        """Show minimal loading indicator for grid processing"""
+        # Create minimal loading widget
+        self.loading_widget = QWidget(self)
+        self.loading_widget.setFixedSize(300, 25)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Style the loading widget - very minimal light grey with grey text
+        self.loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(200, 200, 200, 100);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(180, 180, 180, 255);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(150, 150, 150, 255);
+                font-size: 11px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Layout for loading widget - label and progress bar
+        layout = QVBoxLayout(self.loading_widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(3)
+        
+        # Status label
+        self.loading_label = QLabel(f"Preparing {grid_size} grid view...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+        
+        # Slim progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(1)  # 1px height
+        self.progress_bar.setTextVisible(False)  # No text
+        layout.addWidget(self.progress_bar)
+        
+        # Position loading widget at center of main window
+        self.center_loading_widget()
+        
+        # Show loading widget
+        self.loading_widget.show()
+        
+        # Re-center after showing to ensure proper positioning
+        QApplication.processEvents()
+        self.center_loading_widget()
+        
+        # Start grid processing animation
+        self._start_grid_progress_animation()
+    
+    def _start_grid_progress_animation(self):
+        """Start a simple progress animation for grid processing"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(20)
+            QTimer.singleShot(200, lambda: self._continue_grid_progress(40))
+    
+    def _continue_grid_progress(self, value):
+        """Continue grid progress animation"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(value)
+            if value < 90:
+                QTimer.singleShot(150, lambda: self._continue_grid_progress(value + 15))
+            else:
+                # Close after a brief moment
+                QTimer.singleShot(500, self._finish_grid_loading)
+    
+    def _finish_grid_loading(self):
+        """Finish grid loading and hide progress"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(100)
+        if hasattr(self, 'loading_label') and self.loading_label:
+            self.loading_label.setText("Grid ready")
+        QTimer.singleShot(300, self.close_loading_widget)
+    
+    def show_thumbnail_loading_progress(self, page_num):
+        """Show minimal loading indicator for thumbnail navigation"""
+        # Create minimal loading widget
+        self.loading_widget = QWidget(self)
+        self.loading_widget.setFixedSize(300, 25)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Style the loading widget - very minimal light grey with grey text
+        self.loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(200, 200, 200, 100);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(180, 180, 180, 255);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(150, 150, 150, 255);
+                font-size: 11px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Layout for loading widget - label and progress bar
+        layout = QVBoxLayout(self.loading_widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(3)
+        
+        # Status label
+        self.loading_label = QLabel(f"Loading page {page_num + 1}...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+        
+        # Slim progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(1)  # 1px height
+        self.progress_bar.setTextVisible(False)  # No text
+        layout.addWidget(self.progress_bar)
+        
+        # Position loading widget at center of main window
+        self.center_loading_widget()
+        
+        # Show loading widget
+        self.loading_widget.show()
+        
+        # Re-center after showing to ensure proper positioning
+        QApplication.processEvents()
+        self.center_loading_widget()
+        
+        # Start thumbnail loading animation
+        self._start_thumbnail_progress_animation()
+    
+    def _start_thumbnail_progress_animation(self):
+        """Start a simple progress animation for thumbnail navigation"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(30)
+            QTimer.singleShot(100, lambda: self._continue_thumbnail_progress(60))
+    
+    def _continue_thumbnail_progress(self, value):
+        """Continue thumbnail progress animation"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(value)
+            if value < 90:
+                QTimer.singleShot(80, lambda: self._continue_thumbnail_progress(value + 10))
+            else:
+                # Close after a brief moment
+                QTimer.singleShot(400, self._finish_thumbnail_loading)
+    
+    def _finish_thumbnail_loading(self):
+        """Finish thumbnail loading and hide progress"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(100)
+        if hasattr(self, 'loading_label') and self.loading_label:
+            self.loading_label.setText("Page ready")
+        QTimer.singleShot(200, self.close_loading_widget)
     
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
         try:
@@ -4829,6 +5578,9 @@ Press 'L' to cycle through modes."""
             
             # Handle regular page navigation - IMMEDIATE UI RESPONSE
             if page_num is not None and 0 <= page_num < self.total_pages:
+                # Show loading progress for page navigation
+                self.show_thumbnail_loading_progress(page_num)
+                
                 if self.pdf_widget.grid_mode:
                     # Grid mode: INSTANT navigation with immediate UI update
                     pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
@@ -5250,6 +6002,23 @@ Press 'L' to cycle through modes."""
             if self.current_page < self.total_pages - 1:
                 self.renderer.add_page_to_queue(self.current_page + 1, priority=False, quality=1.5)  # Ultra-fast preload
     
+    def update_page_info(self):
+        """Update page-related UI elements"""
+        if hasattr(self, 'page_label') and self.page_label:
+            self.page_label.setText(f"Page: {self.current_page + 1} / {self.total_pages}")
+        
+        # Update window title
+        if self.pdf_path:
+            filename = os.path.basename(self.pdf_path)
+            self.setWindowTitle(f"GPU PDF Viewer - {filename} - Page {self.current_page + 1}/{self.total_pages}")
+        
+        # Update status bar
+        if hasattr(self, 'status_bar') and self.status_bar:
+            zoom_percent = int(self.pdf_widget.zoom_factor * 100) if hasattr(self, 'pdf_widget') else 100
+            quality = self.pdf_widget.get_zoom_adjusted_quality() if hasattr(self, 'pdf_widget') else 1.0
+            filename = os.path.basename(self.pdf_path) if self.pdf_path else "No file"
+            self.status_bar.showMessage(f"{filename} | Page {self.current_page + 1}/{self.total_pages} | Zoom: {zoom_percent}% | Quality: {quality:.1f}")
+    
     def update_page_label(self):
         # Safety check: Ensure page_label exists before trying to update it
         if not hasattr(self, 'page_label') or self.page_label is None:
@@ -5378,7 +6147,10 @@ Press 'L' to cycle through modes."""
             if not current_text or current_text.strip() == "":
                 current_text = "2x2"  # Default
                 self.grid_size_combo.setCurrentText(current_text)
-                
+            
+            # Show grid loading progress
+            self.show_grid_loading_progress(current_text)
+            
             self.change_grid_size(current_text)
         else:
             # SWITCHING TO SINGLE PAGE MODE - ROBUST TRANSITION
@@ -5464,6 +6236,11 @@ Press 'L' to cycle through modes."""
             cols, rows = map(int, size_text.split('x'))
             self.pdf_widget.grid_cols = cols
             self.pdf_widget.grid_rows = rows
+            
+            # Show loading progress for grid size change (only if not already showing)
+            if not hasattr(self, 'loading_widget') or not self.loading_widget:
+                self.show_grid_loading_progress(size_text)
+            
             # Recompute layout and trigger a repaint with placeholders while rendering happens
             try:
                 self.pdf_widget.compute_grid_layout()
@@ -5547,7 +6324,7 @@ if __name__ == "__main__":
     # Load PDF from command line if provided (after window is shown)
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) and sys.argv[1].endswith('.pdf'):
         # Use QTimer with longer delay to ensure UI is fully set up before loading PDF
-        QTimer.singleShot(300, lambda: viewer.load_pdf(sys.argv[1]))
+        QTimer.singleShot(300, lambda: viewer.load_pdf_with_progress(sys.argv[1]))
     
     # Hide the menu bar as per the change request
     viewer.menuBar().hide()
