@@ -58,7 +58,8 @@ try:
                                 QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
     from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
-                            QShortcut, QAction, QPalette, QColor, QActionGroup)
+                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon)
+    from PyQt6.QtCore import QPoint
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture
     from PyQt6.QtWidgets import QDialog, QSlider, QHBoxLayout, QFrame, QPushButton
@@ -3180,6 +3181,144 @@ class PDFViewer(QMainWindow):
         # Defer UI setup to after window is shown
         QTimer.singleShot(0, self.setup_ui_deferred)
         
+        # Set application icon
+        self.create_and_set_icon()
+    
+    def create_and_set_icon(self):
+        """Create a professional PDF viewer icon with enhanced Windows integration"""
+        # Check if external icon file exists first
+        icon_path = "pdf_viewer_icon.ico"
+        
+        # Create enhanced icon with multiple sizes for better Windows integration
+        icon_full = QIcon()
+        
+        # High-quality icon sizes for Windows (including taskbar, thumbnails, etc.)
+        sizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
+        
+        for size in sizes:
+            sized_pixmap = QPixmap(size, size)
+            sized_pixmap.fill(Qt.GlobalColor.transparent)
+            
+            painter = QPainter(sized_pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            
+            # Scale factor for this size
+            scale = size / 64.0
+            
+            # Enhanced PDF document with shadow
+            doc_left = int(8 * scale)
+            doc_top = int(4 * scale)
+            doc_width = int(44 * scale)
+            doc_height = int(52 * scale)
+            
+            # Drop shadow for depth
+            shadow_offset = max(1, int(2 * scale))
+            painter.setBrush(QColor(50, 50, 50, 80))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(doc_left + shadow_offset, doc_top + shadow_offset, 
+                                  doc_width, doc_height, int(3*scale), int(3*scale))
+            
+            # Main document background
+            painter.setBrush(QColor(248, 249, 250))  # Professional light gray
+            painter.setPen(QPen(QColor(140, 140, 140), max(1, int(scale))))
+            painter.drawRoundedRect(doc_left, doc_top, doc_width, doc_height, int(3*scale), int(3*scale))
+            
+            # Folded corner with gradient effect
+            corner_size = int(12 * scale)
+            painter.setBrush(QColor(220, 220, 220))
+            painter.setPen(QPen(QColor(140, 140, 140), max(1, int(scale))))
+            corner_points = [
+                QPoint(doc_left + doc_width - corner_size, doc_top),
+                QPoint(doc_left + doc_width, doc_top + corner_size),
+                QPoint(doc_left + doc_width, doc_top),
+                QPoint(doc_left + doc_width - corner_size, doc_top)
+            ]
+            corner_polygon = QPolygon(corner_points)
+            painter.drawPolygon(corner_polygon)
+            
+            # Fold line
+            painter.setPen(QPen(QColor(180, 180, 180), max(1, int(scale))))
+            painter.drawLine(doc_left + doc_width - corner_size, doc_top, 
+                           doc_left + doc_width, doc_top + corner_size)
+            
+            # PDF text with better typography
+            if size >= 24:
+                painter.setPen(QPen(QColor(220, 53, 69), max(1, int(scale))))  # Bootstrap red
+                font_size = max(6, int(12 * scale))
+                font = QFont("Segoe UI", font_size, QFont.Weight.Bold)
+                if size >= 48:
+                    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, scale)
+                painter.setFont(font)
+                text_x = doc_left + int(8 * scale)
+                text_y = doc_top + int(24 * scale)
+                painter.drawText(text_x, text_y, "PDF")
+            
+            # GPU acceleration indicator (enhanced lightning bolt)
+            if size >= 20:
+                gpu_size = int(16 * scale)
+                gpu_x = doc_left + doc_width - gpu_size - int(4 * scale)
+                gpu_y = doc_top + doc_height - gpu_size - int(4 * scale)
+                
+                # Lightning bolt with gradient
+                painter.setBrush(QColor(0, 123, 255))  # Bootstrap blue
+                painter.setPen(QPen(QColor(0, 86, 179), max(1, int(scale))))
+                
+                lightning_points = [
+                    QPoint(gpu_x + int(4 * scale), gpu_y),
+                    QPoint(gpu_x + int(10 * scale), gpu_y),
+                    QPoint(gpu_x + int(8 * scale), gpu_y + int(6 * scale)),
+                    QPoint(gpu_x + int(12 * scale), gpu_y + int(6 * scale)),
+                    QPoint(gpu_x + int(6 * scale), gpu_y + int(16 * scale)),
+                    QPoint(gpu_x + int(8 * scale), gpu_y + int(10 * scale)),
+                    QPoint(gpu_x + int(4 * scale), gpu_y + int(10 * scale))
+                ]
+                lightning_polygon = QPolygon(lightning_points)
+                painter.drawPolygon(lightning_polygon)
+            
+            # Document content lines (text representation)
+            if size >= 32:
+                painter.setPen(QPen(QColor(180, 180, 180), max(1, int(scale))))
+                line_start_x = doc_left + int(8 * scale)
+                
+                for i in range(min(4, int(size/16))):  # More lines for larger icons
+                    line_y = doc_top + int(32 * scale) + (i * int(4 * scale))
+                    if line_y < doc_top + doc_height - int(8 * scale):
+                        # Varying line lengths for realistic text
+                        line_length = int(28 * scale) - (i % 2) * int(6 * scale)
+                        painter.drawLine(line_start_x, line_y, 
+                                       line_start_x + line_length, line_y)
+            
+            painter.end()
+            icon_full.addPixmap(sized_pixmap)
+        
+        # Set the icon for window and application
+        self.setWindowIcon(icon_full)
+        
+        # Critical: Set for application instance (taskbar integration)
+        app = QApplication.instance()
+        if app:
+            app.setWindowIcon(icon_full)
+            # Additional Windows-specific settings
+            if hasattr(app, 'setDesktopFileName'):
+                app.setDesktopFileName("GPU PDF Viewer")
+        
+        # Save enhanced icon file for PyInstaller
+        if not os.path.exists(icon_path) or os.path.getsize(icon_path) < 5000:  # Recreate if small/missing
+            try:
+                # Create the largest size for saving
+                save_pixmap = icon_full.pixmap(256, 256)
+                success = save_pixmap.save(icon_path, "ICO")
+                if success:
+                    print(f"✅ Created enhanced icon file: {icon_path} ({os.path.getsize(icon_path)} bytes)")
+                else:
+                    print(f"⚠️ Could not save icon file: {icon_path}")
+            except Exception as e:
+                print(f"⚠️ Error saving icon file: {e}")
+                
+        # Force refresh window decorations (Windows-specific)
+        self.setWindowTitle(self.windowTitle())  # Trigger window update
+
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts"""
         key = event.key()
@@ -4024,6 +4163,12 @@ Press 'L' to cycle through modes."""
     
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
         try:
+            # Ensure UI is fully initialized before loading PDF
+            if not hasattr(self, 'page_label') or self.page_label is None:
+                # UI not ready yet, defer loading
+                QTimer.singleShot(200, lambda: self.load_pdf(pdf_path, quality))
+                return
+                
             # Clean up previous document
             if hasattr(self, 'pdf_doc') and self.pdf_doc is not None:
                 try:
@@ -5106,6 +5251,10 @@ Press 'L' to cycle through modes."""
                 self.renderer.add_page_to_queue(self.current_page + 1, priority=False, quality=1.5)  # Ultra-fast preload
     
     def update_page_label(self):
+        # Safety check: Ensure page_label exists before trying to update it
+        if not hasattr(self, 'page_label') or self.page_label is None:
+            return
+            
         if self.pdf_widget.grid_mode:
             # In grid mode, show page range
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
@@ -5348,27 +5497,57 @@ Press 'L' to cycle through modes."""
 
 
 if __name__ == "__main__":
-    # Fast startup: Create QApplication immediately to show window
+    # Enhanced startup with Windows taskbar integration
     app = QApplication(sys.argv)
     
-    # Set basic application properties quickly
+    # Set application properties for Windows integration
     app.setApplicationName("GPU PDF Viewer")
-    app.setStyle("Fusion")  # Skip version and organization for faster startup
+    app.setApplicationDisplayName("GPU PDF Viewer") 
+    app.setApplicationVersion("1.0")
+    app.setOrganizationName("GPU Tools")
+    app.setOrganizationDomain("gpu-tools.com")
     
-    # Skip dark mode detection for faster startup - use default theme
-    # (Dark mode can be applied later if needed)
+    # Windows-specific settings for proper taskbar integration
+    if sys.platform == "win32":
+        try:
+            # Set taskbar icon grouping ID (Windows 7+)
+            import ctypes
+            myappid = 'gputools.pdfviewer.1.0'  # arbitrary string
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except:
+            pass  # Ignore if not available
     
-    # Show main window immediately with minimal initialization
+    # Enhanced UI style for Windows
+    app.setStyle("Fusion")
+    
+    # Create and set application icon before showing window
+    icon_path = "pdf_viewer_icon.ico"
+    if os.path.exists(icon_path):
+        app_icon = QIcon(icon_path)
+        app.setWindowIcon(app_icon)
+        # Force icon to be used for all windows
+        QApplication.setWindowIcon(app_icon)
+    
+    # Show main window
     viewer = PDFViewer()
+    
+    # Set icon again on the specific window for double insurance
+    if os.path.exists(icon_path):
+        viewer.setWindowIcon(QIcon(icon_path))
+    
     viewer.show()
+    
+    # Force icon refresh after window is shown - critical for Windows taskbar
+    QTimer.singleShot(50, lambda: viewer.create_and_set_icon())
+    QTimer.singleShot(200, lambda: app.processEvents())  # Force Windows to update
     
     # Process events to make window visible immediately
     app.processEvents()
     
     # Load PDF from command line if provided (after window is shown)
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) and sys.argv[1].endswith('.pdf'):
-        # Use QTimer to load PDF after window is shown
-        QTimer.singleShot(100, lambda: viewer.load_pdf(sys.argv[1]))
+        # Use QTimer with longer delay to ensure UI is fully set up before loading PDF
+        QTimer.singleShot(300, lambda: viewer.load_pdf(sys.argv[1]))
     
     # Hide the menu bar as per the change request
     viewer.menuBar().hide()
