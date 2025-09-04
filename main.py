@@ -13,7 +13,7 @@ Features:
 - Priority rendering queue for improved performance
 - Keyboard shortcuts: 
   * 'G' to toggle grid view
-  * '1-5' to set specific grid size (2x2, 3x3, 5x1, 5x2)
+  * '1-4' to set specific grid size (2x2, 3x1, 3x2, 5x1)
   * 'Tab' to cycle through grid sizes
   * 'L' to cycle layout modes, 'Shift+L' for info
   * 'F11' to toggle fullscreen mode
@@ -81,7 +81,7 @@ os.environ['QT_IMAGEIO_MAXALLOC'] = '256'  # Minimal allocation for fastest star
 class GPUTextureCache:
     """🚀 LAYER 3: Intelligent GPU texture cache with advanced memory management"""
     
-    def __init__(self, max_textures=20):  # Increased cache size for better performance
+    def __init__(self, max_textures=200):  # MASSIVE increase for modern GPUs (was 20)
         self.textures = {}  # (page_num, quality) -> QOpenGLTexture
         self.page_textures = {}  # page_num -> best_quality_texture (for backwards compatibility)
         self.dimensions = {}  # page_num -> (width, height)
@@ -90,10 +90,10 @@ class GPUTextureCache:
         self.access_order = []  # LRU tracking for (page_num, quality) keys
         self.priority_textures = set()  # High-quality textures to keep longer
         
-        # 🚀 LAYER 3 OPTIMIZATION: Advanced memory tracking
+        # 🚀 EXTREME GPU VRAM USAGE for modern graphics cards
         self.texture_memory_usage = {}  # (page_num, quality) -> estimated memory in bytes
         self.total_memory_usage = 0
-        self.max_memory_mb = 256  # 256MB limit for GPU textures
+        self.max_memory_mb = 3072  # 3GB GPU VRAM limit (was 256MB) for maximum performance
         
         # Performance statistics
         self._cache_hits = 0
@@ -904,6 +904,7 @@ class PDFPageRenderer(QThread):
         self.pdf_path = pdf_path
         self.quality = quality
         self._running = True
+        self._paused = False  # Flag for pausing during panning
         self._queue = []
         self._priority_queue = []  # High priority queue for grid pages
         self._lock = threading.Lock()
@@ -915,6 +916,18 @@ class PDFPageRenderer(QThread):
         # Skip queueing entirely during fast operations to prevent lag
         viewer = self.parent() if hasattr(self, 'parent') else None
         if viewer and hasattr(viewer, 'pdf_widget'):
+            # Check system performance and throttle accordingly
+            performance_level = getattr(viewer.pdf_widget, '_performance_monitor', {}).get('performance_level', 'high')
+            
+            # When performance is low, be much more aggressive about blocking renders
+            if performance_level == 'low':
+                # Low performance: Only allow priority renders for current page
+                if not priority:
+                    return  # Block ALL non-priority renders when performance is poor
+                # Reduce quality for faster rendering when performance is low
+                if quality and quality > 2.0:
+                    quality = min(quality, 2.0)  # Cap quality to reduce rendering time
+            
             # Allow priority renders but block regular renders during interactions
             if (getattr(viewer.pdf_widget, '_fast_zoom_mode', False) or 
                 getattr(viewer.pdf_widget, 'is_panning', False) or
@@ -933,9 +946,23 @@ class PDFPageRenderer(QThread):
                 quality = max(1.0, min(10.0, quality))  # Keep within bounds
         
         with self._lock:
-            # Limit queue sizes for better performance - balanced for quality and speed  
-            max_priority_queue = 4  # Small but allows essential quality updates
-            max_regular_queue = 6  # Small but allows background processing
+            # AGGRESSIVE QUEUING for modern systems - but adjust based on performance
+            viewer = self.parent() if hasattr(self, 'parent') else None
+            performance_level = 'high'
+            if viewer and hasattr(viewer, 'pdf_widget'):
+                performance_level = getattr(viewer.pdf_widget, '_performance_monitor', {}).get('performance_level', 'high')
+            
+            if performance_level == 'low':
+                # Reduce queue sizes when performance is poor
+                max_priority_queue = 5   # Smaller priority queue when struggling
+                max_regular_queue = 10   # Much smaller background queue
+            elif performance_level == 'medium':
+                max_priority_queue = 10  # Medium queues
+                max_regular_queue = 25
+            else:
+                # High performance - large queues for instant quality
+                max_priority_queue = 20  # Large priority queue for instant quality
+                max_regular_queue = 50   # Massive background queue for preloading
             
             # Check if page is already in either queue
             priority_pages = [p[0] if isinstance(p, tuple) else p for p in self._priority_queue]
@@ -969,6 +996,12 @@ class PDFPageRenderer(QThread):
                 print(f"PDFPageRenderer: failed to open {self.pdf_path}: {e}")
                 self.pdf_doc = None
             while self._running:
+                # CRITICAL: Skip all processing when paused (during panning)
+                with self._lock:
+                    if self._paused:
+                        time.sleep(0.016)  # Sleep while paused
+                        continue
+                
                 # Allow limited processing during interactions but with reduced priority
                 viewer = self.parent() if hasattr(self, 'parent') else None
                 if viewer and hasattr(viewer, 'pdf_widget'):
@@ -1036,6 +1069,19 @@ class PDFPageRenderer(QThread):
             return (len(self._priority_queue) > 0 or 
                    len(self._queue) > 0 or 
                    self.isRunning())
+    
+    def pause(self):
+        """COMPLETE PAUSE: Stop all background rendering and processing during panning"""
+        with self._lock:
+            self._paused = True
+            # Clear all pending work to stop CPU activity immediately
+            self.queue.queue.clear()
+            self.low_priority_queue.queue.clear()
+    
+    def resume(self):
+        """Resume background rendering after panning"""
+        with self._lock:
+            self._paused = False
 
 
 class GPUPDFWidget(QOpenGLWidget):
@@ -1166,36 +1212,34 @@ class GPUPDFWidget(QOpenGLWidget):
     
     def paintGL(self):
         try:
-            # AGGRESSIVE PANNING OPTIMIZATION: Skip everything except basic rendering during pan
-            if getattr(self, '_skip_heavy_processing', False):
-                # Ultra-fast path: Only basic OpenGL operations for panning
+            # GPU-ONLY PANNING: Keep existing textures visible, stop CPU processing only
+            if getattr(self, '_skip_heavy_processing', False) or getattr(self, '_ultra_fast_mode', False):
+                # CLEAR BACKGROUND
                 glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
                 glClear(GL_COLOR_BUFFER_BIT)
                 
                 if self.grid_mode:
-                    self.render_grid_view_fast()  # Fast path grid rendering
+                    # CRITICAL: Render ALL existing textures - don't hide pages during panning
+                    self.render_grid_view_existing_only()  # Show all cached textures
                 else:
-                    # Fast path single page rendering - just render existing texture
-                    self.render_single_page_fast()
+                    self.render_single_page_fast()  # Fast single page rendering
                 
-                return  # Skip all performance monitoring and heavy processing
+                return  # Skip CPU processing but keep all visuals
             
-            # Normal path for when not actively panning
+            # Normal rendering path - full functionality when not panning
             import time
             frame_start_time = time.time()
             
-            # Clear with the same dark gray as the container background
             glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             
-            # Update animation time for loading indicators
             current_time = time.time()
             self.animation_time = current_time
             
-            # Update performance monitoring
+            # Performance monitoring
             self._update_performance_stats(frame_start_time)
             
-            # Enhanced interaction detection with performance tracking
+            # Detect interactions
             renderer_busy = (hasattr(self, 'renderer') and self.renderer and 
                            hasattr(self.renderer, 'is_busy') and self.renderer.is_busy())
             
@@ -1203,19 +1247,15 @@ class GPUPDFWidget(QOpenGLWidget):
                                      getattr(self, '_active_panning', False) or
                                      renderer_busy)
             
-            # Adaptive quality based on performance
             performance_quality = self._get_adaptive_quality()
             
-            # Intelligent resource allocation based on system load
-            if is_actively_interacting:
-                # COMPLETE FREEZE: Zero texture processing during any active interaction
-                max_items = 0  # Absolute zero processing for maximum responsiveness
-            elif self.grid_mode and getattr(self, '_interaction_mode', False):
-                # Grid interaction mode: Minimal processing to prevent lag
-                max_items = 0  # Zero processing even for light interactions in grid
-            elif getattr(self, '_interaction_mode', False):
-                # Single page interaction: Allow minimal processing
-                max_items = 1  # Minimal for single page
+            # STOP background processing during panning but keep visuals
+            if getattr(self, '_active_panning', False):
+                max_items = 0  # Zero background processing during panning
+            elif self.grid_mode and is_actively_interacting:
+                max_items = 0  # Zero processing during grid interactions
+            elif is_actively_interacting:
+                max_items = 0  # Zero processing during interactions
             else:
                 # 🚀 LAYER 2 OPTIMIZATION: Adaptive processing based on performance
                 effective_zoom = self.zoom_factor
@@ -1237,20 +1277,20 @@ class GPUPDFWidget(QOpenGLWidget):
                 
                 # Adaptive processing based on performance
                 if avg_frame_time > 0.025:  # System struggling (< 40 FPS)
-                    texture_processing_factor = 0.5  # Reduce texture processing
+                    texture_processing_factor = 1.0  # Keep normal processing even when struggling
                 elif avg_frame_time < 0.012:  # System performing well (> 80 FPS)
-                    texture_processing_factor = 1.5  # Increase texture processing
+                    texture_processing_factor = 3.0  # MASSIVE increase for fast systems (was 1.5)
                 else:
-                    texture_processing_factor = 1.0  # Normal processing
+                    texture_processing_factor = 2.0  # Higher normal processing (was 1.0)
                 
                 if self.grid_mode:
-                    max_items = max(1, int(1 * texture_processing_factor))
+                    max_items = max(2, int(4 * texture_processing_factor))  # Much higher for grid (was 1)
                 elif effective_zoom > 4.0:
-                    max_items = max(1, int(2 * texture_processing_factor))
+                    max_items = max(3, int(6 * texture_processing_factor))  # Higher for zoomed (was 2)
                 elif effective_zoom > 2.0:
-                    max_items = max(1, int(2 * texture_processing_factor))
+                    max_items = max(4, int(8 * texture_processing_factor))  # Higher for moderate zoom (was 2)
                 else:
-                    max_items = max(1, int(3 * texture_processing_factor))
+                    max_items = max(5, int(10 * texture_processing_factor))  # Much higher for normal (was 3)
                 
                 self._last_render_time = current_time
         
@@ -1354,7 +1394,13 @@ class GPUPDFWidget(QOpenGLWidget):
             glScalef(self.zoom_factor * scale_x, self.zoom_factor * scale_y, 1.0)
             
             # Bind texture and draw quad
-            self.page_texture.bind()
+            # Bind texture if not already bound
+            if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not self.page_texture:
+                try:
+                    self.page_texture.bind()
+                    self._last_bound_texture = self.page_texture
+                except Exception:
+                    pass
             
             glBegin(GL_QUADS)
             # Texture coordinates for PPM image (180° rotation fix)
@@ -1364,7 +1410,8 @@ class GPUPDFWidget(QOpenGLWidget):
             glTexCoord2f(0.0, 0.0); glVertex2f(-1.0, 1.0)
             glEnd()
             
-            self.page_texture.release()
+            # Do not release immediately; keep bound to avoid GPU stalls. Release only when changed.
+            # Keep reference to bound texture in _last_bound_texture
         
         except Exception as e:
             print(f"OpenGL rendering error in render_single_page: {e}")
@@ -1425,51 +1472,43 @@ class GPUPDFWidget(QOpenGLWidget):
         self.update()
     
     def render_single_page_fast(self):
-        """Ultra-fast single page rendering for panning - minimal operations only"""
+        """Optimized single page rendering for smooth panning and zooming."""
         glLoadIdentity()
         
-        # Apply transformations immediately
+        # Apply transformations
         glTranslatef(self.pan_x, self.pan_y, 0.0)
         glScalef(self.zoom_factor, self.zoom_factor, 1.0)
         
-        # Only render existing texture - no loading operations
-        if hasattr(self, 'page_texture') and self.page_texture:
-            try:
-                glColor3f(1.0, 1.0, 1.0)
-                self.page_texture.bind()
-                
-                # Calculate aspect ratio correction for proper display
-                if self.page_width > 0 and self.page_height > 0:
-                    widget_width = max(1, self.width())
-                    widget_height = max(1, self.height())
-                    widget_aspect = widget_width / widget_height
-                    page_aspect = self.page_width / self.page_height
-                    
-                    # Scale to fit
-                    if widget_aspect > page_aspect:
-                        scale_x = page_aspect / widget_aspect
-                        scale_y = 1.0
-                    else:
-                        scale_x = 1.0
-                        scale_y = widget_aspect / page_aspect
-                    
-                    glScalef(scale_x, scale_y, 1.0)
-                
-                glBegin(GL_QUADS)
-                glTexCoord2f(0.0, 1.0); glVertex2f(-1.0, -1.0)
-                glTexCoord2f(1.0, 1.0); glVertex2f(1.0, -1.0)
-                glTexCoord2f(1.0, 0.0); glVertex2f(1.0, 1.0)
-                glTexCoord2f(0.0, 0.0); glVertex2f(-1.0, 1.0)
-                glEnd()
-                self.page_texture.release()
-            except:
-                pass  # Skip errors during fast rendering
+        # Render the page texture if it exists
+        if hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated():
+            # Use the reliable aspect ratio calculation
+            if hasattr(self, 'page_width') and hasattr(self, 'page_height') and self.page_width > 0 and self.page_height > 0:
+                widget_aspect = self.width() / self.height()
+                page_aspect = self.page_width / self.page_height
+                if widget_aspect > page_aspect:
+                    glScalef(page_aspect / widget_aspect, 1.0, 1.0)
+                else:
+                    glScalef(1.0, widget_aspect / page_aspect, 1.0)
+
+            # Bind and draw
+            glColor3f(1.0, 1.0, 1.0)
+            self.page_texture.bind()
+            glBegin(GL_QUADS)
+            glTexCoord2f(0.0, 1.0); glVertex2f(-1.0, -1.0)
+            glTexCoord2f(1.0, 1.0); glVertex2f(1.0, -1.0)
+            glTexCoord2f(1.0, 0.0); glVertex2f(1.0, 1.0)
+            glTexCoord2f(0.0, 0.0); glVertex2f(-1.0, 1.0)
+            glEnd()
+            self.page_texture.release()
+        else:
+            # If no texture, render the loading state
+            self.render_loading_state()
     
-    def render_grid_view_fast(self):
-        """Ultra-fast grid rendering for panning - minimal operations only"""
-        glLoadIdentity()
+    def render_grid_view_existing_only(self):
+        """GPU-ONLY: Render ALL existing textures during panning - no hiding, no loading"""
         
-        # Apply transformations immediately - no checks
+        # Standard OpenGL setup with transformations
+        glLoadIdentity()
         if getattr(self, 'is_temp_zoomed', False):
             glTranslatef(self.temp_pan_x, self.temp_pan_y, 0.0)
             glScalef(self.temp_zoom_factor, self.temp_zoom_factor, 1.0)
@@ -1477,8 +1516,158 @@ class GPUPDFWidget(QOpenGLWidget):
             glTranslatef(self.pan_x, self.pan_y, 0.0)
             glScalef(self.zoom_factor, self.zoom_factor, 1.0)
         
-        # Only render existing textures - no loading, no placeholders, no calculations
         glColor3f(1.0, 1.0, 1.0)
+        
+        # Ensure we have grid layout
+        if not hasattr(self, '_grid_cells') or not self._grid_cells:
+            return
+            
+        viewer = self.window()
+        start_page = getattr(viewer, 'current_page', self.current_page)
+        total_pages = getattr(viewer, 'total_pages', getattr(self, 'total_pages', 0))
+        
+        w_px = self.width()
+        h_px = self.height()
+        
+        # CRITICAL: Render ALL grid pages that have existing textures
+        # Do NOT limit the number - show everything that's available
+        pages_in_grid = min(len(self._grid_cells), self.grid_cols * self.grid_rows)
+        
+        for idx in range(pages_in_grid):
+            page_num = start_page + idx
+            if page_num >= total_pages:
+                break
+            
+            # Check if texture exists - if yes, render it, if no, show minimal placeholder
+            texture = self.texture_cache.get_texture(page_num)
+            if texture and hasattr(texture, 'isCreated') and texture.isCreated():
+                # Render existing texture with proper aspect ratio
+                self.render_grid_cell_with_existing_texture(idx, page_num, texture, w_px, h_px)
+            else:
+                # Show a very minimal placeholder to maintain grid structure
+                self._draw_minimal_grid_placeholder(idx, w_px, h_px)
+    
+    def render_grid_cell_with_existing_texture(self, idx, page_num, texture, w_px, h_px):
+        """Render grid cell with existing texture - optimized for panning"""
+        if idx >= len(self._grid_cells):
+            return
+            
+        cell = self._grid_cells[idx]
+        
+        # Use cached dimensions if available, otherwise use texture dimensions
+        page_dims = self.texture_cache.get_dimensions(page_num)
+        if page_dims and page_dims[1] > 0:
+            page_aspect = page_dims[0] / page_dims[1]
+        else:
+            # Use texture dimensions as fallback
+            page_aspect = 0.75  # Standard fallback
+        
+        # Fast aspect fitting
+        inner_w_px = cell['inner_w_px']
+        inner_h_px = cell['inner_h_px']
+        
+        if page_aspect > (inner_w_px / inner_h_px):
+            fit_w = inner_w_px
+            fit_h = fit_w / page_aspect
+        else:
+            fit_h = inner_h_px
+            fit_w = fit_h * page_aspect
+        
+        # Center within cell
+        fitted_x_px = cell['page_x_px'] + (inner_w_px - fit_w) * 0.5
+        fitted_y_px = cell['page_y_px'] + (inner_h_px - fit_h) * 0.5
+        
+        # Convert to OpenGL coordinates
+        x_scale = 2.0 / w_px
+        y_scale = 2.0 / h_px
+        
+        quad_x = fitted_x_px * x_scale - 1.0
+        quad_y = 1.0 - fitted_y_px * y_scale
+        quad_width = fit_w * x_scale
+        quad_height = fit_h * y_scale
+        
+        # Render texture using cached binding to avoid GPU pipeline stalls
+        try:
+            if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not texture:
+                texture.bind()
+                self._last_bound_texture = texture
+        except Exception:
+            pass
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 1.0); glVertex2f(quad_x, quad_y - quad_height)
+        glTexCoord2f(1.0, 1.0); glVertex2f(quad_x + quad_width, quad_y - quad_height)
+        glTexCoord2f(1.0, 0.0); glVertex2f(quad_x + quad_width, quad_y)
+        glTexCoord2f(0.0, 0.0); glVertex2f(quad_x, quad_y)
+        glEnd()
+
+    def _draw_minimal_grid_placeholder(self, idx, w_px, h_px):
+        """Draw an extremely minimal placeholder to maintain grid structure during panning"""
+        if not hasattr(self, '_grid_cells') or idx >= len(self._grid_cells):
+            return
+            
+        cell = self._grid_cells[idx]
+        inner_w_px = cell['inner_w_px']
+        inner_h_px = cell['inner_h_px']
+        
+        # Use a smaller rectangle than full cell to show grid structure but not distract
+        margin = min(inner_w_px, inner_h_px) * 0.05  # 5% margin
+        fitted_x_px = cell['page_x_px'] + margin
+        fitted_y_px = cell['page_y_px'] + margin
+        fit_w = inner_w_px - 2 * margin
+        fit_h = inner_h_px - 2 * margin
+        
+        x_scale = 2.0 / w_px
+        y_scale = 2.0 / h_px
+        
+        quad_x = fitted_x_px * x_scale - 1.0
+        quad_y = 1.0 - fitted_y_px * y_scale
+        quad_width = fit_w * x_scale
+        quad_height = fit_h * y_scale
+        
+        # Draw a very subtle outline only - no fill
+        glDisable(GL_TEXTURE_2D)  # Disable texturing for line drawing
+        glColor4f(0.4, 0.4, 0.4, 0.2)  # Very subtle gray, very transparent
+        glBegin(GL_LINE_LOOP)  # Draw outline only
+        glVertex2f(quad_x, quad_y - quad_height)
+        glVertex2f(quad_x + quad_width, quad_y - quad_height)
+        glVertex2f(quad_x + quad_width, quad_y)
+        glVertex2f(quad_x, quad_y)
+        glEnd()
+        glEnable(GL_TEXTURE_2D)  # Re-enable texturing
+        glColor3f(1.0, 1.0, 1.0)  # Reset color
+
+    def render_grid_ultra_fast(self):
+        """EXTREME MINIMAL: Render only 1-2 textures during panning for maximum speed"""
+        
+        # Emergency mode: If performance is extremely low, render even less
+        performance_level = getattr(self, '_performance_monitor', {}).get('performance_level', 'high')
+        if performance_level == 'low':
+            # Emergency mode: Only render 1 texture and skip all validation
+            ultra_minimal_count = 1
+            skip_validation = True
+        else:
+            # Normal/medium performance: render based on grid size
+            grid_size = len(self._grid_cells) if hasattr(self, '_grid_cells') else 4
+            if grid_size <= 4:  # 2x2 grid
+                ultra_minimal_count = 2  # Show 2 textures for 2x2
+            else:
+                ultra_minimal_count = 1  # Only 1 texture for larger grids
+            skip_validation = False
+        
+        # Instant OpenGL setup
+        glLoadIdentity()
+        if getattr(self, 'is_temp_zoomed', False):
+            glTranslatef(self.temp_pan_x, self.temp_pan_y, 0.0)
+            glScalef(self.temp_zoom_factor, self.temp_zoom_factor, 1.0)
+        else:
+            glTranslatef(self.pan_x, self.pan_y, 0.0)
+            glScalef(self.zoom_factor, self.zoom_factor, 1.0)
+        
+        glColor3f(1.0, 1.0, 1.0)
+        
+        # EXTREME: Only render the first 1-2 pages during panning - even for 5x2
+        if not hasattr(self, '_grid_cells') or len(self._grid_cells) == 0:
+            return
         
         viewer = self.window()
         start_page = getattr(viewer, 'current_page', self.current_page)
@@ -1487,24 +1676,214 @@ class GPUPDFWidget(QOpenGLWidget):
         w_px = self.width()
         h_px = self.height()
         
-        # Only render if we have cached cell layout
-        if not hasattr(self, '_grid_cells') or not self._grid_cells:
-            return
-            
-        pages_needed = min(len(self._grid_cells), self.grid_cols * self.grid_rows)
+        # Use ultra-minimal count based on performance
+        ultra_minimal_count = min(ultra_minimal_count, len(self._grid_cells))
         
-        for idx in range(pages_needed):
+        # Pre-calculate for speed
+        x_scale = 2.0 / w_px
+        y_scale = 2.0 / h_px
+        
+        # Render only the first 1-2 textures
+        for idx in range(ultra_minimal_count):
             page_num = start_page + idx
             if page_num >= total_pages:
                 break
             
-            # Only render if texture exists and is ready - no loading operations
+            # Get texture with robust validation
+            texture = self.texture_cache.get_texture(page_num)
+            if skip_validation:
+                # Emergency mode: Skip texture validation but ensure texture exists
+                if not texture:
+                    # Instead of continuing, draw a simple colored rectangle as placeholder
+                    self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                    continue
+                # Quick check if texture has any content
+                try:
+                    if not texture.textureId():
+                        self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                        continue
+                except:
+                    self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                    continue
+            else:
+                # Normal validation
+                if not texture or not hasattr(texture, 'isCreated') or not texture.isCreated():
+                    self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                    continue
+                # Additional check for valid texture ID
+                try:
+                    if not texture.textureId():
+                        self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                        continue
+                except:
+                    self._draw_page_placeholder(idx, w_px, h_px, x_scale, y_scale)
+                    continue
+                
+            # Ultra-fast rendering with fixed aspect
+            cell = self._grid_cells[idx]
+            inner_w_px = cell['inner_w_px']
+            inner_h_px = cell['inner_h_px']
+            
+            # Fixed aspect for speed
+            page_aspect = 0.75
+            
+            if page_aspect > (inner_w_px / inner_h_px):
+                fit_w = inner_w_px
+                fit_h = fit_w / page_aspect
+            else:
+                fit_h = inner_h_px
+                fit_w = fit_h * page_aspect
+            
+            fitted_x_px = cell['page_x_px'] + (inner_w_px - fit_w) * 0.5
+            fitted_y_px = cell['page_y_px'] + (inner_h_px - fit_h) * 0.5
+            
+            quad_x = fitted_x_px * x_scale - 1.0
+            quad_y = 1.0 - fitted_y_px * y_scale
+            quad_width = fit_w * x_scale
+            quad_height = fit_h * y_scale
+            
+            # Direct render with cached binding - more robust texture handling
             try:
-                texture = self.texture_cache.get_texture(page_num)
-                if texture and hasattr(texture, 'isCreated') and texture.isCreated():
-                    self.render_grid_cell_with_texture(idx, page_num, texture, w_px, h_px)
-            except:
-                pass  # Ignore errors during fast rendering
+                # Ensure we have a valid texture before binding
+                texture_id = texture.textureId()
+                if texture_id == 0:
+                    continue
+                    
+                if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not texture:
+                    texture.bind()
+                    self._last_bound_texture = texture
+                    
+                # Draw with semi-transparent white background during panning for better visibility
+                if self._active_panning:
+                    glColor4f(1.0, 1.0, 1.0, 0.9)  # Slightly transparent during panning
+                else:
+                    glColor3f(1.0, 1.0, 1.0)  # Fully opaque when not panning
+                    
+            except Exception as e:
+                # If texture binding fails, skip this texture
+                continue
+                
+            glBegin(GL_QUADS)
+            glTexCoord2f(0.0, 1.0); glVertex2f(quad_x, quad_y - quad_height)
+            glTexCoord2f(1.0, 1.0); glVertex2f(quad_x + quad_width, quad_y - quad_height)
+            glTexCoord2f(1.0, 0.0); glVertex2f(quad_x + quad_width, quad_y)
+            glTexCoord2f(0.0, 0.0); glVertex2f(quad_x, quad_y)
+            glEnd()
+
+    def _draw_page_placeholder(self, idx, w_px, h_px, x_scale, y_scale):
+        """Draw a subtle placeholder when texture is not available during fast panning"""
+        if not hasattr(self, '_grid_cells') or idx >= len(self._grid_cells):
+            return
+            
+        cell = self._grid_cells[idx]
+        inner_w_px = cell['inner_w_px']
+        inner_h_px = cell['inner_h_px']
+        
+        # Fixed aspect for speed
+        page_aspect = 0.75
+        
+        if page_aspect > (inner_w_px / inner_h_px):
+            fit_w = inner_w_px
+            fit_h = fit_w / page_aspect
+        else:
+            fit_h = inner_h_px
+            fit_w = fit_h * page_aspect
+        
+        fitted_x_px = cell['page_x_px'] + (inner_w_px - fit_w) * 0.5
+        fitted_y_px = cell['page_y_px'] + (inner_h_px - fit_h) * 0.5
+        
+        quad_x = fitted_x_px * x_scale - 1.0
+        quad_y = 1.0 - fitted_y_px * y_scale
+        quad_width = fit_w * x_scale
+        quad_height = fit_h * y_scale
+        
+        # Draw a subtle dark gray placeholder (not white) that's barely visible
+        glDisable(GL_TEXTURE_2D)  # Disable texturing for solid color
+        glColor4f(0.2, 0.2, 0.2, 0.3)  # Dark gray, semi-transparent
+        glBegin(GL_QUADS)
+        glVertex2f(quad_x, quad_y - quad_height)
+        glVertex2f(quad_x + quad_width, quad_y - quad_height)
+        glVertex2f(quad_x + quad_width, quad_y)
+        glVertex2f(quad_x, quad_y)
+        glEnd()
+        glEnable(GL_TEXTURE_2D)  # Re-enable texturing
+        glColor3f(1.0, 1.0, 1.0)  # Reset color
+
+    def render_grid_view_fast(self):
+        """FAST grid rendering - reduced complexity from ultra-fast mode"""
+        glLoadIdentity()
+        
+        # Apply transformations
+        if getattr(self, 'is_temp_zoomed', False):
+            glTranslatef(self.temp_pan_x, self.temp_pan_y, 0.0)
+            glScalef(self.temp_zoom_factor, self.temp_zoom_factor, 1.0)
+        else:
+            glTranslatef(self.pan_x, self.pan_y, 0.0)
+            glScalef(self.zoom_factor, self.zoom_factor, 1.0)
+        
+        glColor3f(1.0, 1.0, 1.0)
+        
+        if not hasattr(self, '_grid_cells') or not self._grid_cells:
+            return
+            
+        viewer = self.window()
+        start_page = getattr(viewer, 'current_page', self.current_page)
+        total_pages = getattr(viewer, 'total_pages', getattr(self, 'total_pages', 0))
+        
+        w_px = self.width()
+        h_px = self.height()
+        
+        # Render more pages than ultra-fast but still limited for performance
+        pages_to_render = min(len(self._grid_cells), self.grid_cols * self.grid_rows, 8)
+        
+        for idx in range(pages_to_render):
+            page_num = start_page + idx
+            if page_num >= total_pages:
+                break
+            
+            texture = self.texture_cache.get_texture(page_num)
+            if texture and hasattr(texture, 'isCreated') and texture.isCreated():
+                try:
+                    cell = self._grid_cells[idx]
+                    
+                    # Simplified aspect ratio for speed
+                    page_aspect = 0.75
+                    
+                    inner_w_px = cell['inner_w_px']
+                    inner_h_px = cell['inner_h_px']
+                    
+                    if page_aspect > (inner_w_px / inner_h_px):
+                        fit_w = inner_w_px
+                        fit_h = fit_w / page_aspect
+                    else:
+                        fit_h = inner_h_px
+                        fit_w = fit_h * page_aspect
+                    
+                    fitted_x_px = cell['page_x_px'] + (inner_w_px - fit_w) * 0.5
+                    fitted_y_px = cell['page_y_px'] + (inner_h_px - fit_h) * 0.5
+                    
+                    x_scale = 2.0 / w_px
+                    y_scale = 2.0 / h_px
+                    
+                    quad_x = fitted_x_px * x_scale - 1.0
+                    quad_y = 1.0 - fitted_y_px * y_scale
+                    quad_width = fit_w * x_scale
+                    quad_height = fit_h * y_scale
+                    
+                    try:
+                        if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not texture:
+                            texture.bind()
+                            self._last_bound_texture = texture
+                    except Exception:
+                        pass
+                    glBegin(GL_QUADS)
+                    glTexCoord2f(0.0, 1.0); glVertex2f(quad_x, quad_y - quad_height)
+                    glTexCoord2f(1.0, 1.0); glVertex2f(quad_x + quad_width, quad_y - quad_height)
+                    glTexCoord2f(1.0, 0.0); glVertex2f(quad_x + quad_width, quad_y)
+                    glTexCoord2f(0.0, 0.0); glVertex2f(quad_x, quad_y)
+                    glEnd()
+                except:
+                    continue
     
     def render_grid_view(self, temp=False):
         """Render multiple pages in a grid layout - COMPLETELY NON-BLOCKING
@@ -1878,6 +2257,8 @@ class GPUPDFWidget(QOpenGLWidget):
             # Update performance level based on frame times
             avg_frame_time = self._performance_monitor['avg_frame_time'] * 1000  # Convert to ms
             
+            previous_level = self._performance_monitor.get('performance_level', 'high')
+            
             if avg_frame_time < 20:  # < 20ms = >50 FPS
                 self._performance_monitor['performance_level'] = 'high'
                 self._performance_quality_multiplier = 1.0
@@ -1887,6 +2268,22 @@ class GPUPDFWidget(QOpenGLWidget):
             else:  # >33ms = <30 FPS
                 self._performance_monitor['performance_level'] = 'low'
                 self._performance_quality_multiplier = 0.6
+            
+            # Auto-pause renderer when performance drops to very low levels
+            current_level = self._performance_monitor['performance_level']
+            if hasattr(self, 'renderer') and self.renderer:
+                if current_level == 'low' and previous_level != 'low':
+                    # Performance just dropped - pause background rendering
+                    if hasattr(self.renderer, 'pause') and not getattr(self, '_renderer_manually_paused', False):
+                        print("🚀 Auto-pausing renderer due to low performance")
+                        self.renderer.pause()
+                        self._renderer_auto_paused = True
+                elif current_level != 'low' and previous_level == 'low':
+                    # Performance recovered - resume background rendering
+                    if hasattr(self.renderer, 'resume') and getattr(self, '_renderer_auto_paused', False):
+                        print("🚀 Auto-resuming renderer as performance recovered")
+                        self.renderer.resume()
+                        self._renderer_auto_paused = False
         
         self._last_frame_time = current_time
         
@@ -1926,17 +2323,17 @@ class GPUPDFWidget(QOpenGLWidget):
         }
 
     def process_pending_images(self, max_items=1):
-        """Convert up to max_items QImage entries to GPU textures per call - ULTRA FAST"""
+        """Convert up to max_items QImage entries to GPU textures per call - ULTRA AGGRESSIVE"""
         if max_items == 0:
             return  # Skip entirely during interactions
             
         layout_needs_update = False
         count = 0
         
-        # Use even smaller time slices to prevent blocking
+        # AGGRESSIVE processing - much longer time slices for faster processing
         import time
         start_time = time.time()
-        max_time_slice = 0.001  # 1ms maximum processing time to prevent lag
+        max_time_slice = 0.008  # 8ms maximum processing time for much more work (was 1ms)
         
         while self._pending_images and count < max_items:
             # Check if we've exceeded our time budget
@@ -2113,21 +2510,21 @@ class GPUPDFWidget(QOpenGLWidget):
         return adjusted_quality
     
     def get_immediate_quality(self):
-        """Get quality for immediate display (ultra-fast rendering for single page)"""
-        # 🚀 OPTIMIZATION: Use very low quality for immediate display - prioritize speed over quality
+        """Get quality for immediate display (fast rendering for single page)"""
+        # 🚀 OPTIMIZATION: Use moderate quality for immediate display - balance speed and clarity
         try:
             viewer = self.window()
             if viewer and hasattr(viewer, 'pdf_path') and os.path.exists(viewer.pdf_path):
                 file_size_mb = os.path.getsize(viewer.pdf_path) / (1024 * 1024)
                 if file_size_mb > 30:  # Large PDF
-                    return 1.5  # Ultra-fast rendering for large files - same as grid mode
+                    return 2.2  # Faster rendering for large files but readable
                 elif file_size_mb > 10:  # Medium PDF
-                    return 1.8  # Still very fast
+                    return 2.5  # Good balance
         except:
             pass
         
-        # Use low immediate quality for instant response, higher quality will follow
-        return 2.0  # Much lower than before for instant display
+        # Use moderate immediate quality for readable immediate display
+        return 2.8  # Higher than before for better immediate quality
     
     def check_quality_change(self):
         """Check if quality needs updating due to zoom change and re-render if needed"""
@@ -2156,7 +2553,7 @@ class GPUPDFWidget(QOpenGLWidget):
                     self._upgrade_grid_quality(new_quality)
                     viewer.render_current_page()
                 else:
-                    # For single page mode, implement progressive rendering
+                    # 🚀 SINGLE PAGE ZOOM FIX: Make single page mode as aggressive as grid mode for quality
                     current_page = getattr(viewer, 'current_page', 0)
                     
                     # Calculate effective zoom including temporary zoom
@@ -2164,22 +2561,24 @@ class GPUPDFWidget(QOpenGLWidget):
                     if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
                         effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
                     
-                    # For ultra-high zoom levels, be more selective about clearing textures
                     existing_texture = self.texture_cache.get_texture(current_page)
-                    if existing_texture and effective_zoom > self.quality_zoom_threshold:
-                        current_quality = self.texture_cache.get_best_quality_for_page(current_page)
-                        # Only clear texture if zoom is very high and current quality is much lower
-                        if effective_zoom > 8.0 and new_quality > current_quality + 3.0:  # Much higher thresholds
-                            self.texture_cache.remove_texture(current_page)
-                            self.set_page_texture(None)
-                        # Keep current texture visible while rendering higher quality in background
-                        pass  # Don't clear the texture
-                    else:
-                        # Clear texture for zoom out or first render
+                    current_quality = self.texture_cache.get_best_quality_for_page(current_page) if existing_texture else 0.0
+                    
+                    # NEW: Single page mode should request high-quality textures just like grid mode
+                    if new_quality > current_quality + 0.5:  # Same threshold as grid mode
+                        # Request new high-quality texture while keeping current one visible
+                        try:
+                            viewer.renderer.add_page_to_queue(current_page, priority=True, quality=new_quality)
+                            print(f"🔍 Single page quality upgrade: page {current_page}, from {current_quality:.1f} to {new_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                        except Exception as e:
+                            print(f"Error queueing single page {current_page} for quality upgrade: {e}")
+                    
+                    # Only clear texture in extreme cases to avoid visual disruption
+                    if existing_texture and effective_zoom > 8.0 and new_quality > current_quality + 3.0:
                         self.texture_cache.remove_texture(current_page)
                         self.set_page_texture(None)
                 
-                # Trigger progressive re-render
+                # Trigger progressive re-render (but mainly for background high-quality loading)
                 viewer.render_current_page_progressive()
     
     def _schedule_delayed_quality_check(self):
@@ -2220,10 +2619,15 @@ class GPUPDFWidget(QOpenGLWidget):
         # Less aggressive quality target to reduce processing load
         target_quality = min(new_quality, self.max_quality)
         
-        # Only upgrade first row (most visible) during zoom for better responsiveness
-        first_row_only = getattr(self, 'is_temp_zoomed', False)
-        if first_row_only:
-            pages_needed = min(pages_needed, self.grid_cols)
+        # 🔍 GRID FIX: For small grids (2x2), upgrade ALL pages, not just first row
+        if len(self._grid_cells) <= 4:  # 2x2 grid or smaller
+            # Always upgrade all visible pages for small grids
+            pages_needed = min(pages_needed, len(self._grid_cells))
+        else:
+            # For larger grids, only upgrade first row during zoom for better responsiveness
+            first_row_only = getattr(self, 'is_temp_zoomed', False)
+            if first_row_only:
+                pages_needed = min(pages_needed, self.grid_cols)
         
         upgrade_count = 0
         for i in range(pages_needed):
@@ -2235,13 +2639,19 @@ class GPUPDFWidget(QOpenGLWidget):
             
             # Less aggressive quality checking to reduce queue pressure
             if target_quality > current_quality + 0.5:  # Increased threshold
-                # Only prioritize first page to reduce processing load
+                # Priority for first page, but process all needed pages
                 priority = i == 0
                 try:
                     viewer.renderer.add_page_to_queue(page_num, priority=priority, quality=target_quality)
                     upgrade_count += 1
-                    # Limit concurrent upgrades to prevent lag
-                    if upgrade_count >= 3:
+                    print(f"🔍 Grid quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (#{upgrade_count})")
+                    # 🔍 GRID FIX: Increase limit for small grids to ensure all 4 pages in 2x2 get upgraded
+                    if len(self._grid_cells) <= 4:
+                        max_upgrades = 4  # Allow all 4 pages in 2x2 to be upgraded
+                    else:
+                        max_upgrades = 3  # Limit larger grids
+                    
+                    if upgrade_count >= max_upgrades:
                         break
                 except Exception as e:
                     print(f"Error queueing page {page_num} for quality upgrade: {e}")
@@ -2622,9 +3032,23 @@ class GPUPDFWidget(QOpenGLWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = True
-            self._interaction_mode = True  # Enable interaction mode for performance
-            self._active_panning = True    # Flag for active panning optimizations
+            self._interaction_mode = True
+            self._active_panning = True
             self.last_mouse_pos = event.position()
+            
+            # CRITICAL: Pause background rendering to eliminate CPU dependency
+            if hasattr(self, 'renderer') and self.renderer:
+                if hasattr(self.renderer, 'pause'):
+                    self.renderer.pause()
+                    
+            # Don't disable Qt updates - we want real-time panning feedback
+            if self.grid_mode:
+                self._ultra_fast_mode = True
+                # Stop any timer-based processing during panning
+                if hasattr(self, '_performance_timer'):
+                    self._performance_timer.stop()
+            # Keep Qt updates enabled for responsive panning visual feedback
+                
         elif event.button() == Qt.MouseButton.MiddleButton:
             # Middle mouse click goes to next page
             viewer = self.window()
@@ -2632,61 +3056,87 @@ class GPUPDFWidget(QOpenGLWidget):
                 viewer.next_page()
     
     def mouseMoveEvent(self, event):
-        """Handle mouse move for panning - optimized per mode"""
+        """REAL-TIME PANNING - Smooth visual feedback with optimized performance"""
         
-        # SELECTIVE OPTIMIZATION: Only use aggressive optimization for grid mode
         if self.is_panning:
             delta = event.position() - self.last_mouse_pos
             
-            # Skip tiny movements completely
-            if abs(delta.x()) < 0.5 and abs(delta.y()) < 0.5:
+            # Skip microscopic movements to reduce unnecessary updates
+            if abs(delta.x()) < 2.0 and abs(delta.y()) < 2.0:
                 return
             
+            # Light throttling for performance while maintaining responsiveness
+            current_time = time.time()
+            if not hasattr(self, '_last_pan_time'):
+                self._last_pan_time = 0
+            
+            # Throttle to 60 FPS max for smooth panning
+            throttle_interval = 1.0 / 60.0  # 60 FPS limit
+            if current_time - self._last_pan_time < throttle_interval:
+                return
+            
+            self._last_pan_time = current_time
+            
+            # Calculate pan delta with appropriate scaling
             if self.grid_mode:
-                # GRID MODE: Ultra-fast panning with aggressive optimizations
+                scale_factor = 4.0 / max(self.width(), self.height())
                 if self.is_temp_zoomed:
-                    # Pan in temp zoom mode - INSTANT GPU-only update
-                    self.temp_pan_x += delta.x() / self.width() * 2.0
-                    self.temp_pan_y -= delta.y() / self.height() * 2.0
+                    self.temp_pan_x += delta.x() * scale_factor
+                    self.temp_pan_y -= delta.y() * scale_factor
                 else:
-                    # Normal grid panning - INSTANT GPU-only update
-                    self.reset_grid_zoom()
-                    self.pan_x += delta.x() / self.width() * 2.0
-                    self.pan_y -= delta.y() / self.height() * 2.0
-                
-                # Enable fast processing mode for grid
-                self._skip_heavy_processing = True
-                self.update()
+                    self.pan_x += delta.x() * scale_factor
+                    self.pan_y -= delta.y() * scale_factor
             else:
-                # SINGLE PAGE MODE: Standard panning - no heavy processing skip
-                self.pan_x += delta.x() / self.width() * 2.0
-                self.pan_y -= delta.y() / self.height() * 2.0
-                
-                # Use normal update for single page - don't skip heavy processing
-                self.update()
+                # Single page mode
+                scale_factor = 2.0 / max(self.width(), self.height())
+                self.pan_x += delta.x() * scale_factor
+                self.pan_y -= delta.y() * scale_factor
+            
+            # Enable ultra-fast mode flags for performance
+            self._skip_heavy_processing = True
+            self._active_panning = True
+            self._ultra_fast_mode = True
+            
+            # Real-time visual feedback - always update
+            self.update()
             
             self.last_mouse_pos = event.position()
-            return  # Early exit - skip other processing
+            return
         
-        # Non-panning mouse movement - restore normal processing
+        # Reset flags when not panning
         self._skip_heavy_processing = False
+        self._ultra_fast_mode = False
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = False
-            self._active_panning = False   # Disable panning optimizations
-            self._interaction_mode = False  # Disable interaction mode
+            self._active_panning = False
+            self._interaction_mode = False
+            self._skip_heavy_processing = False
+            self._ultra_fast_mode = False
             
-            # Only reset heavy processing skip in grid mode (single page never sets it)
-            if self.grid_mode:
-                self._skip_heavy_processing = False
+            # Clear the cached texture binding to force refresh
+            if hasattr(self, '_last_bound_texture'):
+                self._last_bound_texture = None
+                
+            # Restart performance timer if it exists
+            if hasattr(self, '_performance_timer'):
+                self._performance_timer.start(100)
             
-            # Stop the pan update timer if it's running
-            if hasattr(self, '_pan_update_timer'):
-                self._pan_update_timer.stop()
+            # CRITICAL: Resume background rendering after panning
+            if hasattr(self, 'renderer') and self.renderer:
+                if hasattr(self.renderer, 'resume') and not getattr(self, '_renderer_auto_paused', False):
+                    self.renderer.resume()
             
-            # Immediate update after panning ends for final position
+            # Force a complete repaint to restore proper rendering
             self.update()
+            
+            # Schedule a second update to ensure content is restored
+            QTimer.singleShot(50, self.update)
+            
+            # Quality check after a brief delay
+            if self.grid_mode:
+                QTimer.singleShot(100, self.check_quality_change)
             
             # Re-enable rendering after panning stops, but with delay
             if not hasattr(self, '_pan_end_timer'):
@@ -2901,6 +3351,10 @@ Press F12 to refresh stats"""
         """)
         self.setContentsMargins(0, 0, 0, 0)
         
+        # Create status bar
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Ready - Use File menu or drop file to open a PDF")
+        
         # Central widget
         central_widget = QWidget()
         central_widget.setStyleSheet("""
@@ -2965,53 +3419,145 @@ Press F12 to refresh stats"""
         splitter.setHandleWidth(2)
         splitter.addWidget(left_panel)
         splitter.addWidget(pdf_container)
-        splitter.setSizes([250, 1000])
         
+        # Add splitter to main layout
         main_layout.addWidget(splitter)
         
-        # Defer heavy UI creation
-        QTimer.singleShot(50, self.create_menu_deferred)
+        # Set initial splitter sizes (30% for thumbnails, 70% for PDF)
+        splitter.setSizes([300, 900])
+        
+        # Enable OpenGL context after UI is set up
         QTimer.singleShot(100, self.finalize_ui_setup)
-    
-    def create_menu_deferred(self):
-        """Create menu and toolbar after initial window is shown"""
-        self.create_menu()
-        self.create_toolbar()
     
     def finalize_ui_setup(self):
         """Finalize UI setup after window is visible"""
-        # Re-enable updates on PDF widget
+        # Enable updates on PDF widget
         self.pdf_widget.setUpdatesEnabled(True)
         
-        # Setup zoom connections - moved from setup_ui for faster startup
-        original_zoom_in = self.pdf_widget.zoom_in
-        original_zoom_out = self.pdf_widget.zoom_out
-        original_reset_zoom = self.pdf_widget.reset_zoom
+        # Create menu and toolbar after initial window is shown
+        QTimer.singleShot(50, self.create_menu_deferred)
+    
+    def create_menu_deferred(self):
+        """Create menu after UI is ready"""
+        self.create_menu_bar()
+        self.create_toolbar()
         
-        def update_zoom_in(cursor_pos=None):
-            original_zoom_in(cursor_pos)
-            self.zoom_slider.setValue(int(self.pdf_widget.zoom_factor * 100))
-        
-        def update_zoom_out(cursor_pos=None):
-            original_zoom_out(cursor_pos)
-            self.zoom_slider.setValue(int(self.pdf_widget.zoom_factor * 100))
-            
-        def update_reset_zoom():
-            original_reset_zoom()
+        # Set initial zoom slider value
+        if hasattr(self, 'zoom_slider'):
             self.zoom_slider.setValue(100)
+    
+    def generate_thumbnails_deferred(self, force_new_pdf=False):
+        """Generate thumbnails after main view is ready"""
+        try:
+            # Check if we're in grid mode - if so, minimize thumbnail generation
+            # BUT override this check if we're loading a new PDF (force_new_pdf=True)
+            if not force_new_pdf and getattr(self.pdf_widget, 'grid_mode', False):
+                print("Grid mode active - skipping heavy thumbnail generation to prioritize grid performance")
+                return
+            
+            # If we're forcing generation for new PDF, show status message
+            if force_new_pdf:
+                print("New PDF loaded - forcing thumbnail generation even in grid mode")
+            
+            # Force complete thumbnail regeneration for new PDF
+            self._selective_thumbnails_enabled = False
+            
+            # Generate thumbnails with force clear to ensure old thumbnails are removed
+            self.generate_thumbnails(force_clear=True)
+            
+            # Re-enable selective loading after initial generation
+            self._selective_thumbnails_enabled = True
+            
+            # Initialize tracking variables for selective loading
+            if not hasattr(self, '_current_thumb_range'):
+                self._current_thumb_range = (0, min(30, self.total_pages - 1))  # Initial range
+            
+            # Show final loaded status
+            file_name = os.path.basename(self.pdf_path)
+            zoom_percent = int(self.pdf_widget.zoom_factor * 100)
+            quality = self.pdf_widget.get_zoom_adjusted_quality()
+            self.status_bar.showMessage(f"Loaded: {file_name} | Page 1/{self.total_pages} | Zoom: {zoom_percent}% | Quality: {quality:.1f}")
+            
+            # Update PDF widget status
+            self.pdf_widget.update_status()
+            QTimer.singleShot(2000, lambda: self.status_bar.showMessage("Ready"))
+            
+            # Start aggressive preloading after initial loading is complete
+            QTimer.singleShot(3000, self.start_aggressive_preloading)
+            
+        except Exception as e:
+            print(f"Thumbnail generation error: {e}")
+            
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Show the exception and include a copyable traceback for debugging
+            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}\n\nTraceback:\n{tb}")
+    
+    def render_current_page(self):
+        if self.pdf_doc and 0 <= self.current_page < self.total_pages:
+            if self.pdf_widget.grid_mode:
+                self.render_grid_pages()
+            else:
+                # Single page mode - implement immediate display for maximum responsiveness
+                texture = self.pdf_widget.texture_cache.get_texture(self.current_page)
+                if texture:
+                    # We have a texture, set it immediately without blocking operations
+                    cached_dims = self.pdf_widget.texture_cache.get_dimensions(self.current_page)
+                    if cached_dims:
+                        page_width, page_height = cached_dims
+                    else:
+                        # Fallback to PDF dimensions but don't block the main thread
+                        try:
+                            page = self.pdf_doc[self.current_page]
+                            page_width = page.rect.width
+                            page_height = page.rect.height
+                            # Cache these dimensions for next time
+                            self.pdf_widget.texture_cache.dimensions[self.current_page] = (page_width, page_height)
+                        except:
+                            # Use default aspect ratio if PDF access fails
+                            page_width, page_height = 595, 842  # A4 default
+                    
+                    # Set texture immediately for instant display
+                    self.pdf_widget.set_page_texture(texture, page_width, page_height)
+                    self.pdf_widget.set_current_page(self.current_page)
+                    
+                    # Update window title
+                    if self.pdf_path:
+                        filename = os.path.basename(self.pdf_path)
+                        self.setWindowTitle(f"PDF Viewer - {filename} - Page {self.current_page + 1} of {self.total_pages}")
+                    
+                    # Schedule background texture generation for better quality if needed
+                    QTimer.singleShot(10, lambda: self.ensure_high_quality_texture(self.current_page))
+                else:
+                    # No texture available - generate one in background while showing loading
+                    self.pdf_widget.set_loading_state(True)
+                    
+                    # For single page mode, always use zoom-adjusted quality for best visual quality
+                    target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                    if self.renderer:
+                        self.renderer.add_page_to_queue(self.current_page, priority=True, quality=target_quality)
+                    
+                    # Update window title even without texture
+                    if self.pdf_path:
+                        filename = os.path.basename(self.pdf_path)
+                        self.setWindowTitle(f"PDF Viewer - {filename} - Page {self.current_page + 1} of {self.total_pages} (Loading...)")
+    
+    def ensure_high_quality_texture(self, page_num):
+        """Ensure we have a high-quality texture for the given page"""
+        if not self.pdf_doc or page_num < 0 or page_num >= self.total_pages:
+            return
         
-        self.pdf_widget.zoom_in = update_zoom_in
-        self.pdf_widget.zoom_out = update_zoom_out
-        self.pdf_widget.reset_zoom = update_reset_zoom
-        
-        # Setup status bar
-        self.status_bar = self.statusBar()
-        self.status_bar.showMessage("Ready - Use File menu or drop file to open a PDF")
-        
-        # Hide menu bar for cleaner look  
-        self.menuBar().hide()
-
+        # Check if we already have a high-quality texture
+        texture = self.pdf_widget.texture_cache.get_texture(page_num)
+        if texture:
+            # We have a texture, but let's make sure it's high quality
+            # This is a background operation so it won't block the UI
+            target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+            if self.renderer:
+                self.renderer.add_page_to_queue(page_num, priority=False, quality=target_quality)
+    
     def create_left_panel(self):
+        """Create the left panel with thumbnails"""
         panel = QWidget()
         panel.setFixedWidth(200)
         panel.setStyleSheet("""
@@ -3061,7 +3607,8 @@ Press F12 to refresh stats"""
         
         return panel
     
-    def create_menu(self):
+    def create_menu_bar(self):
+        """Create the application menu bar"""
         menubar = self.menuBar()
         
         # File menu
@@ -3198,11 +3745,11 @@ Press F12 to refresh stats"""
 
         # Grid size selector for single-row view
         self.grid_size_combo = QComboBox()
-        self.grid_size_combo.addItems(["2x2", "3x3", "5x1", "5x2"])
+        self.grid_size_combo.addItems(["2x2", "3x1", "3x2", "5x1"])
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         self.grid_size_combo.setEnabled(False)
         self.grid_size_combo.setMaxVisibleItems(10)
-        self.grid_size_combo.setToolTip("Grid Size (1-5 keys or Tab to cycle)")
+        self.grid_size_combo.setToolTip("Grid Size (1-4 keys or Tab to cycle)")
         toolbar.addWidget(self.grid_size_combo)
 
         # Fullscreen action with better matching icon
@@ -3261,9 +3808,9 @@ Press F12 to refresh stats"""
         
         # Grid size shortcuts
         QShortcut(QKeySequence("1"), self, lambda: self.set_grid_size("2x2"))
-        QShortcut(QKeySequence("2"), self, lambda: self.set_grid_size("3x3"))
-        QShortcut(QKeySequence("3"), self, lambda: self.set_grid_size("5x1"))  # Moved 5x1 to key 3
-        QShortcut(QKeySequence("4"), self, lambda: self.set_grid_size("5x2"))  # Moved 5x2 to key 4
+        QShortcut(QKeySequence("2"), self, lambda: self.set_grid_size("3x1"))
+        QShortcut(QKeySequence("3"), self, lambda: self.set_grid_size("3x2"))
+        QShortcut(QKeySequence("4"), self, lambda: self.set_grid_size("5x1"))
         QShortcut(QKeySequence("Tab"), self, self.cycle_grid_size)
     
     def cycle_grid_layout_mode(self):
@@ -3297,14 +3844,14 @@ Press F12 to refresh stats"""
         info_text = f"""Current Grid Layout Mode: {current.title()}
 
 Available Modes:
-• Adaptive: Balances uniform sizing with aspect ratio proportionality
-• Uniform: All grid cells have the same dimensions
-• Proportional: Row heights strictly follow page aspect ratios
+- Adaptive: Balances uniform sizing with aspect ratio proportionality
+- Uniform: All grid cells have the same dimensions
+- Proportional: Row heights strictly follow page aspect ratios
 
 Settings:
-• Gap ratio: {self.pdf_widget.grid_gap_ratio:.1%} of widget size
-• Aspect weight: {self.pdf_widget.grid_aspect_weight:.0%} (adaptive mode only)
-• Gap range: {self.pdf_widget.grid_min_gap:.0f}px - {self.pdf_widget.grid_max_gap:.0f}px
+- Gap ratio: {self.pdf_widget.grid_gap_ratio:.1%} of widget size
+- Aspect weight: {self.pdf_widget.grid_aspect_weight:.0%} (adaptive mode only)
+- Gap range: {int(self.pdf_widget.grid_min_gap)}px to {int(self.pdf_widget.grid_max_gap)}px
 
 Press 'L' to cycle through modes."""
         
@@ -3349,10 +3896,20 @@ Press 'L' to cycle through modes."""
             pass
 
         self.grid_size_combo.clear()
-        self.grid_size_combo.addItems(["2x2", "3x3", "5x1", "5x2"])
+        self.grid_size_combo.addItems(["2x2", "3x1", "3x2", "5x1"])
         
-        if current_text and current_text != "4x4":  # Skip 4x4 if it was selected
+        if current_text and current_text not in ["4x4", "3x3", "5x2"]:  # Skip 4x4, old 3x3, and 5x2 if they were selected
             index = self.grid_size_combo.findText(current_text)
+            if index >= 0:
+                self.grid_size_combo.setCurrentIndex(index)
+        elif current_text == "3x3":
+            # Map old 3x3 to new 3x2
+            index = self.grid_size_combo.findText("3x2")
+            if index >= 0:
+                self.grid_size_combo.setCurrentIndex(index)
+        elif current_text == "5x2":
+            # Map 5x2 to 5x1 as fallback
+            index = self.grid_size_combo.findText("5x1")
             if index >= 0:
                 self.grid_size_combo.setCurrentIndex(index)
         
@@ -3367,7 +3924,7 @@ Press 'L' to cycle through modes."""
             
             # Show helpful message
             if self.isFullScreen():
-                self.status_bar.showMessage("Fullscreen: Use keys 1-5 or Tab to change grid size", 3000)
+                self.status_bar.showMessage("Fullscreen: Use keys 1-4 or Tab to change grid size", 3000)
         except Exception as e:
             print(f"Error restoring combo box state: {e}")
 
@@ -3613,6 +4170,10 @@ Press 'L' to cycle through modes."""
             # Update PDF widget status
             self.pdf_widget.update_status()
             QTimer.singleShot(2000, lambda: self.status_bar.showMessage("Ready"))
+            
+            # Start aggressive preloading after initial loading is complete
+            QTimer.singleShot(3000, self.start_aggressive_preloading)
+            
         except Exception as e:
             print(f"Thumbnail generation error: {e}")
             
@@ -4148,12 +4709,26 @@ Press 'L' to cycle through modes."""
                         # Page already visible - INSTANT zoom without rendering delay
                         self.pdf_widget.zoom_to_grid_page(page_num)
                         
-                        # DEFERRED TEXTURE CHECK: Ensure texture quality after UI update
+                        # 🔍 QUALITY CHECK: Ensure texture quality matches zoom level
+                        effective_zoom = self.pdf_widget.zoom_factor
+                        if hasattr(self.pdf_widget, 'is_temp_zoomed') and self.pdf_widget.is_temp_zoomed:
+                            effective_zoom *= getattr(self.pdf_widget, 'temp_zoom_factor', 1.0)
+                        
+                        if effective_zoom > self.pdf_widget.quality_zoom_threshold:
+                            current_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
+                            target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                            
+                            if target_quality > current_quality + 0.5:  # Same threshold as quality check
+                                print(f"🔍 Grid click quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                                if self.renderer:
+                                    self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
+                        
+                        # DEFERRED TEXTURE CHECK: Ensure texture exists
                         if page_num not in self.pdf_widget.grid_textures:
                             self._queue_single_texture_deferred(page_num)
                 else:
-                    # Single-page mode: INSTANT navigation with immediate_loading flag
-                    self.go_to_page(page_num, immediate_loading=True)
+                    # Single-page mode: Use the simplified, more stable go_to_page
+                    self.go_to_page(page_num)
 
     def _queue_grid_textures_deferred(self, start_page, pages_needed, focus_page):
         """Queue grid textures for background loading after UI update - DEFERRED 10ms"""
@@ -4161,14 +4736,28 @@ Press 'L' to cycle through modes."""
             if not self.renderer:
                 return
             try:
+                # 🔍 GRID QUALITY: Use zoom-aware quality for all grid pages
+                effective_zoom = self.pdf_widget.zoom_factor
+                if hasattr(self.pdf_widget, 'is_temp_zoomed') and self.pdf_widget.is_temp_zoomed:
+                    effective_zoom *= getattr(self.pdf_widget, 'temp_zoom_factor', 1.0)
+                
+                if effective_zoom > self.pdf_widget.quality_zoom_threshold:
+                    # If zoomed, use high quality for all visible pages
+                    base_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                    focus_quality = base_quality
+                else:
+                    # Normal zoom levels
+                    base_quality = 2.5  # Better base quality than before
+                    focus_quality = 3.0  # Focus page gets extra quality
+                
                 # Priority loading for visible pages
                 for i in range(pages_needed):
                     page_num = start_page + i
                     if page_num >= self.total_pages:
                         break
                     
-                    # Ultra-fast quality for instant appearance
-                    quality = 1.5 if page_num == focus_page else 1.2
+                    # Focus page gets best quality, others get base quality
+                    quality = focus_quality if page_num == focus_page else base_quality
                     priority = i < 4  # First 4 pages get priority
                     
                     self.renderer.add_page_to_queue(page_num, priority=priority, quality=quality)
@@ -4184,11 +4773,23 @@ Press 'L' to cycle through modes."""
         QTimer.singleShot(10, queue_textures)
 
     def _queue_single_texture_deferred(self, page_num):
-        """Queue single texture for background loading - DEFERRED 10ms"""
+        """Queue single texture for background loading - DEFERRED 10ms with zoom-aware quality"""
         def queue_texture():
             if self.renderer:
                 try:
-                    quality = self.pdf_widget.get_immediate_quality()
+                    # 🔍 GRID ZOOM-AWARE: Request appropriate quality based on current zoom/temp zoom
+                    effective_zoom = self.pdf_widget.zoom_factor
+                    if hasattr(self.pdf_widget, 'is_temp_zoomed') and self.pdf_widget.is_temp_zoomed:
+                        effective_zoom *= getattr(self.pdf_widget, 'temp_zoom_factor', 1.0)
+                    
+                    if effective_zoom > self.pdf_widget.quality_zoom_threshold:
+                        # If zoomed, request high quality immediately
+                        quality = self.pdf_widget.get_zoom_adjusted_quality()
+                        print(f"🔍 Grid thumbnail quality upgrade: page {page_num}, quality {quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                    else:
+                        # Normal zoom, use standard quality
+                        quality = self.pdf_widget.get_immediate_quality()
+                    
                     self.renderer.add_page_to_queue(page_num, priority=True, quality=quality)
                 except:
                     pass
@@ -4243,65 +4844,57 @@ Press 'L' to cycle through modes."""
             center_page = (start_page + new_end) // 2
             self.generate_thumbnails(around_page=center_page, radius=12, preserve_scroll=True)  # Reduced from 20 to 12
     
-    def go_to_page(self, page_num, immediate_loading=False):
-        """Navigate to a specific page - INSTANT UI RESPONSE with optional immediate loading"""
+    def go_to_page(self, page_num):
+        """Navigate to a specific page with the safest possible rendering path."""
         if not self.pdf_doc or not (0 <= page_num < self.total_pages):
             return
             
-        # INSTANT UI UPDATE: Always update page number and label immediately
+        # Update page number and label immediately
         self.current_page = page_num
         self.update_page_label()
         
-        if immediate_loading:
-            # IMMEDIATE LOADING MODE: Instant UI feedback, deferred rendering
+        # Always clear any cached texture binding
+        if hasattr(self, '_last_bound_texture'):
+            delattr(self, '_last_bound_texture')
+
+        # Reset GPU flags
+        self._skip_heavy_processing = False
+        self._ultra_fast_mode = False
+        self._active_panning = False
+
+        # Try to get an existing texture
+        texture = self.pdf_widget.texture_cache.get_texture(self.current_page)
+        dims = self.pdf_widget.texture_cache.get_dimensions(self.current_page)
+        if texture and texture.isCreated() and dims:
+            self.pdf_widget.set_page_texture(texture, dims[0], dims[1])
             
-            # Clear current page texture to show loading state immediately
-            self.pdf_widget.page_texture = None
-            self.pdf_widget.update()  # INSTANT visual feedback - shows loading state
-            
-            # DEFERRED RENDERING: Queue page loading after UI update
-            def queue_page_rendering():
-                if not self.renderer:
-                    return
-                try:
-                    # Ultra-fast quality for instant appearance
-                    immediate_quality = 1.5
-                    self.renderer.add_page_to_queue(page_num, priority=True, quality=immediate_quality)
-                    
-                    # Queue better quality version after initial load
-                    QTimer.singleShot(100, lambda: (
-                        self.renderer.add_page_to_queue(page_num, priority=False, quality=self.pdf_widget.get_zoom_adjusted_quality())
-                        if self.renderer else None
-                    ))
-                except Exception as e:
-                    pass
-            
-            # CRITICAL: 10ms delay allows UI to show loading state first
-            QTimer.singleShot(10, queue_page_rendering)
-            
+            # 🔍 QUALITY CHECK: If zoomed and texture quality is too low, request upgrade
+            if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
+                current_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(self.current_page)
+                target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                
+                if target_quality > current_quality + 0.5:  # Same threshold as quality check
+                    print(f"🔍 Navigation quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
+                    if hasattr(self, 'renderer') and self.renderer:
+                        self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
         else:
-            # NORMAL LOADING MODE: Check for existing texture first
-            existing_texture = self.pdf_widget.texture_cache.get_texture(self.current_page)
-            if existing_texture:
-                # Display existing texture immediately for instant response
-                cached_dims = self.pdf_widget.texture_cache.get_dimensions(self.current_page)
-                if cached_dims:
-                    page_width, page_height = cached_dims
-                    self.pdf_widget.set_page_texture(existing_texture, page_width, page_height)
-                    self.pdf_widget.update()
-                    
-                    # Queue better quality in background if needed
-                    QTimer.singleShot(100, lambda: self._check_and_queue_better_quality())
-                else:
-                    # Render normally if no dimensions cached
-                    self.render_current_page()
+            # Show a placeholder (gray) if no texture is available
+            self.pdf_widget.set_page_texture(None)
+
+        # Always update the widget to force a redraw
+        self.pdf_widget.update()
+
+        # If no texture, queue a render for this page
+        if (not texture or not texture.isCreated()) and hasattr(self, 'renderer') and self.renderer:
+            # 🔍 ZOOM-AWARE NAVIGATION: Request appropriate quality based on current zoom
+            if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
+                # If zoomed in, request high quality immediately to avoid zoom out/in cycle
+                target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                print(f"🔍 Zoomed navigation: page {page_num}, requesting quality {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
+                self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
             else:
-                # No existing texture - render with priority
-                self.render_current_page()
-        
-        # Background operations (non-blocking) - only for non-immediate loading
-        if not immediate_loading:
-            QTimer.singleShot(200, lambda: self._background_page_operations())
+                # Normal zoom, use standard quality
+                self.renderer.add_page_to_queue(page_num, priority=True, quality=2.5)
         
     def _background_page_operations(self):
         """Perform background operations after page navigation (non-blocking)"""
@@ -4309,22 +4902,66 @@ Press 'L' to cycle through modes."""
             # Clean up distant textures to save memory
             self.pdf_widget.cleanup_distant_textures()
             
-            # Preload adjacent pages for smoother navigation (ultra-fast quality)
+            # AGGRESSIVE PRELOADING for much larger GPU cache
             if self.renderer:
-                if self.current_page > 0:
-                    self.renderer.add_page_to_queue(self.current_page - 1, priority=False, quality=1.5)  # Ultra-fast preload
-                if self.current_page < self.total_pages - 1:
-                    self.renderer.add_page_to_queue(self.current_page + 1, priority=False, quality=1.5)  # Ultra-fast preload
+                # Preload many more adjacent pages with the increased VRAM
+                current = self.current_page
+                
+                # Preload 30 pages ahead and 30 pages behind (was only 1 each)
+                for offset in range(-30, 31):
+                    page_to_preload = current + offset
+                    if 0 <= page_to_preload < self.total_pages and page_to_preload != current:
+                        # Use progressive quality - closer pages get higher quality
+                        distance = abs(offset)
+                        if distance <= 5:
+                            quality = 3.0  # High quality for very close pages
+                        elif distance <= 15:
+                            quality = 2.0  # Medium quality for close pages
+                        else:
+                            quality = 1.5  # Fast quality for distant pages
+                        
+                        self.renderer.add_page_to_queue(page_to_preload, priority=False, quality=quality)
                     
-            # Check if we need to load more thumbnails around the new page
+            # Extended thumbnail range for larger cache
             if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
                 hasattr(self, '_current_thumb_range')):
                 start_page, end_page = self._current_thumb_range
-                # If navigating near the edge of loaded range, preload more
-                if self.current_page <= start_page + 3 or self.current_page >= end_page - 3:
-                    self.generate_thumbnails(around_page=self.current_page, radius=15, preserve_scroll=True)
+                # If navigating near the edge of loaded range, preload much more
+                if self.current_page <= start_page + 10 or self.current_page >= end_page - 10:
+                    # Preload 50 pages around current position (was 15)
+                    self.generate_thumbnails(around_page=self.current_page, radius=50, preserve_scroll=True)
+                    
         except Exception as e:
             print(f"Background operations error: {e}")
+    
+    def start_aggressive_preloading(self):
+        """Start aggressive preloading to fill GPU VRAM for maximum performance"""
+        if not self.pdf_doc or not self.renderer:
+            return
+        
+        # Check current performance - skip aggressive preloading if performance is poor
+        performance_level = getattr(self.pdf_widget, '_performance_monitor', {}).get('performance_level', 'high')
+        if performance_level == 'low':
+            print("🚀 Skipping aggressive preloading due to low performance")
+            return
+            
+        # Preload entire document in background with low priority
+        print(f"🚀 Starting aggressive preloading of {self.total_pages} pages...")
+        
+        for page_num in range(self.total_pages):
+            if page_num != self.current_page:  # Skip current page (already loaded)
+                # Use distance-based quality
+                distance = abs(page_num - self.current_page)
+                if distance <= 10:
+                    quality = 2.5  # Good quality for close pages
+                elif distance <= 50:
+                    quality = 2.0  # Medium quality 
+                else:
+                    quality = 1.5  # Fast quality for distant pages
+                
+                self.renderer.add_page_to_queue(page_num, priority=False, quality=quality)
+                
+        print(f"🚀 Queued {self.total_pages} pages for aggressive preloading")
     
     def _on_thumbnail_hover(self, item):
         """Preload page texture when hovering over thumbnail for instant response"""
@@ -4633,8 +5270,11 @@ Press 'L' to cycle through modes."""
                 immediate_quality = self.pdf_widget.get_immediate_quality()
                 self.renderer.add_page_to_queue(self.current_page, priority=True, quality=immediate_quality)
                 
-                # Queue high-quality render for final result
+                # Queue high-quality render for final result - ensure it matches grid quality
                 final_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                # Boost quality slightly for single page mode to match grid experience
+                if final_quality < 3.0:
+                    final_quality = max(final_quality, 3.0)  # Minimum high quality for single page
                 QTimer.singleShot(100, lambda: self.renderer.add_page_to_queue(self.current_page, priority=True, quality=final_quality))
             
             # STEP 7: Update widget after brief delay to ensure all state is reset
@@ -4645,11 +5285,21 @@ Press 'L' to cycle through modes."""
         if not self.grid_view_action.isChecked():
             return
         
-        # Block 4x4 grid completely
+        # Block 4x4 grid completely and handle old 3x3
         if size_text == "4x4":
-            self.status_bar.showMessage("4x4 grid disabled - switching to 3x3", 2000)
-            # Switch to 3x3 instead
-            size_text = "3x3"
+            self.status_bar.showMessage("4x4 grid disabled - switching to 3x2", 2000)
+            # Switch to 3x2 instead
+            size_text = "3x2"
+            self.grid_size_combo.setCurrentText(size_text)
+        elif size_text == "3x3":
+            self.status_bar.showMessage("3x3 grid changed to 3x2", 2000)
+            # Switch to 3x2 instead of old 3x3
+            size_text = "3x2"
+            self.grid_size_combo.setCurrentText(size_text)
+        elif size_text == "5x2":
+            self.status_bar.showMessage("5x2 grid removed - switching to 5x1", 2000)
+            # Switch to 5x1 instead of 5x2
+            size_text = "5x1"
             self.grid_size_combo.setCurrentText(size_text)
         
         # Handle empty or invalid size_text
