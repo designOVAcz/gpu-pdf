@@ -3062,7 +3062,7 @@ class GPUPDFWidget(QOpenGLWidget):
             # Keep Qt updates enabled for responsive panning visual feedback
                 
         elif event.button() == Qt.MouseButton.MiddleButton:
-            # Middle mouse click goes to next page
+            # Middle mouse click goes to next page with loading indicator
             viewer = self.window()
             if viewer and hasattr(viewer, 'next_page'):
                 viewer.next_page()
@@ -4910,6 +4910,90 @@ Press 'L' to cycle through modes."""
             self.loading_label.setText("Page ready")
         QTimer.singleShot(200, self.close_loading_widget)
     
+    def show_navigation_loading_progress(self, direction, page_num):
+        """Show minimal loading indicator for page navigation (next/prev)"""
+        # Create minimal loading widget
+        self.loading_widget = QWidget(self)
+        self.loading_widget.setFixedSize(250, 25)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Style the loading widget - very minimal light grey with grey text
+        self.loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(200, 200, 200, 100);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(180, 180, 180, 255);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(150, 150, 150, 255);
+                font-size: 11px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Layout for loading widget - label and progress bar
+        layout = QVBoxLayout(self.loading_widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(3)
+        
+        # Status label
+        direction_text = "Next" if direction == "next" else "Previous"
+        self.loading_label = QLabel(f"{direction_text} page {page_num + 1}...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+        
+        # Slim progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(1)  # 1px height
+        self.progress_bar.setTextVisible(False)  # No text
+        layout.addWidget(self.progress_bar)
+        
+        # Position loading widget at center of main window
+        self.center_loading_widget()
+        
+        # Show loading widget
+        self.loading_widget.show()
+        
+        # Re-center after showing to ensure proper positioning
+        QApplication.processEvents()
+        self.center_loading_widget()
+        
+        # Start navigation loading animation (faster than others)
+        self._start_navigation_progress_animation()
+    
+    def _start_navigation_progress_animation(self):
+        """Start a quick progress animation for page navigation"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(40)
+            QTimer.singleShot(50, lambda: self._continue_navigation_progress(70))
+    
+    def _continue_navigation_progress(self, value):
+        """Continue navigation progress animation"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(value)
+            if value < 90:
+                QTimer.singleShot(40, lambda: self._continue_navigation_progress(value + 10))
+            else:
+                # Close quickly
+                QTimer.singleShot(200, self._finish_navigation_loading)
+    
+    def _finish_navigation_loading(self):
+        """Finish navigation loading and hide progress"""
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(100)
+        QTimer.singleShot(100, self.close_loading_widget)
+    
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
         try:
             # Ensure UI is fully initialized before loading PDF
@@ -5941,12 +6025,18 @@ Press 'L' to cycle through modes."""
         if self.pdf_widget.grid_mode:
             # In grid mode, move by grid size
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
-            self.current_page = max(0, self.current_page - grid_size)
+            new_page = max(0, self.current_page - grid_size)
         else:
             # Single page mode
             if self.current_page > 0:
-                self.current_page -= 1
+                new_page = self.current_page - 1
+            else:
+                return  # Already at first page
         
+        # Show loading indicator
+        self.show_navigation_loading_progress("previous", new_page)
+        
+        self.current_page = new_page
         self.update_page_label()
         self.render_current_page()
         
@@ -5974,12 +6064,18 @@ Press 'L' to cycle through modes."""
             # In grid mode, move by grid size
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
             max_page = self.total_pages - grid_size
-            self.current_page = min(max_page, self.current_page + grid_size)
+            new_page = min(max_page, self.current_page + grid_size)
         else:
             # Single page mode
             if self.current_page < self.total_pages - 1:
-                self.current_page += 1
+                new_page = self.current_page + 1
+            else:
+                return  # Already at last page
         
+        # Show loading indicator
+        self.show_navigation_loading_progress("next", new_page)
+        
+        self.current_page = new_page
         self.update_page_label()
         self.render_current_page()
         
