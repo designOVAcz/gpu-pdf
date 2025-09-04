@@ -35,6 +35,7 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. Desig
     ```bash
     pip install PyQt6 PyOpenGL PyMuPDF
     ```
+3.  Build and tested on Windows OS
 
 ## Usage
 
@@ -72,5 +73,6 @@ Binary will be in `dist/` folder. Build on target OS for best compatibility.
 ## License
 
 MIT License. **Enjoy browsing your images!**
+
 
 
