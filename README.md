@@ -1,14 +1,22 @@
 # PDF Viewer
 
-A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. It is designed for efficient rendering and smooth navigation of PDF documents, especially those with high-resolution images.
+A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. Designed for efficient rendering and smooth navigation of PDF documents with high-resolution support.
 
 ## Features
 
-*   **GPU-Accelerated Rendering**: Utilizes OpenGL for fast and efficient page rendering.
-*   **Dual View Modes**: Switch between a single-page view for detailed reading and a grid view for quick document overview.
-*   **Smooth Navigation**: Zoom, pan, and scroll through documents with ease.
-*   **Asynchronous Loading**: Thumbnails and pages are loaded in the background to keep the UI responsive.
-*   **Modern Interface**: A clean and intuitive user interface built with PyQt6.
+*   **GPU-Accelerated Rendering**: OpenGL-powered fast page rendering with texture caching
+*   **Dual View Modes**: Single-page for detailed reading, grid view for document overview
+*   **Smooth Navigation**: Zoom, pan, scroll with responsive controls
+*   **Loading Indicators**: Minimal progress feedback for all operations
+*   **Auto-Refresh Fix**: Automatic click simulation to resolve fullscreen white screen issues
+*   **Asynchronous Processing**: Background thumbnail and page loading for responsive UI
+*   **File Association**: Double-click PDF files to open directly
+
+## Controls
+
+*   **Mouse**: Scroll pages, drag to pan, click thumbnails to navigate
+*   **Keyboard**: `G` for grid view, `F11` for fullscreen, `Ctrl+O` to open files
+*   **Grid Sizes**: `1-4` keys or Tab to cycle through 2x2, 3x1, 3x2, 5x1 layouts
 
 ## Requirements
 
@@ -30,35 +38,39 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. It is
 
 ## Usage
 
-1.  **Run the application**
-    Navigate to the project directory in your terminal and run:
+1.  **Launch the application**
     ```bash
     python main.py
     ```
 
-2.  **Open a File**
-    The application will start, and you can open a PDF file using the "Open" button or by dragging and dropping a file onto the window.
+2.  **Load a PDF**
+    *   Drag & drop a PDF file onto the window
+    *   Use `Ctrl+O` to open file dialog
+    *   Double-click PDF files if associated with the executable
 
-3.  **Navigate the Viewer**
-    *   Use the mouse wheel to scroll through pages in single-page view.
-    *   Click and drag to pan the document when zoomed in.
-    *   Use the buttons on the toolbar to switch between single-page and grid views, and to navigate pages.
+3.  **Navigate**
+    *   **Single View**: Mouse wheel to scroll pages, drag to pan when zoomed
+    *   **Grid View**: Press `G` to toggle, use `1-4` keys for different layouts
+    *   **Thumbnails**: Click any thumbnail to jump to that page
+    *   **Fullscreen**: Press `F11` (auto-fixes white screen issues)
+
+---
+
+## Build Executable
+
+Compile to standalone executable using PyInstaller:
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name="GPU PDF Viewer" --clean main.py
+```
+
+Binary will be in `dist/` folder. Build on target OS for best compatibility.
 
 ---
 
-## Compiling to a Standalone Binary
+## License
 
-You can compile this app to a standalone executable for Windows, Linux, or Mac using [PyInstaller](https://pyinstaller.org/).
+MIT License. **Enjoy browsing your images!**
 
-1. **Install PyInstaller:**
-   ```sh
-   pip install pyinstaller
-   ```
-2. **Build the Executable:**
-   ```sh
-   python -m PyInstaller --onefile --windowed --icon=pdf_viewer_icon.ico --name="GPU PDF Viewer" --clean --noconfirm main.py
-   ```
-   - The binary will be in the `dist/` folder.
-   - For cross-compiling, build on the target OS or use a cross-compilation toolchain.
 
----
