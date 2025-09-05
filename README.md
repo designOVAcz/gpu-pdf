@@ -72,7 +72,8 @@ Binary will be in `dist/` folder. Build on target OS for best compatibility.
 
 ## License
 
-MIT License. **Enjoy browsing your images!**
+MIT License.
+
 
 
 
