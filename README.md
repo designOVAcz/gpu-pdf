@@ -63,7 +63,7 @@ Compile to standalone executable using PyInstaller:
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --name="GPU PDF Viewer" --clean main.py
+python -m PyInstaller --onefile --windowed --icon=pdf_viewer_icon.ico --name="GPU PDF Viewer" --clean --noconfirm main.py
 ```
 
 Binary will be in `dist/` folder. Build on target OS for best compatibility.
@@ -73,6 +73,7 @@ Binary will be in `dist/` folder. Build on target OS for best compatibility.
 ## License
 
 MIT License. **Enjoy browsing your images!**
+
 
 
 
