@@ -1411,7 +1411,8 @@ class GPUPDFWidget(QOpenGLWidget):
                 viewer = self.window()
                 # Check if the main window has a document loaded
                 if hasattr(viewer, 'pdf_doc') and viewer.pdf_doc is not None:
-                    self.render_loading_state()
+                    # REMOVED: spinner loading state - no longer show spinner
+                    pass  # Just show empty state instead of spinner
                 return
             
             # Calculate aspect ratio correction
@@ -3547,17 +3548,18 @@ class PDFViewer(QMainWindow):
                 app.setDesktopFileName("GPU PDF Viewer")
         
         # Save enhanced icon file for PyInstaller
-        if not os.path.exists(icon_path) or os.path.getsize(icon_path) < 5000:  # Recreate if small/missing
-            try:
-                # Create the largest size for saving
-                save_pixmap = icon_full.pixmap(256, 256)
-                success = save_pixmap.save(icon_path, "ICO")
-                if success:
-                    print(f"✅ Created enhanced icon file: {icon_path} ({os.path.getsize(icon_path)} bytes)")
-                else:
-                    print(f"⚠️ Could not save icon file: {icon_path}")
-            except Exception as e:
-                print(f"⚠️ Error saving icon file: {e}")
+        # REMOVED: Disabled .ico file creation to avoid creating files in folder
+        # if not os.path.exists(icon_path) or os.path.getsize(icon_path) < 5000:  # Recreate if small/missing
+        #     try:
+        #         # Create the largest size for saving
+        #         save_pixmap = icon_full.pixmap(256, 256)
+        #         success = save_pixmap.save(icon_path, "ICO")
+        #         if success:
+        #             print(f"✅ Created enhanced icon file: {icon_path} ({os.path.getsize(icon_path)} bytes)")
+        #         else:
+        #             print(f"⚠️ Could not save icon file: {icon_path}")
+        #     except Exception as e:
+        #         print(f"⚠️ Error saving icon file: {e}")
                 
         # Force refresh window decorations (Windows-specific)
         self.setWindowTitle(self.windowTitle())  # Trigger window update
