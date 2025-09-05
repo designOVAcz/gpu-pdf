@@ -56,10 +56,9 @@ try:
                                 QListWidget, QListWidgetItem, QCheckBox, QComboBox,
                                 QGroupBox, QGridLayout, QScrollArea, QStatusBar,
                                 QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF, QEvent
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
-                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon,
-                            QMouseEvent, QResizeEvent)
+                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon)
     from PyQt6.QtCore import QPoint
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture
@@ -1092,7 +1091,7 @@ class GPUPDFWidget(QOpenGLWidget):
     def __init__(self):
         super().__init__()
         
-        # Set widget attributes for transparency
+        # Set widget attributes for transparency - GitHub reference fix
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         
         self.texture_cache = GPUTextureCache()
@@ -1114,7 +1113,7 @@ class GPUPDFWidget(QOpenGLWidget):
 
         # Zoom-adaptive quality settings - optimized for sharp text with smooth filtering
         self.base_quality = 4.5  # Higher base quality for very sharp text at 100% zoom
-        self.quality_zoom_threshold = 1.2  # Even lower threshold for earlier high quality
+        self.quality_zoom_threshold = 0.8  # FIXED: Lower threshold so quality upgrades happen even at 80% zoom
         self.max_quality = 7.0  # Higher maximum quality for ultra-sharp text
         self.last_zoom_quality = self.base_quality
 
@@ -1138,6 +1137,11 @@ class GPUPDFWidget(QOpenGLWidget):
         self.temp_zoom_factor = 1.0
         self.temp_pan_x = 0.0
         self.temp_pan_y = 0.0
+        
+        # FIXED: Add periodic quality verification timer
+        self._quality_verification_timer = QTimer()
+        self._quality_verification_timer.timeout.connect(self._verify_quality_periodically)
+        self._quality_verification_timer.start(2000)  # Check every 2 seconds
         
         # Performance optimization
         self._last_update_time = 0
@@ -1357,15 +1361,53 @@ class GPUPDFWidget(QOpenGLWidget):
             # Prevent crash by catching any OpenGL errors
     
     def render_single_page(self):
-        """Render a single page with loading state support"""
+        """Render a single page with loading state support - robust like grid mode with redundant texture sources"""
         try:
             # Clear grid mode flag for single page rendering to prioritize thumbnails
             self.grid_mode = False
             
             glLoadIdentity()
             
+            # Use robust texture lookup like grid mode - check multiple sources
+            current_page = getattr(self.window(), 'current_page', 0) if self.window() else 0
+            texture_to_render = None
+            page_width = 1.0
+            page_height = 1.0
+            
+            # Source 1: Main page texture (primary)
+            if hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated():
+                texture_to_render = self.page_texture
+                page_width = getattr(self, 'page_width', 1.0)
+                page_height = getattr(self, 'page_height', 1.0)
+            
+            # Source 2: Texture cache (fallback like grid mode)
+            elif hasattr(self, 'texture_cache') and self.texture_cache.get_texture(current_page) is not None:
+                cache_texture = self.texture_cache.get_texture(current_page)
+                if cache_texture and hasattr(cache_texture, 'isCreated') and cache_texture.isCreated():
+                    texture_to_render = cache_texture
+                    # Get dimensions from cache
+                    dims = self.texture_cache.get_dimensions(current_page)
+                    if dims:
+                        page_width, page_height = dims
+                    else:
+                        page_width = getattr(self, 'page_width', 1.0)
+                        page_height = getattr(self, 'page_height', 1.0)
+            
+            # Source 3: Grid textures (if available - for consistency)
+            elif hasattr(self, 'grid_textures') and current_page in self.grid_textures:
+                grid_texture = self.grid_textures.get(current_page)
+                if grid_texture and hasattr(grid_texture, 'isCreated') and grid_texture.isCreated():
+                    texture_to_render = grid_texture
+                    # Use cached dimensions or defaults
+                    dims = self.texture_cache.get_dimensions(current_page) if hasattr(self, 'texture_cache') else None
+                    if dims:
+                        page_width, page_height = dims
+                    else:
+                        page_width = getattr(self, 'page_width', 1.0)
+                        page_height = getattr(self, 'page_height', 1.0)
+            
             # If no texture available, show loading state only if a document is loaded
-            if not self.page_texture or not self.page_texture.isCreated():
+            if not texture_to_render:
                 viewer = self.window()
                 # Check if the main window has a document loaded
                 if hasattr(viewer, 'pdf_doc') and viewer.pdf_doc is not None:
@@ -1376,10 +1418,10 @@ class GPUPDFWidget(QOpenGLWidget):
             widget_width = self.width()
             widget_height = self.height()
             
-            if widget_width <= 0 or widget_height <= 0 or self.page_width <= 0 or self.page_height <= 0:
+            if widget_width <= 0 or widget_height <= 0 or page_width <= 0 or page_height <= 0:
                 return  # Skip if dimensions are invalid
             widget_aspect = widget_width / widget_height
-            page_aspect = self.page_width / self.page_height
+            page_aspect = page_width / page_height
             
             # Scale to fit the page in the viewport
             if widget_aspect > page_aspect:
@@ -1395,12 +1437,11 @@ class GPUPDFWidget(QOpenGLWidget):
             glTranslatef(self.pan_x, self.pan_y, 0.0)
             glScalef(self.zoom_factor * scale_x, self.zoom_factor * scale_y, 1.0)
             
-            # Bind texture and draw quad
-            # Bind texture if not already bound
-            if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not self.page_texture:
+            # Bind the found texture and draw quad
+            if not hasattr(self, '_last_bound_texture') or self._last_bound_texture is not texture_to_render:
                 try:
-                    self.page_texture.bind()
-                    self._last_bound_texture = self.page_texture
+                    texture_to_render.bind()
+                    self._last_bound_texture = texture_to_render
                 except Exception:
                     pass
             
@@ -1474,37 +1515,75 @@ class GPUPDFWidget(QOpenGLWidget):
         self.update()
     
     def render_single_page_fast(self):
-        """Optimized single page rendering for smooth panning and zooming."""
+        """Optimized single page rendering for smooth panning - robust like grid mode with redundant texture sources"""
         glLoadIdentity()
         
         # Apply transformations
         glTranslatef(self.pan_x, self.pan_y, 0.0)
         glScalef(self.zoom_factor, self.zoom_factor, 1.0)
         
-        # Render the page texture if it exists
-        if hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated():
-            # Use the reliable aspect ratio calculation
-            if hasattr(self, 'page_width') and hasattr(self, 'page_height') and self.page_width > 0 and self.page_height > 0:
+        # Use robust texture lookup like grid mode - check multiple sources
+        current_page = getattr(self.window(), 'current_page', 0) if self.window() else 0
+        texture_to_render = None
+        page_width = 1.0
+        page_height = 1.0
+        
+        # Debug texture availability
+        main_available = hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated()
+        cache_available = hasattr(self, 'texture_cache') and self.texture_cache.get_texture(current_page) is not None
+        grid_available = hasattr(self, 'grid_textures') and current_page in self.grid_textures
+        
+        # Source 1: Main page texture (primary)
+        if main_available:
+            texture_to_render = self.page_texture
+            page_width = getattr(self, 'page_width', 1.0)
+            page_height = getattr(self, 'page_height', 1.0)
+        
+        # Source 2: Texture cache (fallback like grid mode)
+        elif cache_available:
+            cache_texture = self.texture_cache.get_texture(current_page)
+            if cache_texture and hasattr(cache_texture, 'isCreated') and cache_texture.isCreated():
+                texture_to_render = cache_texture
+                # Get dimensions from cache
+                dims = self.texture_cache.get_dimensions(current_page)
+                if dims:
+                    page_width, page_height = dims
+        
+        # Source 3: Grid textures (if available - for consistency)
+        elif grid_available:
+            grid_texture = self.grid_textures.get(current_page)
+            if grid_texture and hasattr(grid_texture, 'isCreated') and grid_texture.isCreated():
+                texture_to_render = grid_texture
+                # Use default or cached dimensions
+                dims = self.texture_cache.get_dimensions(current_page) if hasattr(self, 'texture_cache') else None
+                if dims:
+                    page_width, page_height = dims
+        
+        if texture_to_render:
+            # Calculate aspect ratio with reliable values
+            if page_width > 0 and page_height > 0:
                 widget_aspect = self.width() / self.height()
-                page_aspect = self.page_width / self.page_height
+                page_aspect = page_width / page_height
                 if widget_aspect > page_aspect:
                     glScalef(page_aspect / widget_aspect, 1.0, 1.0)
                 else:
                     glScalef(1.0, widget_aspect / page_aspect, 1.0)
 
-            # Bind and draw
+            # Render the found texture - robust like grid mode
             glColor3f(1.0, 1.0, 1.0)
-            self.page_texture.bind()
+            texture_to_render.bind()
             glBegin(GL_QUADS)
             glTexCoord2f(0.0, 1.0); glVertex2f(-1.0, -1.0)
             glTexCoord2f(1.0, 1.0); glVertex2f(1.0, -1.0)
             glTexCoord2f(1.0, 0.0); glVertex2f(1.0, 1.0)
             glTexCoord2f(0.0, 0.0); glVertex2f(-1.0, 1.0)
             glEnd()
-            self.page_texture.release()
+            texture_to_render.release()
         else:
-            # If no texture, render the loading state
-            self.render_loading_state()
+            # Debug when no texture found
+            print(f"❌ NO TEXTURE for page {current_page}: main={main_available}, cache={cache_available}, grid={grid_available}")
+            # Minimal placeholder instead of loading state during resize/pan
+            self._draw_minimal_single_page_placeholder()
     
     def render_grid_view_existing_only(self):
         """GPU-ONLY: Render ALL existing textures during panning - no hiding, no loading"""
@@ -2084,15 +2163,28 @@ class GPUPDFWidget(QOpenGLWidget):
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
         
-        # Use simple orthographic projection for grid view
+        # Use simple orthographic projection for both grid and single page view
         glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0)
             
         glMatrixMode(GL_MODELVIEW)
-        # Recompute grid layout on resize
-        try:
-            self.compute_grid_layout()
-        except Exception:
-            pass
+        
+        # CRITICAL: Clear the cached texture binding to force refresh after resize
+        # This is what fixes the white box - same as what happens on mouse click
+        if hasattr(self, '_last_bound_texture'):
+            self._last_bound_texture = None
+        
+        if self.grid_mode:
+            # Recompute grid layout on resize
+            try:
+                self.compute_grid_layout()
+            except Exception:
+                pass
+        else:
+            # Single page mode: Use same approach as grid mode
+            try:
+                self.compute_single_page_layout()
+            except Exception:
+                pass
 
     def compute_grid_layout(self):
         """🚀 NON-BLOCKING: Computes grid layout using cached dimensions only - no UI freeze"""
@@ -2202,6 +2294,75 @@ class GPUPDFWidget(QOpenGLWidget):
         self.compute_grid_layout()
         self.update()  # Trigger redraw with refined layout
 
+    def compute_single_page_layout(self):
+        """🚀 NON-BLOCKING: Computes single page layout exactly like grid mode"""
+        viewer = self.window()
+        if not viewer or not hasattr(viewer, 'current_page'):
+            return
+            
+        current_page = viewer.current_page
+        
+        # Force immediate update with existing content - no white box
+        self.update()
+        
+        # Check if we have texture for current page
+        has_texture = (
+            (hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated()) or
+            (hasattr(self, 'texture_cache') and self.texture_cache.get_texture(current_page)) or
+            (hasattr(self, 'grid_textures') and current_page in self.grid_textures)
+        )
+        
+        # If no texture available, request high-quality render like grid mode does
+        if not has_texture and hasattr(viewer, 'renderer') and viewer.renderer:
+            target_quality = self.get_zoom_adjusted_quality()
+            viewer.renderer.add_page_to_queue(current_page, priority=True, quality=target_quality)
+
+    def _handle_single_page_resize(self):
+        """Handle single page mode resize with same robustness as grid mode"""
+        try:
+            # Force immediate texture refresh for current page to prevent white box
+            viewer = self.window()
+            if not viewer or not hasattr(viewer, 'current_page'):
+                return
+                
+            current_page = viewer.current_page
+            
+            # CRITICAL: Preserve existing textures in grid_textures cache during resize
+            # This is what makes grid mode work - it keeps textures in grid_textures
+            if hasattr(self, 'page_texture') and self.page_texture and current_page not in self.grid_textures:
+                # Copy current page texture to grid_textures for persistence
+                self.grid_textures[current_page] = self.page_texture
+            
+            # Clear any cached rendering state that might be stale after resize
+            self._clear_single_page_cache()
+            
+            # Force immediate update to show existing textures while new ones load
+            self.update()
+            
+            # Request new high-quality render of current page if needed
+            if hasattr(viewer, 'renderer') and viewer.renderer:
+                # Request immediate high-quality render of current page
+                target_quality = self.get_zoom_adjusted_quality()
+                viewer.renderer.add_page_to_queue(current_page, priority=True, quality=target_quality)
+            
+        except Exception as e:
+            print(f"Error handling single page resize: {e}")
+
+    def _clear_single_page_cache(self):
+        """Clear cached rendering state for single page mode"""
+        try:
+            # Clear any cached transformations or rendering state
+            if hasattr(self, '_single_page_cache'):
+                self._single_page_cache = None
+            
+            # Force recalculation of page positioning and scaling
+            if hasattr(self, 'page_texture') and self.page_texture:
+                # Keep the texture but clear positioning cache
+                pass
+                
+        except Exception as e:
+            print(f"Error clearing single page cache: {e}")
+
     def cleanup_distant_textures(self, keep_distance=20):
         """Remove textures that are far from current view to save memory"""
         if not hasattr(self, 'window') or not self.window():
@@ -2239,6 +2400,33 @@ class GPUPDFWidget(QOpenGLWidget):
             if page_num in self.grid_textures:
                 del self.grid_textures[page_num]
     
+    def _ensure_current_page_visible(self):
+        """Ensure current page is visible after resize - prevent white box"""
+        try:
+            if not self.window():
+                return
+                
+            current_page = getattr(self.window(), 'current_page', 0)
+            
+            # If no texture is available, force immediate render of current page
+            has_main_texture = hasattr(self, 'page_texture') and self.page_texture and self.page_texture.isCreated()
+            has_cache_texture = hasattr(self, 'texture_cache') and self.texture_cache.get_texture(current_page) is not None
+            has_grid_texture = hasattr(self, 'grid_textures') and current_page in self.grid_textures
+            
+            print(f"🔧 _ensure_current_page_visible: page {current_page}, main={has_main_texture}, cache={has_cache_texture}, grid={has_grid_texture}")
+            
+            if not (has_main_texture or has_cache_texture or has_grid_texture):
+                # No texture available - force immediate render
+                print(f"🔧 No texture found - forcing render of page {current_page}")
+                if hasattr(self.window(), 'render_current_page'):
+                    self.window().render_current_page()
+            
+            # Always force update to show available content
+            self.update()
+            
+        except Exception as e:
+            print(f"Error ensuring page visibility: {e}")
+
     def _update_performance_stats(self, frame_start_time):
         """🚀 LAYER 3: Update performance monitoring statistics"""
         import time
@@ -2376,10 +2564,12 @@ class GPUPDFWidget(QOpenGLWidget):
                                 if not had_dimensions:
                                     layout_needs_update = True
                         else:
-                            # Single page mode: minimal update
+                            # Single page mode: Add to both page_texture AND grid_textures for persistence
                             viewer_current_page = getattr(self.window(), 'current_page', self.current_page)
                             if page_num == viewer_current_page:
                                 self.set_page_texture(texture, page_w, page_h)
+                                # CRITICAL: Also add to grid_textures for resize persistence
+                                self.grid_textures[page_num] = texture
                                 
                 except Exception as e:
                     # Skip problematic textures to prevent blocking
@@ -2545,10 +2735,29 @@ class GPUPDFWidget(QOpenGLWidget):
         else:
             sensitivity = 1.0  # Still less sensitive than before for low zoom
         
-        if abs(new_quality - self.last_zoom_quality) > sensitivity:
+        # FIXED: Always check current quality adequacy, not just zoom changes
+        zoom_changed = abs(new_quality - self.last_zoom_quality) > sensitivity
+        
+        # NEW: Also trigger quality check if current quality is insufficient
+        viewer = self.window()
+        should_upgrade_quality = False
+        
+        if viewer and hasattr(viewer, 'current_page'):
+            current_page = getattr(viewer, 'current_page', 0)
+            existing_texture = self.texture_cache.get_texture(current_page)
+            current_quality = self.texture_cache.get_best_quality_for_page(current_page) if existing_texture else 0.0
+            
+            # Check if current quality is adequate for current zoom - this fixes the main issue
+            quality_gap = new_quality - current_quality
+            should_upgrade_quality = quality_gap > 0.5  # Need significant quality upgrade
+        
+        if zoom_changed or should_upgrade_quality:
             self.last_zoom_quality = new_quality
+            
+            if should_upgrade_quality:
+                print(f"🔍 Auto quality check: current={current_quality:.1f}, target={new_quality:.1f}, zoom={effective_zoom:.1f}x")
+            
             # Re-render current content with progressive quality
-            viewer = self.window()
             if viewer and hasattr(viewer, 'render_current_page'):
                 if self.grid_mode:
                     # 🚀 GRID ZOOM FIX: Force upgrade of visible grid textures
@@ -2557,11 +2766,6 @@ class GPUPDFWidget(QOpenGLWidget):
                 else:
                     # 🚀 SINGLE PAGE ZOOM FIX: Make single page mode as aggressive as grid mode for quality
                     current_page = getattr(viewer, 'current_page', 0)
-                    
-                    # Calculate effective zoom including temporary zoom
-                    effective_zoom = self.zoom_factor
-                    if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
-                        effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
                     
                     existing_texture = self.texture_cache.get_texture(current_page)
                     current_quality = self.texture_cache.get_best_quality_for_page(current_page) if existing_texture else 0.0
@@ -2582,6 +2786,44 @@ class GPUPDFWidget(QOpenGLWidget):
                 
                 # Trigger progressive re-render (but mainly for background high-quality loading)
                 viewer.render_current_page_progressive()
+
+    def _verify_quality_periodically(self):
+        """Periodic quality verification to catch cases where quality is insufficient"""
+        try:
+            # Skip during active interactions to avoid lag
+            if (getattr(self, '_active_panning', False) or 
+                getattr(self, '_fast_zoom_mode', False) or
+                getattr(self, '_skip_heavy_processing', False)):
+                return
+            
+            viewer = self.window()
+            if not (viewer and hasattr(viewer, 'current_page')):
+                return
+            
+            current_page = getattr(viewer, 'current_page', 0)
+            target_quality = self.get_zoom_adjusted_quality()
+            
+            # Check current quality adequacy
+            existing_texture = self.texture_cache.get_texture(current_page)
+            current_quality = self.texture_cache.get_best_quality_for_page(current_page) if existing_texture else 0.0
+            
+            # Calculate effective zoom
+            effective_zoom = self.zoom_factor
+            if hasattr(self, 'is_temp_zoomed') and self.is_temp_zoomed:
+                effective_zoom *= getattr(self, 'temp_zoom_factor', 1.0)
+            
+            # If quality is significantly below target, request upgrade
+            quality_gap = target_quality - current_quality
+            if quality_gap > 1.0:  # More aggressive than manual check (0.5)
+                if hasattr(viewer, 'renderer') and viewer.renderer:
+                    try:
+                        viewer.renderer.add_page_to_queue(current_page, priority=False, quality=target_quality)
+                        print(f"🔄 Periodic quality check: upgrading page {current_page} from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                    except Exception as e:
+                        print(f"Error in periodic quality upgrade: {e}")
+                        
+        except Exception as e:
+            print(f"Error in periodic quality verification: {e}")
     
     def _schedule_delayed_quality_check(self):
         """Schedule a delayed quality check to avoid lag during rapid zoom changes"""
@@ -2764,11 +3006,6 @@ class GPUPDFWidget(QOpenGLWidget):
         
         self._zoom_interaction_timer.start(300)  # 300ms interaction window
         self.update()
-        
-        # WORKAROUND: If in fullscreen and high zoom, simulate click to fix white screen
-        viewer = self.window()
-        if viewer and viewer.isFullScreen() and self.zoom_factor > 2.0:
-            QTimer.singleShot(200, viewer.simulate_click_workaround)
     
     def zoom_out(self, cursor_pos=None):
         # Enable interaction mode during zoom
@@ -2806,11 +3043,6 @@ class GPUPDFWidget(QOpenGLWidget):
         
         self._zoom_interaction_timer.start(300)  # 300ms interaction window
         self.update()
-        
-        # WORKAROUND: If in fullscreen, simulate click to fix white screen
-        viewer = self.window()
-        if viewer and viewer.isFullScreen():
-            QTimer.singleShot(200, viewer.simulate_click_workaround)
     
     def reset_zoom(self):
         self.zoom_factor = 1.0
@@ -3053,16 +3285,16 @@ class GPUPDFWidget(QOpenGLWidget):
                 if hasattr(self.renderer, 'pause'):
                     self.renderer.pause()
                     
-            # Don't disable Qt updates - we want real-time panning feedback
-            if self.grid_mode:
-                self._ultra_fast_mode = True
-                # Stop any timer-based processing during panning
-                if hasattr(self, '_performance_timer'):
-                    self._performance_timer.stop()
-            # Keep Qt updates enabled for responsive panning visual feedback
+            # Apply fast mode for both single page and grid mode
+            self._ultra_fast_mode = True
+            self._skip_heavy_processing = True
+            
+            # Stop any timer-based processing during panning
+            if hasattr(self, '_performance_timer'):
+                self._performance_timer.stop()
                 
         elif event.button() == Qt.MouseButton.MiddleButton:
-            # Middle mouse click goes to next page with loading indicator
+            # Middle mouse click goes to next page
             viewer = self.window()
             if viewer and hasattr(viewer, 'next_page'):
                 viewer.next_page()
@@ -3334,6 +3566,11 @@ class PDFViewer(QMainWindow):
         """Handle keyboard shortcuts"""
         key = event.key()
         
+        # Fullscreen exit with ESC key
+        if key == Qt.Key.Key_Escape and self.isFullScreen():
+            self.exit_fullscreen()
+            return
+        
         # Navigation shortcuts
         if key == Qt.Key.Key_Space or key == Qt.Key.Key_Right or key == Qt.Key.Key_Down or key == Qt.Key.Key_N:
             # Next page
@@ -3361,14 +3598,6 @@ class PDFViewer(QMainWindow):
         elif key == Qt.Key.Key_G:
             # Toggle grid view
             self.toggle_grid_view()
-        
-        # Fullscreen shortcuts
-        elif key == Qt.Key.Key_F11:
-            # Toggle fullscreen
-            self.toggle_fullscreen()
-        elif key == Qt.Key.Key_Escape and self.isFullScreen():
-            # Exit fullscreen with Escape key
-            self.toggle_fullscreen()
         
         # 🚀 LAYER 3: Performance stats shortcut
         elif key == Qt.Key.Key_F12:
@@ -3539,8 +3768,8 @@ Press F12 to refresh stats"""
         self.pdf_widget.setStyleSheet("QOpenGLWidget { border: none; }")
         
         # Create container widget with the background color
-        pdf_container = QWidget()
-        pdf_container.setStyleSheet("""
+        self.pdf_container = QWidget()
+        self.pdf_container.setStyleSheet("""
             QWidget { 
                 background-color: rgb(38, 38, 38); 
                 border: none;
@@ -3550,7 +3779,7 @@ Press F12 to refresh stats"""
         """)
         
         # Layout to hold the PDF widget inside the container
-        pdf_layout = QVBoxLayout(pdf_container)
+        pdf_layout = QVBoxLayout(self.pdf_container)
         pdf_layout.setContentsMargins(0, 0, 0, 0)
         pdf_layout.setSpacing(0)
         pdf_layout.addWidget(self.pdf_widget)
@@ -3576,7 +3805,7 @@ Press F12 to refresh stats"""
         """)
         splitter.setHandleWidth(2)
         splitter.addWidget(left_panel)
-        splitter.addWidget(pdf_container)
+        splitter.addWidget(self.pdf_container)
         
         # Add splitter to main layout
         main_layout.addWidget(splitter)
@@ -4087,7 +4316,7 @@ Press 'L' to cycle through modes."""
             print(f"Error restoring combo box state: {e}")
 
     def toggle_fullscreen(self, checked=None):
-        """Enhanced fullscreen mode with window movement capability"""
+        """Enhanced fullscreen mode with comprehensive fixes from GitHub reference"""
         # Save combo box state before fullscreen transition
         current_grid_size = self.grid_size_combo.currentText()
         grid_enabled = self.grid_size_combo.isEnabled()
@@ -4107,16 +4336,16 @@ Press 'L' to cycle through modes."""
         
         # Restore combo box state after fullscreen transition
         QTimer.singleShot(100, lambda: self.restore_combo_box_state(current_grid_size, grid_enabled))
-    
+
     def enter_fullscreen(self):
-        """Enter fullscreen mode with mouse click simulation workaround"""
+        """Enter fullscreen mode with mouse click simulation workaround from GitHub reference"""
         # Store the current window state
         if not hasattr(self, '_normal_geometry'):
             self._normal_geometry = self.saveGeometry()
         
         # Store current PDF position to prevent jumping
         if hasattr(self, 'pdf_widget') and self.pdf_widget:
-            self._stored_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
+            self._stored_zoom = getattr(self.pdf_widget, 'zoom_factor', 1.0)
             self._stored_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
             self._stored_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
         
@@ -4124,18 +4353,59 @@ Press 'L' to cycle through modes."""
         self.showFullScreen()
         
         # Create fullscreen control overlay (delayed to avoid interference)
-        QTimer.singleShot(50, self.create_fullscreen_overlay)
+        QTimer.singleShot(100, self.create_fullscreen_overlay)
         
-        # WORKAROUND: Single well-timed mouse click simulation
-        QTimer.singleShot(300, self.simulate_click_workaround)
+        # Apply aggressive fullscreen refresh to fix white screen
+        QTimer.singleShot(200, self.aggressive_fullscreen_refresh)
         
-        # Restore PDF position after fullscreen transition
-        QTimer.singleShot(400, self._restore_fullscreen_position)
+        # Restore position after fullscreen transition
+        QTimer.singleShot(300, self._restore_fullscreen_position)
         
-        # Show helpful message
-        if hasattr(self, 'status_bar'):
-            self.status_bar.showMessage("Fullscreen Mode: Press F11 or Esc to exit, drag top area to move", 4000)
-    
+        # Show help message
+        self.status_bar.showMessage("Fullscreen mode: Press F11 to exit, drag top area to move", 4000)
+
+    def exit_fullscreen(self):
+        """Exit fullscreen mode with fixes from GitHub reference"""
+        # Store current position before exiting fullscreen
+        if hasattr(self, 'pdf_widget') and self.pdf_widget:
+            current_zoom = getattr(self.pdf_widget, 'zoom_factor', 1.0)
+            current_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
+            current_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
+        
+        # Hide fullscreen overlay
+        if hasattr(self, '_fullscreen_overlay'):
+            self._fullscreen_overlay.hide()
+            self._fullscreen_overlay.deleteLater()
+            delattr(self, '_fullscreen_overlay')
+        
+        # FIXED: Properly restore window state and controls
+        # Exit fullscreen
+        self.showNormal()
+        
+        # Force window flags restoration to ensure title bar and controls are visible
+        self.setWindowFlags(Qt.WindowType.Window | 
+                           Qt.WindowType.WindowTitleHint | 
+                           Qt.WindowType.WindowCloseButtonHint |
+                           Qt.WindowType.WindowMinimizeButtonHint | 
+                           Qt.WindowType.WindowMaximizeButtonHint)
+        
+        # Force window title restoration
+        self.setWindowTitle("GPU-Accelerated PDF Viewer")
+        
+        # Show the window to apply the new flags
+        self.show()
+        
+        # Restore window geometry if available
+        if hasattr(self, '_normal_geometry'):
+            QTimer.singleShot(50, lambda: self.restoreGeometry(self._normal_geometry))
+        
+        # Apply aggressive normal mode refresh
+        QTimer.singleShot(100, self.aggressive_normal_refresh)
+        
+        # Restore PDF position after a delay
+        if hasattr(self, 'pdf_widget') and self.pdf_widget:
+            QTimer.singleShot(200, lambda: self._restore_pdf_position(current_zoom, current_pan_x, current_pan_y))
+
     def _restore_fullscreen_position(self):
         """Restore PDF position after fullscreen transition"""
         try:
@@ -4143,8 +4413,8 @@ Press 'L' to cycle through modes."""
                 print(f"🔧 RESTORING FULLSCREEN POSITION: zoom={self._stored_zoom:.2f}")
                 
                 # Restore zoom and pan position
-                if hasattr(self.pdf_widget, 'zoom_level'):
-                    self.pdf_widget.zoom_level = self._stored_zoom
+                if hasattr(self.pdf_widget, 'zoom_factor'):
+                    self.pdf_widget.zoom_factor = self._stored_zoom
                 if hasattr(self.pdf_widget, 'pan_x'):
                     self.pdf_widget.pan_x = self._stored_pan_x
                 if hasattr(self.pdf_widget, 'pan_y'):
@@ -4156,7 +4426,7 @@ Press 'L' to cycle through modes."""
                 
         except Exception as e:
             print(f"⚠️ Error restoring fullscreen position: {e}")
-    
+
     def simulate_resize_click_workaround(self):
         """WORKAROUND: Force OpenGL repaint after resize through mouse event simulation"""
         if not hasattr(self, 'pdf_widget'):
@@ -4192,27 +4462,19 @@ Press 'L' to cycle through modes."""
                 Qt.KeyboardModifier.NoModifier
             )
             
-            # Send the actual mouse events
-            QApplication.postEvent(self.pdf_widget, press_event)
+            # Send events to the PDF widget
+            QApplication.sendEvent(self.pdf_widget, press_event)
             QApplication.processEvents()
-            
-            # Small delay between press and release
-            QTimer.singleShot(10, lambda: [
-                QApplication.postEvent(self.pdf_widget, release_event),
-                QApplication.processEvents()
-            ])
+            QApplication.sendEvent(self.pdf_widget, release_event)
+            QApplication.processEvents()
             
             print("✓ Resize mouse click simulation executed")
             
         except Exception as e:
-            print(f"✗ Error in resize mouse click simulation: {e}")
-            # Fallback to simple update
-            if hasattr(self, 'pdf_widget'):
-                self.pdf_widget.update()
-                QApplication.processEvents()
-    
+            print(f"⚠️ Error in resize click workaround: {e}")
+
     def simulate_click_workaround(self):
-        """WORKAROUND: Force OpenGL repaint through actual mouse event simulation"""
+        """WORKAROUND: Simulate mouse click to fix fullscreen white screen from GitHub reference"""
         if not hasattr(self, 'pdf_widget'):
             return
             
@@ -4246,59 +4508,19 @@ Press 'L' to cycle through modes."""
                 Qt.KeyboardModifier.NoModifier
             )
             
-            # Send the actual mouse events
-            QApplication.postEvent(self.pdf_widget, press_event)
+            # Send events to the PDF widget with proper timing
+            QApplication.sendEvent(self.pdf_widget, press_event)
+            QApplication.processEvents()
+            QApplication.sendEvent(self.pdf_widget, release_event)
             QApplication.processEvents()
             
-            # Small delay between press and release
-            QTimer.singleShot(10, lambda: [
-                QApplication.postEvent(self.pdf_widget, release_event),
-                QApplication.processEvents()
-            ])
-            
-            print("✓ Mouse click simulation executed")
+            print("✓ Fullscreen mouse click simulation executed")
             
         except Exception as e:
-            print(f"✗ Error in mouse click simulation: {e}")
-            # Fallback to simple update
-            if hasattr(self, 'pdf_widget'):
-                self.pdf_widget.update()
-                self.pdf_widget.repaint()
-                QApplication.processEvents()
-    
-    def _nuclear_content_refresh(self):
-        """Nuclear option: Force complete PDF content refresh"""
-        try:
-            if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                print("💥 NUCLEAR CONTENT REFRESH - Clearing all caches...")
-                
-                # Clear GPU texture cache if it exists
-                if hasattr(self.pdf_widget, 'gpu_cache'):
-                    cache = self.pdf_widget.gpu_cache
-                    if hasattr(cache, 'clear_all'):
-                        cache.clear_all()
-                    elif hasattr(cache, 'textures'):
-                        cache.textures.clear()
-                        cache.page_textures.clear()
-                        print("💥 GPU cache cleared")
-                
-                # Force re-render current page immediately
-                if hasattr(self, 'render_current_page'):
-                    self.render_current_page()
-                
-                # Force OpenGL context refresh
-                self.pdf_widget.makeCurrent()
-                for i in range(3):
-                    self.pdf_widget.update()
-                    self.pdf_widget.repaint()
-                    QApplication.processEvents()
-                
-                print("💥 NUCLEAR REFRESH COMPLETED")
-        except Exception as e:
-            print(f"⚠️ Nuclear refresh error: {e}")
-    
-    def _refresh_fullscreen_content(self):
-        """Force refresh of PDF content when entering fullscreen - AGGRESSIVE APPROACH"""
+            print(f"⚠️ Error in click workaround: {e}")
+
+    def aggressive_fullscreen_refresh(self):
+        """AGGRESSIVE FULLSCREEN REFRESH - COMPREHENSIVE APPROACH from GitHub reference"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
                 print("🔥 AGGRESSIVE fullscreen refresh starting...")
@@ -4330,26 +4552,14 @@ Press 'L' to cycle through modes."""
                     QTimer.singleShot(5, lambda: self.pdf_widget.update())
                 
                 # STEP 8: Final update with delay
-                QTimer.singleShot(10, lambda: self._force_final_update())
+                QTimer.singleShot(50, lambda: self.pdf_widget.update())
                 
-                print("� AGGRESSIVE fullscreen refresh completed")
+                print("✅ AGGRESSIVE fullscreen refresh complete")
         except Exception as e:
-            print(f"⚠️ Aggressive fullscreen refresh error: {e}")
-    
-    def _force_final_update(self):
-        """Final forced update to ensure content is visible"""
-        try:
-            if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                self.pdf_widget.makeCurrent()
-                self.pdf_widget.update()
-                self.pdf_widget.repaint()
-                QApplication.processEvents()
-                print("🎯 Final update completed")
-        except Exception as e:
-            print(f"⚠️ Final update error: {e}")
-    
-    def _refresh_normal_content(self):
-        """Force refresh of PDF content when exiting fullscreen - AGGRESSIVE APPROACH"""
+            print(f"⚠️ Error in aggressive fullscreen refresh: {e}")
+
+    def aggressive_normal_refresh(self):
+        """AGGRESSIVE NORMAL MODE REFRESH - COMPREHENSIVE APPROACH from GitHub reference"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
                 print("🔥 AGGRESSIVE normal mode refresh starting...")
@@ -4376,43 +4586,15 @@ Press 'L' to cycle through modes."""
                 self.pdf_widget.update()
                 QApplication.processEvents()
                 
-                # STEP 7: Final delayed update
-                QTimer.singleShot(10, lambda: self._force_final_update())
+                # STEP 7: Final update with delay
+                QTimer.singleShot(50, lambda: self.pdf_widget.update())
                 
-                print("� AGGRESSIVE normal mode refresh completed")
+                print("✅ AGGRESSIVE normal mode refresh complete")
         except Exception as e:
-            print(f"⚠️ Aggressive normal mode refresh error: {e}")
-    
-    def exit_fullscreen(self):
-        """Exit fullscreen mode with mouse click simulation workaround"""
-        # Store current fullscreen position
-        if hasattr(self, 'pdf_widget') and self.pdf_widget:
-            current_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
-            current_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
-            current_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
-        
-        # Remove fullscreen overlay
-        if hasattr(self, '_fullscreen_overlay'):
-            self._fullscreen_overlay.hide()
-            self._fullscreen_overlay.deleteLater()
-            delattr(self, '_fullscreen_overlay')
-        
-        # Restore normal window
-        self.showNormal()
-        
-        # Restore previous geometry if available
-        if hasattr(self, '_normal_geometry'):
-            self.restoreGeometry(self._normal_geometry)
-        
-        # WORKAROUND: Single well-timed mouse click simulation
-        QTimer.singleShot(300, self.simulate_click_workaround)
-        
-        # Restore PDF position after normal window transition
-        if 'current_zoom' in locals():
-            QTimer.singleShot(400, lambda: self._restore_pdf_position(current_zoom, current_pan_x, current_pan_y))
-    
+            print(f"⚠️ Error in aggressive normal refresh: {e}")
+
     def create_fullscreen_overlay(self):
-        """Create a small overlay with window controls in fullscreen mode"""
+        """Create fullscreen control overlay from GitHub reference"""
         if hasattr(self, '_fullscreen_overlay'):
             return
         
@@ -4436,56 +4618,49 @@ Press 'L' to cycle through modes."""
             }
         """)
         
-        # Create layout for overlay
-        overlay_layout = QHBoxLayout(self._fullscreen_overlay)
-        overlay_layout.setContentsMargins(5, 5, 5, 5)
-        overlay_layout.setSpacing(5)
+        # Create layout and controls
+        layout = QHBoxLayout(self._fullscreen_overlay)
+        layout.setContentsMargins(5, 5, 5, 5)
         
-        # Add exit fullscreen button
-        exit_btn = QPushButton("Exit Fullscreen (F11)")
+        # Exit fullscreen button
+        exit_btn = QPushButton("Exit Fullscreen")
         exit_btn.clicked.connect(self.exit_fullscreen)
-        overlay_layout.addWidget(exit_btn)
+        layout.addWidget(exit_btn)
         
-        # Add minimize button for window management
-        minimize_btn = QPushButton("Minimize")
-        minimize_btn.clicked.connect(self.showMinimized)
-        overlay_layout.addWidget(minimize_btn)
+        # Position overlay in top-right corner
+        self._fullscreen_overlay.setFixedSize(150, 40)
+        self._fullscreen_overlay.move(self.width() - 160, 10)
         
-        # Position overlay at top-right corner
-        self._fullscreen_overlay.resize(300, 40)
-        self._fullscreen_overlay.move(self.width() - 310, 10)
-        self._fullscreen_overlay.show()
+        # Initially hide, show on mouse movement
+        self._fullscreen_overlay.hide()
+        
+        # Auto-hide timer
+        self._overlay_hide_timer = QTimer()
+        self._overlay_hide_timer.setSingleShot(True)
+        self._overlay_hide_timer.timeout.connect(self._auto_hide_overlay)
         
         # Make overlay draggable for window movement
         self._fullscreen_overlay.mousePressEvent = self._overlay_mouse_press
         self._fullscreen_overlay.mouseMoveEvent = self._overlay_mouse_move
-        
-        # Auto-hide overlay after 3 seconds, show on mouse movement
-        self._overlay_hide_timer = QTimer()
-        self._overlay_hide_timer.timeout.connect(self._auto_hide_overlay)
-        self._overlay_hide_timer.start(3000)
-        
-        # Track mouse movement to show overlay
-        self.setMouseTracking(True)
-    
+
     def _overlay_mouse_press(self, event):
-        """Handle mouse press on overlay for dragging"""
+        """Handle mouse press on overlay for dragging window"""
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
-    
+
     def _overlay_mouse_move(self, event):
         """Handle mouse move on overlay for dragging window"""
         if (event.buttons() == Qt.MouseButton.LeftButton and 
             hasattr(self, '_drag_position')):
             self.move(event.globalPosition().toPoint() - self._drag_position)
             event.accept()
-    
+
     def _auto_hide_overlay(self):
         """Auto-hide overlay after timeout"""
         if hasattr(self, '_fullscreen_overlay') and self._fullscreen_overlay.isVisible():
             self._fullscreen_overlay.hide()
-    
+
     def mouseMoveEvent(self, event):
         """Show overlay on mouse movement in fullscreen"""
         super().mouseMoveEvent(event)
@@ -4496,17 +4671,16 @@ Press 'L' to cycle through modes."""
                 # Reset auto-hide timer
                 if hasattr(self, '_overlay_hide_timer'):
                     self._overlay_hide_timer.start(3000)
-    
+
     def resizeEvent(self, event):
-        """Reposition overlay and refresh content on window resize"""
+        """Enhanced resize event with comprehensive fixes from GitHub reference"""
         super().resizeEvent(event)
         
         # Handle fullscreen overlay repositioning
         if (self.isFullScreen() and hasattr(self, '_fullscreen_overlay')):
-            # Reposition overlay at top-right
-            self._fullscreen_overlay.move(self.width() - 310, 10)
+            self._fullscreen_overlay.move(self.width() - 160, 10)
         
-        # Smart resize handling to prevent excessive workarounds and position jumping
+        # Enhanced resize handling to prevent PDF position jumping
         if hasattr(self, 'pdf_widget') and self.pdf_widget and event.size().isValid():
             old_size = event.oldSize()
             new_size = event.size()
@@ -4516,12 +4690,25 @@ Press 'L' to cycle through modes."""
                 (abs(new_size.width() - old_size.width()) > 20 or 
                  abs(new_size.height() - old_size.height()) > 20)):
                 
-                print(f"🔧 SIGNIFICANT RESIZE: {old_size.width()}x{old_size.height()} → {new_size.width()}x{new_size.height()}")
-                
                 # Store current PDF state to prevent position jumping
-                current_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
+                current_zoom = getattr(self.pdf_widget, 'zoom_factor', 1.0)
                 current_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
                 current_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
+                
+                # Enhanced handling for both grid and single page mode
+                if getattr(self.pdf_widget, 'grid_mode', False):
+                    # Grid mode: Force immediate layout recalculation
+                    self.pdf_widget._grid_cached_size = (0, 0, 0, 0)
+                    QTimer.singleShot(0, lambda: (
+                        self.pdf_widget.compute_grid_layout(),
+                        self.pdf_widget.update()
+                    ))
+                else:
+                    # Single page mode: Use same approach as grid mode
+                    QTimer.singleShot(0, lambda: (
+                        self.pdf_widget.compute_single_page_layout(),
+                        self.pdf_widget.update()
+                    ))
                 
                 # Immediate content refresh while preserving position
                 self.pdf_widget.update()
@@ -4535,16 +4722,14 @@ Press 'L' to cycle through modes."""
                 
                 # Also trigger regular content refresh
                 QTimer.singleShot(25, self._refresh_content_after_resize)
-    
+
     def _restore_pdf_position(self, zoom, pan_x, pan_y):
         """Restore PDF position and zoom after resize to prevent jumping"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                print(f"🔧 RESTORING PDF POSITION: zoom={zoom:.2f}, pan=({pan_x:.1f}, {pan_y:.1f})")
-                
                 # Restore zoom level
-                if hasattr(self.pdf_widget, 'zoom_level'):
-                    self.pdf_widget.zoom_level = zoom
+                if hasattr(self.pdf_widget, 'zoom_factor'):
+                    self.pdf_widget.zoom_factor = zoom
                 
                 # Restore pan position
                 if hasattr(self.pdf_widget, 'pan_x'):
@@ -4558,25 +4743,15 @@ Press 'L' to cycle through modes."""
                 
         except Exception as e:
             print(f"⚠️ Error restoring PDF position: {e}")
-    
+
     def _refresh_content_after_resize(self):
         """Refresh PDF content after significant window size changes"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                # Force grid layout recalculation for new dimensions
-                if hasattr(self.pdf_widget, 'compute_grid_layout'):
-                    self.pdf_widget.compute_grid_layout()
-                
-                # Update the OpenGL widget
-                self.pdf_widget.update()
-                
-                # Process events
-                QApplication.processEvents()
-                
                 print(f"🔄 Content refreshed after resize to {self.size().width()}x{self.size().height()}")
         except Exception as e:
             print(f"⚠️ Resize refresh error: {e}")
-    
+
     def showEvent(self, event):
         """Handle window show events to ensure proper rendering"""
         super().showEvent(event)
@@ -4585,7 +4760,7 @@ Press 'L' to cycle through modes."""
         # This is especially important for fullscreen transitions
         if hasattr(self, 'pdf_widget') and self.pdf_widget:
             QTimer.singleShot(30, self._refresh_on_show)
-    
+
     def _refresh_on_show(self):
         """Refresh content when window is shown"""
         try:
@@ -4619,7 +4794,7 @@ Press 'L' to cycle through modes."""
         event.ignore()
     
     def dropEvent(self, event):
-        """Handle drop events with progress indicator"""
+        """Handle drop events"""
         print("Drop event received")
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
@@ -4628,609 +4803,76 @@ Press 'L' to cycle through modes."""
                     print(f"Processing dropped file: {file_path}")
                     if file_path.lower().endswith('.pdf'):
                         print(f"Loading PDF: {file_path}")
-                        self.load_pdf_with_progress(file_path)
+                        self.load_pdf(file_path)
                         event.acceptProposedAction()
+                        self.status_bar.showMessage(f"Dropped: {os.path.basename(file_path)}", 3000)
                         return
         print("Drop event ignored")
         event.ignore()
     
     def open_pdf_direct(self):
-        """Open PDF with loading indicator"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open PDF", "", "PDF Files (*.pdf)"
-        )
-        if file_path:
-            self.load_pdf_with_progress(file_path)
-    
-    def load_pdf_with_progress(self, file_path):
-        """Load PDF with minimal progress indicator"""
-        # Close any existing loading widget first
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.close_loading_widget()
-            QApplication.processEvents()
-        
-        # Create minimal loading widget - thin line with text
-        self.loading_widget = QWidget(self)
-        self.loading_widget.setObjectName("pdfLoadingWidget")
-        self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.loading_widget.raise_()  # Bring to front
-        
-        # Style the loading widget - very minimal light grey with white text
-        self.loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-            }
-            QProgressBar {
-                border: none;
-                background-color: rgba(200, 200, 200, 100);
-                border-radius: 0px;
-            }
-            QProgressBar::chunk {
-                background-color: rgba(180, 180, 180, 255);
-                border-radius: 0px;
-            }
-            QLabel {
-                color: rgba(150, 150, 150, 255);
-                font-size: 11px;
-                font-weight: normal;
-                background: transparent;
-            }
-        """)
-        
-        # Layout for loading widget - label and progress bar
-        layout = QVBoxLayout(self.loading_widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(3)
-        
-        # Status label
-        self.loading_label = QLabel("Loading PDF...")
-        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.loading_label)
-        
-        # Only the slim progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(1)  # 1px height
-        self.progress_bar.setTextVisible(False)  # No text
-        layout.addWidget(self.progress_bar)
-        
-        # Position loading widget at center of main window
-        self.center_loading_widget()
-        
-        # Show loading widget
-        self.loading_widget.show()
-        
-        # Re-center after showing to ensure proper positioning
-        QApplication.processEvents()
-        self.center_loading_widget()
-        
-        # Start loading process
-        self.load_pdf_step_by_step(file_path)
-    
-    def center_loading_widget(self):
-        """Center the loading widget on the main window (both horizontally and vertically)"""
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            # Get current main window geometry and size
-            main_rect = self.geometry()
-            main_size = self.size()
-            loading_size = self.loading_widget.size()
-            
-            # Calculate center position relative to main window
-            # Since the loading widget is a child of self, we use relative positioning
-            x = (main_size.width() - loading_size.width()) // 2
-            y = (main_size.height() - loading_size.height()) // 2
-            
-            # Move to center position (relative to parent)
-            self.loading_widget.move(x, y)
-            print(f"📍 Loading widget positioned at ({x}, {y}) in window {main_size.width()}x{main_size.height()}")
-    
-    def load_pdf_step_by_step(self, file_path):
-        """Load PDF in steps with progress updates"""
+        """Open PDF file with minimal dialog implementation"""
         try:
-            # Step 1: Open PDF document (10%)
-            self.update_loading_progress("Opening PDF document...", 10)
-            
-            # Close existing document
-            if self.pdf_doc:
-                self.pdf_doc.close()
-            
-            # Open new document
-            self.pdf_doc = fitz.open(file_path)
-            self.pdf_path = file_path
-            self.total_pages = len(self.pdf_doc)
-            self.current_page = 0
-            
-            # Step 2: Initialize renderer (25%)
-            self.update_loading_progress("Initializing renderer...", 25)
+            # Process any pending events to ensure clean state
             QApplication.processEvents()
             
-            # Stop existing renderer
-            if self.renderer:
-                self.renderer.stop()
-                self.renderer.wait()
-            
-            # Create new renderer
-            self.renderer = PDFPageRenderer(file_path, parent=self)
-            self.renderer.pageRendered.connect(self.on_page_rendered)
-            self.renderer.start()
-            
-            # Step 3: Clear old data (40%)
-            self.update_loading_progress("Clearing previous data...", 40)
-            QApplication.processEvents()
-            
-            # Clear thumbnail list and textures
-            self.thumbnail_list.clear()
-            if hasattr(self.pdf_widget, 'texture_cache'):
-                self.pdf_widget.texture_cache.clear()
-            
-            # Step 4: Render first page (60%)
-            self.update_loading_progress("Rendering first page...", 60)
-            QApplication.processEvents()
-            
-            # Render first page immediately for quick preview
-            self.render_current_page()
-            
-            # Step 5: Update UI (75%)
-            self.update_loading_progress("Updating interface...", 75)
-            QApplication.processEvents()
-            
-            # Update UI elements
-            self.update_page_info()
-            filename = os.path.basename(file_path)
-            self.setWindowTitle(f"GPU PDF Viewer - {filename}")
-            
-            # Step 6: Start thumbnail generation (90%)
-            self.update_loading_progress("Generating thumbnails...", 90)
-            QApplication.processEvents()
-            
-            # Start thumbnail generation in background
-            QTimer.singleShot(100, self.start_thumbnail_generation)
-            
-        except Exception as e:
-            self.close_loading_widget()
-            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}")
-    
-    def start_thumbnail_generation(self):
-        """Start thumbnail generation with progress tracking"""
-        try:
-            # Stop existing thumbnail worker
-            if self.thumbnail_worker:
-                self.thumbnail_worker.stop()
-                self.thumbnail_worker.wait()
-            
-            # Create new thumbnail worker with progress tracking
-            self.thumbnail_worker = ThumbnailWorker(
-                self.pdf_doc, 
-                limit=min(50, self.total_pages),
-                parent=self,
-                gpu_widget=self.pdf_widget
+            # Try the static method first (most compatible)
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select PDF File",
+                "",  # Let system choose default directory
+                "PDF Files (*.pdf);;All Files (*.*)",
+                options=QFileDialog.Option.DontUseNativeDialog  # Force Qt dialog
             )
             
-            # Connect signals for progress tracking
-            self.thumbnail_worker.thumbnailReady.connect(self.on_thumbnail_ready)
-            self.thumbnail_worker.finished.connect(self.on_thumbnail_generation_complete)
-            
-            # Start thumbnail generation
-            self.thumbnail_worker.start()
-            
-            # Update progress
-            self.update_loading_progress(f"Generating thumbnails (0/{min(50, self.total_pages)})...", 90)
-            
-            # Track thumbnail progress
-            self.thumbnails_generated = 0
-            self.total_thumbnails = min(50, self.total_pages)
-            
-        except Exception as e:
-            print(f"Error starting thumbnail generation: {e}")
-            self.close_loading_widget()
-    
-    def on_thumbnail_ready(self, page_num, qimage):
-        """Handle thumbnail ready with progress update"""
-        try:
-            # Create thumbnail item
-            item = QListWidgetItem()
-            
-            # Scale image to fit icon size while maintaining aspect ratio
-            icon_size = self.thumbnail_list.iconSize()
-            scaled_image = qimage.scaled(
-                icon_size, 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            )
-            
-            # Create pixmap and set as icon
-            pixmap = QPixmap.fromImage(scaled_image)
-            item.setIcon(QIcon(pixmap))
-            item.setText(f"Page {page_num + 1}")
-            item.setData(Qt.ItemDataRole.UserRole, page_num)
-            
-            # Add to list
-            self.thumbnail_list.addItem(item)
-            
-            # Update progress
-            self.thumbnails_generated += 1
-            progress = 90 + (self.thumbnails_generated / self.total_thumbnails) * 8  # 90-98%
-            self.update_loading_progress(
-                f"Generating thumbnails ({self.thumbnails_generated}/{self.total_thumbnails})...", 
-                int(progress)
-            )
-            
-        except Exception as e:
-            print(f"Error processing thumbnail {page_num}: {e}")
-    
-    def on_thumbnail_generation_complete(self):
-        """Handle completion of thumbnail generation"""
-        # Final progress update
-        self.update_loading_progress("Complete!", 100)
-        QApplication.processEvents()
-        
-        # Close loading widget after a brief delay
-        QTimer.singleShot(800, self.close_loading_widget)
-        
-        # Backup force cleanup in case the normal close fails
-        QTimer.singleShot(2000, self.force_cleanup_loading_widget)
-        
-        # Show completion message in status bar
-        filename = os.path.basename(self.pdf_path)
-        self.status_bar.showMessage(f"✓ Loaded: {filename} - {self.total_pages} pages, {self.thumbnails_generated} thumbnails generated", 5000)
-        
-        print(f"✓ PDF loading complete: {filename}")
-    
-    def update_loading_progress(self, message, percentage):
-        """Update loading widget with progress"""
-        if hasattr(self, 'loading_label') and self.loading_label:
-            self.loading_label.setText(message)
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(percentage)
-        QApplication.processEvents()
-    
-    def close_loading_widget(self):
-        """Close the loading widget"""
-        try:
-            if hasattr(self, 'loading_widget') and self.loading_widget:
-                print("🔧 Closing loading widget...")
-                self.loading_widget.hide()
-                self.loading_widget.deleteLater()
-                self.loading_widget = None
-                print("✓ Loading widget closed")
-            if hasattr(self, 'loading_label'):
-                self.loading_label = None
-            if hasattr(self, 'progress_bar'):
-                self.progress_bar = None
-        except Exception as e:
-            print(f"✗ Error closing loading widget: {e}")
-            # Force cleanup
-            if hasattr(self, 'loading_widget'):
-                self.loading_widget = None
-            if hasattr(self, 'loading_label'):
-                self.loading_label = None
-            if hasattr(self, 'progress_bar'):
-                self.progress_bar = None
-    
-    def force_cleanup_loading_widget(self):
-        """Force cleanup of any persistent loading widgets"""
-        print("🔧 FORCE CLEANUP: Checking for persistent loading widgets...")
-        try:
-            # Find and remove any loading widgets that might be stuck
-            loading_widget_names = ["pdfLoadingWidget", "gridLoadingWidget", "thumbnailLoadingWidget", "navigationLoadingWidget"]
-            for child in self.findChildren(QWidget):
-                if hasattr(child, 'objectName') and child.objectName() in loading_widget_names:
-                    print(f"🔧 FORCE CLEANUP: Removing persistent widget: {child.objectName()}")
-                    child.hide()
-                    child.deleteLater()
-            
-            # Also check for widgets with 'loading' in their object name (generic backup)
-            for child in self.findChildren(QWidget):
-                if hasattr(child, 'objectName') and 'loading' in child.objectName().lower():
-                    print(f"🔧 FORCE CLEANUP: Removing generic loading widget: {child}")
-                    child.hide()
-                    child.deleteLater()
-            
-            # Clear all loading widget references
-            self.loading_widget = None
-            self.loading_label = None
-            self.progress_bar = None
-            if hasattr(self, 'loading_progress_bar'):
-                self.loading_progress_bar = None
-            if hasattr(self, 'loading_timer'):
-                if self.loading_timer:
-                    self.loading_timer.stop()
-                self.loading_timer = None
-            
-            print("✓ FORCE CLEANUP: Complete")
-            
-        except Exception as e:
-            print(f"✗ FORCE CLEANUP ERROR: {e}")
-    
-    def show_grid_loading_progress(self, grid_size):
-        """Show minimal loading indicator for grid processing"""
-        # Close any existing loading widget first
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.close_loading_widget()
-            QApplication.processEvents()
-        
-        # Create minimal loading widget
-        self.loading_widget = QWidget(self)
-        self.loading_widget.setObjectName("gridLoadingWidget")
-        self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.loading_widget.raise_()  # Bring to front
-        
-        # Style the loading widget - very minimal light grey with grey text
-        self.loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-            }
-            QProgressBar {
-                border: none;
-                background-color: rgba(200, 200, 200, 100);
-                border-radius: 0px;
-            }
-            QProgressBar::chunk {
-                background-color: rgba(180, 180, 180, 255);
-                border-radius: 0px;
-            }
-            QLabel {
-                color: rgba(150, 150, 150, 255);
-                font-size: 11px;
-                font-weight: normal;
-                background: transparent;
-            }
-        """)
-        
-        # Layout for loading widget - label and progress bar
-        layout = QVBoxLayout(self.loading_widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(3)
-        
-        # Status label
-        self.loading_label = QLabel(f"Preparing {grid_size} grid view...")
-        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.loading_label)
-        
-        # Slim progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(1)  # 1px height
-        self.progress_bar.setTextVisible(False)  # No text
-        layout.addWidget(self.progress_bar)
-        
-        # Position loading widget at center of main window
-        self.center_loading_widget()
-        
-        # Show loading widget
-        self.loading_widget.show()
-        
-        # Re-center after showing to ensure proper positioning
-        QApplication.processEvents()
-        self.center_loading_widget()
-        
-        # Start grid processing animation
-        self._start_grid_progress_animation()
-    
-    def _start_grid_progress_animation(self):
-        """Start a simple progress animation for grid processing"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(20)
-            QTimer.singleShot(200, lambda: self._continue_grid_progress(40))
-    
-    def _continue_grid_progress(self, value):
-        """Continue grid progress animation"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(value)
-            if value < 90:
-                QTimer.singleShot(150, lambda: self._continue_grid_progress(value + 15))
+            if file_path:
+                print(f"Selected file: {file_path}")
+                self.load_pdf(file_path)
             else:
-                # Close after a brief moment
-                QTimer.singleShot(500, self._finish_grid_loading)
-    
-    def _finish_grid_loading(self):
-        """Finish grid loading and hide progress"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(100)
-        if hasattr(self, 'loading_label') and self.loading_label:
-            self.loading_label.setText("Grid ready")
-        QTimer.singleShot(300, self.close_loading_widget)
-    
-    def show_thumbnail_loading_progress(self, page_num):
-        """Show minimal loading indicator for thumbnail navigation"""
-        # Close any existing loading widget first
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.close_loading_widget()
-            QApplication.processEvents()
-        
-        # Create minimal loading widget
-        self.loading_widget = QWidget(self)
-        self.loading_widget.setObjectName("thumbnailLoadingWidget")
-        self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.loading_widget.raise_()  # Bring to front
-        
-        # Style the loading widget - very minimal light grey with grey text
-        self.loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-            }
-            QProgressBar {
-                border: none;
-                background-color: rgba(200, 200, 200, 100);
-                border-radius: 0px;
-            }
-            QProgressBar::chunk {
-                background-color: rgba(180, 180, 180, 255);
-                border-radius: 0px;
-            }
-            QLabel {
-                color: rgba(150, 150, 150, 255);
-                font-size: 11px;
-                font-weight: normal;
-                background: transparent;
-            }
-        """)
-        
-        # Layout for loading widget - label and progress bar
-        layout = QVBoxLayout(self.loading_widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(3)
-        
-        # Status label
-        self.loading_label = QLabel(f"Loading page {page_num + 1}...")
-        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.loading_label)
-        
-        # Slim progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(1)  # 1px height
-        self.progress_bar.setTextVisible(False)  # No text
-        layout.addWidget(self.progress_bar)
-        
-        # Position loading widget at center of main window
-        self.center_loading_widget()
-        
-        # Show loading widget
-        self.loading_widget.show()
-        
-        # Re-center after showing to ensure proper positioning
-        QApplication.processEvents()
-        self.center_loading_widget()
-        
-        # Start thumbnail loading animation
-        self._start_thumbnail_progress_animation()
-    
-    def _start_thumbnail_progress_animation(self):
-        """Start a simple progress animation for thumbnail navigation"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(30)
-            QTimer.singleShot(100, lambda: self._continue_thumbnail_progress(60))
-    
-    def _continue_thumbnail_progress(self, value):
-        """Continue thumbnail progress animation"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(value)
-            if value < 90:
-                QTimer.singleShot(80, lambda: self._continue_thumbnail_progress(value + 10))
-            else:
-                # Close after a brief moment
-                QTimer.singleShot(400, self._finish_thumbnail_loading)
-    
-    def _finish_thumbnail_loading(self):
-        """Finish thumbnail loading and hide progress"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(100)
-        if hasattr(self, 'loading_label') and self.loading_label:
-            self.loading_label.setText("Page ready")
-        QTimer.singleShot(200, self.close_loading_widget)
-    
-    def show_navigation_loading_progress(self, direction, page_num):
-        """Show minimal loading indicator for page navigation (next/prev)"""
-        # Close any existing loading widget first
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.close_loading_widget()
-            QApplication.processEvents()
-        
-        # Create minimal loading widget
-        self.loading_widget = QWidget(self)
-        self.loading_widget.setObjectName("navigationLoadingWidget")
-        self.loading_widget.setFixedSize(250, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.loading_widget.raise_()  # Bring to front
-        
-        # Style the loading widget - very minimal light grey with grey text
-        self.loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-            }
-            QProgressBar {
-                border: none;
-                background-color: rgba(200, 200, 200, 100);
-                border-radius: 0px;
-            }
-            QProgressBar::chunk {
-                background-color: rgba(180, 180, 180, 255);
-                border-radius: 0px;
-            }
-            QLabel {
-                color: rgba(150, 150, 150, 255);
-                font-size: 11px;
-                font-weight: normal;
-                background: transparent;
-            }
-        """)
-        
-        # Layout for loading widget - label and progress bar
-        layout = QVBoxLayout(self.loading_widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(3)
-        
-        # Status label
-        direction_text = "Next" if direction == "next" else "Previous"
-        self.loading_label = QLabel(f"{direction_text} page {page_num + 1}...")
-        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.loading_label)
-        
-        # Slim progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(1)  # 1px height
-        self.progress_bar.setTextVisible(False)  # No text
-        layout.addWidget(self.progress_bar)
-        
-        # Position loading widget at center of main window
-        self.center_loading_widget()
-        
-        # Show loading widget
-        self.loading_widget.show()
-        
-        # Re-center after showing to ensure proper positioning
-        QApplication.processEvents()
-        self.center_loading_widget()
-        
-        # Start navigation loading animation (faster than others)
-        self._start_navigation_progress_animation()
-    
-    def _start_navigation_progress_animation(self):
-        """Start a quick progress animation for page navigation"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(40)
-            QTimer.singleShot(50, lambda: self._continue_navigation_progress(70))
-    
-    def _continue_navigation_progress(self, value):
-        """Continue navigation progress animation"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(value)
-            if value < 90:
-                QTimer.singleShot(40, lambda: self._continue_navigation_progress(value + 10))
-            else:
-                # Close quickly
-                QTimer.singleShot(200, self._finish_navigation_loading)
-    
-    def _finish_navigation_loading(self):
-        """Finish navigation loading and hide progress"""
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.setValue(100)
-        QTimer.singleShot(100, self.close_loading_widget)
-        
-        # Backup force cleanup
-        QTimer.singleShot(1000, self.force_cleanup_loading_widget)
+                print("No file selected")
+                
+        except Exception as e:
+            print(f"Error in file dialog: {e}")
+            self.status_bar.showMessage(f"File dialog error: {str(e)}", 5000)
+            
+            # Fallback: try with native dialog
+            try:
+                print("Trying fallback native dialog...")
+                file_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select PDF File", 
+                    "",
+                    "PDF Files (*.pdf)"
+                )
+                if file_path:
+                    self.load_pdf(file_path)
+            except Exception as e2:
+                print(f"Fallback dialog also failed: {e2}")
+                self.status_bar.showMessage("File dialog unavailable", 5000)
     
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
+        """Enhanced PDF loading with comprehensive preloader from GitHub reference"""
         try:
             # Ensure UI is fully initialized before loading PDF
             if not hasattr(self, 'page_label') or self.page_label is None:
                 # UI not ready yet, defer loading
                 QTimer.singleShot(200, lambda: self.load_pdf(pdf_path, quality))
                 return
-                
+            
+            # Store quality for step-by-step loading
+            self.render_quality = quality
+            
+            # Start step-by-step loading with comprehensive preloader
+            self.load_pdf_step_by_step(pdf_path)
+            
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Show the exception and include a copyable traceback for debugging
+            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}\n\nTraceback:\n{tb}")
+            
+    def load_pdf_legacy(self, pdf_path: str, quality: float = 5.0):
+        """Legacy PDF loading method - kept for reference but not used"""
+        try:
             # Clean up previous document
             if hasattr(self, 'pdf_doc') and self.pdf_doc is not None:
                 try:
@@ -5342,6 +4984,815 @@ Press 'L' to cycle through modes."""
             # Show the exception and include a copyable traceback for debugging
             QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}\n\nTraceback:\n{tb}")
     
+    def show_loading_widget_with_progress(self, title="Loading..."):
+        """Show ultra-minimal loading widget with 1px progress line - consistent style"""
+        # Close any existing loading widget first
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.close_loading_widget()
+            QApplication.processEvents()
+
+        # Create ultra-minimal loading widget as child of main window
+        self.loading_widget = QWidget(self)
+        self.loading_widget.setObjectName("pdfLoadingWidget")  # Unique name for cleanup
+        self.loading_widget.setFixedSize(120, 20)  # Ultra-compact size
+        self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.loading_widget.raise_()  # Bring to front
+
+        # Create ultra-minimal layout
+        layout = QVBoxLayout(self.loading_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        # Loading message - small grey text
+        self.loading_label = QLabel(title)
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+
+        # Progress bar - 1px line
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(1)  # Ultra-thin 1px progress line
+        self.progress_bar.setTextVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # Apply ultra-minimal styling - consistent with mini indicator
+        self.loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(240, 240, 240, 120);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(100, 100, 100, 200);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(120, 120, 120, 220);
+                font-size: 9px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+
+        # Center the loading widget in PDF viewing area
+        self.center_loading_widget()
+        self.loading_widget.show()
+        QApplication.processEvents()
+
+    def center_loading_widget(self):
+        """Center ultra-minimal loading widget in PDF viewing area (excluding thumbnails)"""
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            # Get PDF container geometry for centering (this is the area excluding thumbnails)
+            pdf_area_rect = self.pdf_container.geometry()
+            loading_size = self.loading_widget.size()
+            
+            # Calculate center position relative to PDF viewing area
+            x = pdf_area_rect.x() + (pdf_area_rect.width() - loading_size.width()) // 2
+            y = pdf_area_rect.y() + (pdf_area_rect.height() - loading_size.height()) // 2
+            
+            # Move to center position in PDF area
+            self.loading_widget.move(x, y)
+            print(f"📍 Ultra-minimal loading widget positioned at ({x}, {y}) in PDF area {pdf_area_rect.width()}x{pdf_area_rect.height()}")
+
+    def load_pdf_step_by_step(self, file_path):
+        """Load PDF in steps with progress updates from GitHub reference - PRESERVING CURRENT SETTINGS"""
+        try:
+            # Show loading widget at start
+            self.show_loading_widget_with_progress("Loading PDF...")
+            
+            # Step 1: Open PDF document (10%)
+            self.update_loading_progress("Opening PDF document...", 10)
+            
+            # Clean up previous document (PRESERVE CURRENT CLEANUP LOGIC)
+            if hasattr(self, 'pdf_doc') and self.pdf_doc is not None:
+                try:
+                    self.pdf_doc.close()
+                except:
+                    pass  # Ignore errors if already closed
+                self.pdf_doc = None
+                
+            if hasattr(self, 'renderer') and self.renderer:
+                self.renderer.stop()
+                self.renderer.wait()
+                self.renderer = None
+                
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                # Properly disconnect signals before stopping
+                try:
+                    self.thumbnail_worker.thumbnailReady.disconnect()
+                    self.thumbnail_worker.finished.disconnect()
+                except:
+                    pass
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker.wait()
+                self.thumbnail_worker = None
+            
+            # Clear thumbnail list immediately when loading new PDF (PRESERVE CURRENT LOGIC)
+            if hasattr(self, 'thumbnail_list') and self.thumbnail_list:
+                self.thumbnail_list.clear()
+                print("Cleared thumbnail list for new PDF")
+            
+            # Reset thumbnail-related state variables (PRESERVE CURRENT LOGIC)
+            if hasattr(self, '_current_thumb_range'):
+                delattr(self, '_current_thumb_range')
+            if hasattr(self, '_selective_thumbnails_enabled'):
+                delattr(self, '_selective_thumbnails_enabled')
+            
+            # Open new document
+            self.pdf_doc = fitz.open(file_path)
+            self.pdf_path = file_path
+            self.total_pages = self.pdf_doc.page_count
+            self.current_page = 0
+            
+            # Step 2: Initialize renderer (25%)
+            self.update_loading_progress("Initializing renderer...", 25)
+            QApplication.processEvents()
+            
+            # PRESERVE CURRENT QUALITY SETTING - use stored render_quality or default
+            quality = getattr(self, 'render_quality', 5.0)
+            
+            # Create new renderer with PRESERVED QUALITY
+            self.renderer = PDFPageRenderer(file_path, quality)
+            self.renderer.pageRendered.connect(self.on_page_rendered)
+            self.renderer.start()
+            
+            # Step 3: Clear caches (40%)
+            self.update_loading_progress("Clearing caches...", 40)
+            QApplication.processEvents()
+            
+            # Clear texture cache and grid textures when loading new document (PRESERVE CURRENT LOGIC)
+            try:
+                if hasattr(self.pdf_widget, 'texture_cache') and self.pdf_widget.texture_cache:
+                    if hasattr(self.pdf_widget.texture_cache, 'clear_cache'):
+                        self.pdf_widget.texture_cache.clear_cache()
+                    elif hasattr(self.pdf_widget.texture_cache, 'clear'):
+                        self.pdf_widget.texture_cache.clear()
+                    else:
+                        # Recreate texture cache if methods are missing
+                        print("Warning: Recreating texture cache due to missing methods")
+                        self.pdf_widget.texture_cache = GPUTextureCache()
+            except Exception as e:
+                print(f"Warning: Could not clear texture cache: {e}")
+                # Fallback: recreate texture cache
+                self.pdf_widget.texture_cache = GPUTextureCache()
+            
+            # CRITICAL: Reset grid mode state when loading new PDF (PRESERVE CURRENT LOGIC)
+            # The grid mode should be determined by the UI toggle state, not previous PDF state
+            grid_view_checked = self.grid_view_action.isChecked() if hasattr(self, 'grid_view_action') else False
+            self.pdf_widget.grid_mode = grid_view_checked
+            
+            # Reset all grid-related state variables (PRESERVE CURRENT LOGIC)
+            if hasattr(self.pdf_widget, 'is_temp_zoomed'):
+                self.pdf_widget.is_temp_zoomed = False
+            if hasattr(self.pdf_widget, 'temp_zoom_factor'):
+                self.pdf_widget.temp_zoom_factor = 1.0
+            if hasattr(self.pdf_widget, 'temp_pan_x'):
+                self.pdf_widget.temp_pan_x = 0.0
+            if hasattr(self.pdf_widget, 'temp_pan_y'):
+                self.pdf_widget.temp_pan_y = 0.0
+            
+            print(f"PDF loading - Grid mode set to: {self.pdf_widget.grid_mode} (from UI toggle)")
+            
+            try:
+                if hasattr(self.pdf_widget, 'grid_textures'):
+                    self.pdf_widget.grid_textures.clear()
+            except Exception as e:
+                print(f"Warning: Could not clear grid textures: {e}")
+                
+            self.pdf_widget.set_page_texture(None)  # Clear current page texture
+            
+            # Step 4: Update UI (55%)
+            self.update_loading_progress("Updating interface...", 55)
+            QApplication.processEvents()
+            
+            # Update window title and UI
+            filename = os.path.basename(file_path)
+            self.setWindowTitle(f"PDF Viewer - {filename}")
+            self.update_page_label()
+            
+            # Step 5: Render first page (70%)
+            self.update_loading_progress("Rendering first page...", 70)
+            QApplication.processEvents()
+            
+            # Render current page immediately for ultra-fast display
+            self.render_current_page()
+            
+            # Update background color for current theme (PRESERVE CURRENT LOGIC)
+            self.pdf_widget.update_background_color()
+            
+            # Step 6: Start thumbnail generation (90%)
+            self.update_loading_progress("Preparing thumbnails...", 90)
+            QApplication.processEvents()
+            
+            # PRESERVE CURRENT THUMBNAIL LOGIC - ALWAYS generate thumbnails for new PDF
+            # This ensures thumbnail ordering and quality settings are preserved
+            QTimer.singleShot(100, lambda: self._complete_loading_with_thumbnails())
+            
+        except Exception as e:
+            print(f"Error in step-by-step loading: {e}")
+            self.close_loading_widget()
+            raise
+    
+    def _complete_loading_with_thumbnails(self):
+        """Complete loading process with preserved thumbnail generation"""
+        try:
+            # PRESERVE CURRENT THUMBNAIL GENERATION LOGIC
+            # This maintains the current quality and ordering that works correctly
+            self.generate_thumbnails_deferred(force_new_pdf=True)
+            
+            # Show completion status
+            self.status_bar.showMessage(f"Loaded: {os.path.basename(self.pdf_path)} ({self.total_pages} pages)")
+            
+            # Close loading widget after a brief delay to show completion
+            QTimer.singleShot(500, self.close_loading_widget)
+            
+        except Exception as e:
+            print(f"Error completing loading: {e}")
+            self.close_loading_widget()
+
+    def on_thumbnail_ready(self, page_num, qimage):
+        """Handle thumbnail ready with progress update from GitHub reference"""
+        try:
+            # Create thumbnail item
+            item = QListWidgetItem()
+            
+            # Scale image to fit icon size while maintaining aspect ratio
+            icon_size = self.thumbnail_list.iconSize()
+            scaled_image = qimage.scaled(
+                icon_size, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            # Create pixmap and set as icon
+            pixmap = QPixmap.fromImage(scaled_image)
+            item.setIcon(QIcon(pixmap))
+            item.setText(f"{page_num + 1}")
+            item.setData(Qt.ItemDataRole.UserRole, page_num)
+            
+            # Add to list
+            self.thumbnail_list.addItem(item)
+            
+            # Update progress during initial load
+            if hasattr(self, 'loading_widget') and self.loading_widget and hasattr(self, 'thumbnails_generated'):
+                self.thumbnails_generated += 1
+                progress = 90 + (self.thumbnails_generated / self.total_thumbnails) * 8  # 90-98%
+                self.update_loading_progress(
+                    f"Generating thumbnails ({self.thumbnails_generated}/{self.total_thumbnails})...", 
+                    int(progress)
+                )
+                
+                # Complete loading when all initial thumbnails are done
+                if self.thumbnails_generated >= self.total_thumbnails:
+                    self.update_loading_progress("Loading complete!", 100)
+                    QTimer.singleShot(500, self.close_loading_widget)
+                    
+                    # Show final status
+                    filename = os.path.basename(self.pdf_path)
+                    self.status_bar.showMessage(f"Loaded: {filename} - {self.total_pages} pages, {self.thumbnails_generated} thumbnails generated", 5000)
+                    print(f"✓ PDF loading complete: {filename}")
+        
+        except Exception as e:
+            print(f"Thumbnail ready error: {e}")
+
+    def update_loading_progress(self, message, percentage):
+        """Update loading widget with progress"""
+        if hasattr(self, 'loading_label') and self.loading_label:
+            self.loading_label.setText(message)
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.setValue(percentage)
+        QApplication.processEvents()
+
+    def close_loading_widget(self):
+        """Close the loading widget"""
+        try:
+            if hasattr(self, 'loading_widget') and self.loading_widget:
+                print("🔧 Closing loading widget...")
+                self.loading_widget.hide()
+                self.loading_widget.deleteLater()
+                self.loading_widget = None
+                print("✓ Loading widget closed")
+                
+                # Clear references
+                if hasattr(self, 'loading_label'):
+                    self.loading_label = None
+                if hasattr(self, 'progress_bar'):
+                    self.progress_bar = None
+        except Exception as e:
+            print(f"Error closing loading widget: {e}")
+
+    def force_cleanup_loading_widget(self):
+        """Force cleanup of any persistent loading widgets from GitHub reference"""
+        try:
+            print("🔧 FORCE CLEANUP: Checking for persistent loading widgets...")
+            
+            # Find and remove specific loading widget types by object name
+            loading_widget_names = ["pdfLoadingWidget", "gridLoadingWidget", "thumbnailLoadingWidget", "navigationLoadingWidget"]
+            for child in self.findChildren(QWidget):
+                if hasattr(child, 'objectName') and child.objectName() in loading_widget_names:
+                    print(f"🔧 FORCE CLEANUP: Removing persistent widget: {child.objectName()}")
+                    child.hide()
+                    child.deleteLater()
+            
+            # Also check for widgets with 'loading' in their object name (generic backup)
+            for child in self.findChildren(QWidget):
+                if hasattr(child, 'objectName') and 'loading' in child.objectName().lower():
+                    print(f"🔧 FORCE CLEANUP: Removing generic loading widget: {child}")
+                    child.hide()
+                    child.deleteLater()
+            
+            # Clear all loading widget references
+            self.loading_widget = None
+            self.loading_label = None
+            self.progress_bar = None
+            if hasattr(self, 'loading_progress_bar'):
+                self.loading_progress_bar = None
+            if hasattr(self, 'loading_timer'):
+                if self.loading_timer:
+                    self.loading_timer.stop()
+                self.loading_timer = None
+            
+            print("✓ FORCE CLEANUP: Complete")
+            
+        except Exception as e:
+            print(f"✗ FORCE CLEANUP ERROR: {e}")
+
+    def show_page_navigation_status(self, direction):
+        """Show immediate status for page navigation"""
+        if direction == "next":
+            if self.pdf_widget.grid_mode:
+                grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                max_page = self.total_pages - grid_size
+                if self.current_page >= max_page:
+                    self.status_bar.showMessage("Last pages reached", 1500)
+                else:
+                    next_page = min(max_page, self.current_page + grid_size)
+                    self.status_bar.showMessage(f"Loading pages {next_page + 1} to {min(next_page + grid_size, self.total_pages)}...", 2000)
+            else:
+                if self.current_page >= self.total_pages - 1:
+                    self.status_bar.showMessage("Last page reached", 1500)
+                else:
+                    self.status_bar.showMessage(f"Loading page {self.current_page + 2}...", 2000)
+        elif direction == "previous":
+            if self.pdf_widget.grid_mode:
+                grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                if self.current_page <= 0:
+                    self.status_bar.showMessage("First pages reached", 1500)
+                else:
+                    prev_page = max(0, self.current_page - grid_size)
+                    self.status_bar.showMessage(f"Loading pages {prev_page + 1} to {prev_page + grid_size}...", 2000)
+            else:
+                if self.current_page <= 0:
+                    self.status_bar.showMessage("First page reached", 1500)
+                else:
+                    self.status_bar.showMessage(f"Loading page {self.current_page}...", 2000)
+
+    def show_mini_loading_indicator(self, message="Loading..."):
+        """Show ultra-minimal 1px line loading indicator in center"""
+        try:
+            # Remove any existing mini loader
+            self.hide_mini_loading_indicator()
+            
+            # Create ultra-minimal loading widget
+            self.mini_loading_widget = QWidget(self)
+            self.mini_loading_widget.setObjectName("navigationLoadingWidget")
+            self.mini_loading_widget.setStyleSheet("""
+                QWidget {
+                    background-color: transparent;
+                }
+                QProgressBar {
+                    border: none;
+                    background-color: rgba(240, 240, 240, 120);
+                    border-radius: 0px;
+                }
+                QProgressBar::chunk {
+                    background-color: rgba(100, 100, 100, 200);
+                    border-radius: 0px;
+                }
+                QLabel {
+                    color: rgba(120, 120, 120, 220);
+                    font-size: 9px;
+                    font-weight: normal;
+                    background: transparent;
+                }
+            """)
+            
+            # Create ultra-minimal layout
+            layout = QVBoxLayout(self.mini_loading_widget)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(3)
+            
+            # Add small grey message label
+            self.mini_message_label = QLabel(message)
+            self.mini_message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(self.mini_message_label)
+            
+            # Add 1px progress line
+            self.mini_progress_bar = QProgressBar()
+            self.mini_progress_bar.setRange(0, 100)
+            self.mini_progress_bar.setValue(0)
+            self.mini_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
+            self.mini_progress_bar.setTextVisible(False)
+            layout.addWidget(self.mini_progress_bar)
+            
+            # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
+            self.mini_loading_widget.setFixedSize(120, 20)
+            pdf_area_rect = self.pdf_container.geometry()
+            self.mini_loading_widget.move(
+                pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
+                pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
+            )
+            
+            # Show widget
+            self.mini_loading_widget.show()
+            self.mini_loading_widget.raise_()
+            
+            # Start progress animation
+            self._animate_mini_progress(0)
+            
+            print(f"🔄 Ultra-minimal 1px loading indicator shown: {message}")
+            
+        except Exception as e:
+            print(f"Error showing mini loading indicator: {e}")
+
+    def _animate_mini_progress(self, value):
+        """Animate ultra-minimal 1px progress line with realistic rendering stages"""
+        try:
+            if hasattr(self, 'mini_progress_bar') and self.mini_progress_bar:
+                self.mini_progress_bar.setValue(value)
+                
+                # Update progress message based on rendering stage
+                if hasattr(self, 'mini_message_label') and value < 100:
+                    if value < 20:
+                        stage = "Loading..."
+                    elif value < 50:
+                        stage = "Rendering..."
+                    elif value < 80:
+                        stage = "Enhancing..."
+                    else:
+                        stage = "Finalizing..."
+                    
+                    current_text = self.mini_message_label.text()
+                    if "Page" in current_text:
+                        page_part = current_text.split(" - ")[0] if " - " in current_text else current_text.split(":")[0]
+                        self.mini_message_label.setText(f"{page_part} - {stage}")
+                    else:
+                        self.mini_message_label.setText(stage)
+                
+                # Continue smooth animation
+                if value < 100:
+                    # Slower progress for more realistic rendering time
+                    next_value = min(100, value + 1)
+                    QTimer.singleShot(80, lambda: self._animate_mini_progress(next_value))
+                else:
+                    # Page fully loaded - hide indicator
+                    QTimer.singleShot(200, self.hide_mini_loading_indicator)
+                    
+        except Exception as e:
+            print(f"Error animating mini progress: {e}")
+
+    def hide_mini_loading_indicator(self):
+        """Hide mini loading indicator"""
+        try:
+            if hasattr(self, 'mini_loading_timer') and self.mini_loading_timer:
+                self.mini_loading_timer.stop()
+                self.mini_loading_timer = None
+            
+            if hasattr(self, 'mini_loading_widget') and self.mini_loading_widget:
+                self.mini_loading_widget.hide()
+                self.mini_loading_widget.deleteLater()
+                self.mini_loading_widget = None
+                
+            if hasattr(self, 'mini_message_label'):
+                self.mini_message_label = None
+            if hasattr(self, 'mini_progress_bar'):
+                self.mini_progress_bar = None
+                
+            print("🔄 Mini loading indicator hidden")
+            
+        except Exception as e:
+            print(f"Error hiding mini loading indicator: {e}")
+
+    def _render_page_with_feedback(self):
+        """Render current page and hide loading indicator when done"""
+        try:
+            # Render the page
+            self.render_current_page()
+            
+            # Hide mini loading indicator after a brief delay
+            QTimer.singleShot(300, self.hide_mini_loading_indicator)
+            
+            # Update status to show completion
+            if self.pdf_widget.grid_mode:
+                grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                start_page = self.current_page + 1
+                end_page = min(self.current_page + grid_size, self.total_pages)
+                self.status_bar.showMessage(f"Showing pages {start_page} to {end_page} of {self.total_pages}", 3000)
+            else:
+                self.status_bar.showMessage(f"Page {self.current_page + 1} of {self.total_pages}", 3000)
+                
+        except Exception as e:
+            print(f"Error in render with feedback: {e}")
+            self.hide_mini_loading_indicator()
+
+    def show_grid_loading_progress(self, grid_size, focus_page=None):
+        """Show ultra-minimal loading indicator for grid processing"""
+        # Close any existing loading widget first
+        self.hide_mini_loading_indicator()
+        
+        # Create ultra-minimal grid loading widget
+        self.grid_loading_widget = QWidget(self)
+        self.grid_loading_widget.setObjectName("gridLoadingWidget")
+        self.grid_loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(240, 240, 240, 120);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(100, 100, 100, 200);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(120, 120, 120, 220);
+                font-size: 9px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Create ultra-minimal layout
+        layout = QVBoxLayout(self.grid_loading_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+        
+        # Grid info label - small grey text
+        if focus_page is not None:
+            grid_info = f"Loading {grid_size} grid (page {focus_page + 1})"
+        else:
+            grid_info = f"Loading {grid_size} grid"
+        self.grid_info_label = QLabel(grid_info)
+        self.grid_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.grid_info_label)
+        
+        # 1px progress line
+        self.grid_progress_bar = QProgressBar()
+        self.grid_progress_bar.setRange(0, 100)
+        self.grid_progress_bar.setValue(0)
+        self.grid_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
+        self.grid_progress_bar.setTextVisible(False)
+        layout.addWidget(self.grid_progress_bar)
+        
+        # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
+        self.grid_loading_widget.setFixedSize(140, 20)
+        
+        # Show widget first
+        self.grid_loading_widget.show()
+        self.grid_loading_widget.raise_()
+        
+        # Position after a brief delay to ensure layout is stable
+        QTimer.singleShot(10, self._position_grid_loading_widget)
+        
+        # Start progress animation
+        self._animate_grid_progress(0)
+        
+        print(f"🔄 Ultra-minimal grid loading indicator shown: {grid_info}")
+
+    def _position_grid_loading_widget(self):
+        """Position grid loading widget in center of PDF viewing area"""
+        try:
+            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                # Get PDF container geometry for centering (this is the area excluding thumbnails)
+                pdf_area_rect = self.pdf_container.geometry()
+                self.grid_loading_widget.move(
+                    pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2,
+                    pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
+                )
+                print(f"📍 Grid loading widget positioned at PDF area center: {pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2}, {pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2}")
+        except Exception as e:
+            print(f"Error positioning grid loading widget: {e}")
+
+    def _animate_grid_progress(self, value):
+        """Animate ultra-minimal grid loading progress with rendering stages"""
+        try:
+            if hasattr(self, 'grid_progress_bar') and self.grid_progress_bar:
+                self.grid_progress_bar.setValue(value)
+                
+                # Update progress message based on rendering stage
+                if hasattr(self, 'grid_info_label') and value < 100:
+                    if value < 20:
+                        stage = "Computing layout..."
+                    elif value < 40:
+                        stage = "Loading pages..."
+                    elif value < 70:
+                        stage = "Rendering textures..."
+                    elif value < 90:
+                        stage = "Enhancing quality..."
+                    else:
+                        stage = "Finalizing grid..."
+                    
+                    current_text = self.grid_info_label.text()
+                    if "grid" in current_text.lower():
+                        grid_part = current_text.split(" (")[0] if " (" in current_text else current_text.split(" -")[0]
+                        self.grid_info_label.setText(f"{grid_part} - {stage}")
+                
+                # Continue smooth animation
+                if value < 100:
+                    # Grid rendering takes more time
+                    next_value = min(100, value + 3)
+                    QTimer.singleShot(100, lambda: self._animate_grid_progress(next_value))
+                else:
+                    # Complete - hide when fully loaded
+                    QTimer.singleShot(400, self._finish_grid_loading)
+                    
+        except Exception as e:
+            print(f"Error animating grid progress: {e}")
+
+    def _finish_grid_loading(self):
+        """Finish ultra-minimal grid loading and hide progress"""
+        try:
+            if hasattr(self, 'grid_progress_bar') and self.grid_progress_bar:
+                self.grid_progress_bar.setValue(100)
+            
+            # Hide after brief display
+            QTimer.singleShot(200, self.hide_grid_loading_indicator)
+            
+        except Exception as e:
+            print(f"Error finishing grid loading: {e}")
+
+    def hide_grid_loading_indicator(self):
+        """Hide grid loading indicator"""
+        try:
+            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                self.grid_loading_widget.hide()
+                self.grid_loading_widget.deleteLater()
+                self.grid_loading_widget = None
+                
+            if hasattr(self, 'grid_progress_bar'):
+                self.grid_progress_bar = None
+            if hasattr(self, 'grid_status_label'):
+                self.grid_status_label = None
+            if hasattr(self, 'grid_info_label'):
+                self.grid_info_label = None
+                
+            print("🔄 Grid loading indicator hidden")
+            
+        except Exception as e:
+            print(f"Error hiding grid loading indicator: {e}")
+
+    def show_thumbnail_loading_progress(self, page_num):
+        """Show ultra-minimal loading indicator for thumbnail navigation"""
+        # Close any existing mini loader
+        self.hide_mini_loading_indicator()
+        
+        # Create ultra-minimal thumbnail loading widget
+        self.thumb_loading_widget = QWidget(self)
+        self.thumb_loading_widget.setObjectName("thumbnailLoadingWidget")
+        self.thumb_loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(240, 240, 240, 120);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(100, 100, 100, 200);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(120, 120, 120, 220);
+                font-size: 9px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Create ultra-minimal layout
+        layout = QVBoxLayout(self.thumb_loading_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+        
+        # Page info - small grey text
+        page_info = f"Loading page {page_num + 1}"
+        self.thumb_page_label = QLabel(page_info)
+        self.thumb_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.thumb_page_label)
+        
+        # 1px progress line
+        self.thumb_progress_bar = QProgressBar()
+        self.thumb_progress_bar.setRange(0, 100)
+        self.thumb_progress_bar.setValue(0)
+        self.thumb_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
+        self.thumb_progress_bar.setTextVisible(False)
+        layout.addWidget(self.thumb_progress_bar)
+        
+        # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
+        self.thumb_loading_widget.setFixedSize(120, 20)
+        pdf_area_rect = self.pdf_container.geometry()
+        self.thumb_loading_widget.move(
+            pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
+            pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
+        )
+        
+        # Show widget
+        self.thumb_loading_widget.show()
+        self.thumb_loading_widget.raise_()
+        
+        # Start progress animation
+        self._animate_thumbnail_progress(0)
+        
+        print(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
+
+    def _animate_thumbnail_progress(self, value):
+        """Animate ultra-minimal thumbnail loading progress with rendering stages"""
+        try:
+            if hasattr(self, 'thumb_progress_bar') and self.thumb_progress_bar:
+                self.thumb_progress_bar.setValue(value)
+                
+                # Update progress message based on rendering stage
+                if hasattr(self, 'thumb_page_label') and value < 100:
+                    if value < 25:
+                        stage = "Loading..."
+                    elif value < 55:
+                        stage = "Rendering..."
+                    elif value < 85:
+                        stage = "Enhancing..."
+                    else:
+                        stage = "Finalizing..."
+                    
+                    current_text = self.thumb_page_label.text()
+                    if "Page" in current_text:
+                        page_part = current_text.split(" - ")[0] if " - " in current_text else current_text.split(":")[0]
+                        self.thumb_page_label.setText(f"{page_part} - {stage}")
+                
+                # Continue smooth animation
+                if value < 100:
+                    # Realistic rendering speed
+                    next_value = min(100, value + 2)
+                    QTimer.singleShot(70, lambda: self._animate_thumbnail_progress(next_value))
+                else:
+                    # Complete after brief delay - hide when fully loaded
+                    QTimer.singleShot(300, self._finish_thumbnail_loading)
+                    
+        except Exception as e:
+            print(f"Error animating thumbnail progress: {e}")
+
+    def _finish_thumbnail_loading(self):
+        """Finish thumbnail loading and hide progress"""
+        try:
+            if hasattr(self, 'thumb_progress_bar') and self.thumb_progress_bar:
+                self.thumb_progress_bar.setValue(100)
+            
+            # Hide after brief display
+            QTimer.singleShot(200, self.hide_thumbnail_loading_indicator)
+            
+        except Exception as e:
+            print(f"Error finishing thumbnail loading: {e}")
+
+    def hide_thumbnail_loading_indicator(self):
+        """Hide thumbnail loading indicator"""
+        try:
+            if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget:
+                self.thumb_loading_widget.hide()
+                self.thumb_loading_widget.deleteLater()
+                self.thumb_loading_widget = None
+                
+            if hasattr(self, 'thumb_progress_bar'):
+                self.thumb_progress_bar = None
+            if hasattr(self, 'thumb_page_label'):
+                self.thumb_page_label = None
+                
+            print("🔄 Thumbnail loading indicator hidden")
+            
+        except Exception as e:
+            print(f"Error hiding thumbnail loading indicator: {e}")
+
+    def resizeEvent(self, event):
+        """Enhanced resize event with all loading indicator repositioning"""
+        super().resizeEvent(event)
+        
+        # Reposition all loading indicators if visible
+        if hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and self.mini_loading_widget.isVisible():
+            self.mini_loading_widget.move(self.width() - 150, 10)
+            
+        if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and self.thumb_loading_widget.isVisible():
+            self.thumb_loading_widget.move(self.width() - 170, 10)
+            
+        if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and self.grid_loading_widget.isVisible():
+            self.grid_loading_widget.move(
+                (self.width() - 300) // 2,
+                (self.height() - 100) // 2
+            )
+
     def generate_thumbnails_deferred(self, force_new_pdf=False):
         """Generate thumbnails after main view is ready"""
         try:
@@ -5871,7 +6322,7 @@ Press 'L' to cycle through modes."""
             self.thumbnail_list.addItem(load_below_item)
     
     def thumbnail_clicked(self, item):
-        """Handle thumbnail click to navigate to page - INSTANT UI RESPONSE"""
+        """Handle thumbnail click to navigate to page with enhanced loading feedback"""
         if item:
             page_num = item.data(Qt.ItemDataRole.UserRole)
             
@@ -5880,28 +6331,36 @@ Press 'L' to cycle through modes."""
                 if hasattr(self, '_current_thumb_range'):
                     start_page, end_page = self._current_thumb_range
                     new_start = max(0, start_page - 20)  # Load 20 pages before
+                    # Show preloader for thumbnail expansion
+                    self.show_mini_loading_indicator("Loading earlier thumbnails...")
                     self.generate_thumbnails(around_page=(new_start + end_page) // 2, radius=25, preserve_scroll=True)
                 return
             elif page_num == -2:  # Load Later Pages
                 if hasattr(self, '_current_thumb_range'):
                     start_page, end_page = self._current_thumb_range
                     new_end = min(self.total_pages - 1, end_page + 20)  # Load 20 pages after
+                    # Show preloader for thumbnail expansion
+                    self.show_mini_loading_indicator("Loading later thumbnails...")
                     self.generate_thumbnails(around_page=(start_page + new_end) // 2, radius=25, preserve_scroll=True)
                 return
             
-            # Handle regular page navigation - IMMEDIATE UI RESPONSE
+            # Handle regular page navigation with comprehensive loading feedback
             if page_num is not None and 0 <= page_num < self.total_pages:
-                # Show loading progress for page navigation
-                self.show_thumbnail_loading_progress(page_num)
                 
                 if self.pdf_widget.grid_mode:
-                    # Grid mode: INSTANT navigation with immediate UI update
+                    # Grid mode: Show only grid loading feedback
                     pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
                     start_page = getattr(self, 'current_page', 0)
 
                     if not (start_page <= page_num < start_page + pages_needed):
-                        # INSTANT UI UPDATE: Switch grid immediately, queue rendering after
+                        # Grid navigation to different page set
                         new_start = min(max(0, page_num), max(0, self.total_pages - pages_needed))
+                        
+                        # Show comprehensive grid loading progress
+                        grid_size_text = f"{self.pdf_widget.grid_cols}x{self.pdf_widget.grid_rows}"
+                        self.show_grid_loading_progress(grid_size_text, page_num)
+                        
+                        # INSTANT UI UPDATE: Switch grid immediately, queue rendering after
                         self.current_page = new_start
                         self.update_page_label()
 
@@ -5918,6 +6377,9 @@ Press 'L' to cycle through modes."""
                     else:
                         # Page already visible - INSTANT zoom without rendering delay
                         self.pdf_widget.zoom_to_grid_page(page_num)
+                        
+                        # Hide loading, show focus feedback
+                        QTimer.singleShot(200, self.hide_mini_loading_indicator)
                         
                         # 🔍 QUALITY CHECK: Ensure texture quality matches zoom level
                         effective_zoom = self.pdf_widget.zoom_factor
@@ -5937,7 +6399,8 @@ Press 'L' to cycle through modes."""
                         if page_num not in self.pdf_widget.grid_textures:
                             self._queue_single_texture_deferred(page_num)
                 else:
-                    # Single-page mode: Use the simplified, more stable go_to_page
+                    # Single-page mode: Show thumbnail loading feedback and use go_to_page
+                    self.show_thumbnail_loading_progress(page_num)
                     self.go_to_page(page_num)
 
     def _queue_grid_textures_deferred(self, start_page, pages_needed, focus_page):
@@ -6061,6 +6524,11 @@ Press 'L' to cycle through modes."""
             
         # Update page number and label immediately
         self.current_page = page_num
+        
+        # Track page change timing for preloader logic
+        import time
+        self._last_page_change_time = time.time()
+        
         self.update_page_label()
         
         # Always clear any cached texture binding
@@ -6183,7 +6651,138 @@ Press 'L' to cycle through modes."""
                     # No texture - preload a fast one in background
                     self.renderer.add_page_to_queue(page_num, priority=False, quality=1.5)  # Very low quality for preloading
     
+    def _update_preloader_rendering_status(self, page_num: int, quality: float):
+        """Update preloaders with real-time rendering progress and quality status"""
+        try:
+            # Determine quality level description
+            if quality < 2.0:
+                quality_status = "Loading..."
+                progress_percent = int(quality * 25)  # 0-50%
+            elif quality < 3.0:
+                quality_status = "Rendering..."
+                progress_percent = int(50 + (quality - 2.0) * 25)  # 50-75%
+            elif quality < 4.0:
+                quality_status = "Enhancing..."
+                progress_percent = int(75 + (quality - 3.0) * 15)  # 75-90%
+            else:
+                quality_status = "Finalizing..."
+                progress_percent = min(100, int(90 + (quality - 4.0) * 10))  # 90-100%
+            
+            current_page = getattr(self, 'current_page', 0)
+            
+            # Update status bar with detailed rendering progress for current page
+            if page_num == current_page:
+                viewer = self.window() if hasattr(self, 'window') else self
+                if hasattr(viewer, 'status_bar'):
+                    # Get target quality to show progress
+                    target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                    quality_progress = min(100, int((quality / target_quality) * 100))
+                    
+                    # Show comprehensive status with multiple progress indicators
+                    zoom_percent = int(self.pdf_widget.zoom_factor * 100)
+                    page_display = f"Page {page_num + 1}/{self.total_pages}"
+                    zoom_display = f"Zoom: {zoom_percent}%"
+                    quality_display = f"Quality: {quality:.1f}/{target_quality:.1f}"
+                    progress_display = f"Progress: {quality_progress}%"
+                    
+                    status_msg = f"{page_display} | {zoom_display} | {quality_display} | {quality_status} {progress_display}"
+                    viewer.status_bar.showMessage(status_msg)
+            
+            # Update mini loading indicator if visible
+            if (hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and 
+                self.mini_loading_widget.isVisible() and hasattr(self, 'mini_message_label')):
+                if page_num == current_page:
+                    self.mini_message_label.setText(f"{quality_status} {progress_percent}%")
+                    
+            # Update thumbnail loading indicator if visible  
+            if (hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and 
+                self.thumb_loading_widget.isVisible() and hasattr(self, 'thumb_page_label')):
+                if page_num == current_page:
+                    self.thumb_page_label.setText(f"Page {page_num + 1} - {quality_status} {progress_percent}%")
+                    
+            # Update grid loading indicator if visible
+            if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
+                # For grid mode, check if this page is in current grid
+                if self.pdf_widget.grid_mode:
+                    pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                    start_page = current_page
+                    end_page = start_page + pages_needed
+                    if start_page <= page_num < end_page:
+                        progress = f"Page {page_num + 1}: {quality_status} {progress_percent}%"
+                        self.grid_info_label.setText(progress)
+            
+            # More intelligent preloader hiding - focus on actual quality achievement
+            if page_num == current_page:
+                # Get the target quality for current zoom level
+                target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                
+                # More strict quality requirements - must be close to target AND sharp enough
+                quality_is_good = quality >= max(4.0, target_quality * 0.9)  # At least 4.0 OR 90% of target
+                
+                # Additional check: ensure we're not in a loading state where more quality is expected
+                viewer = self.window()
+                recently_changed_page = False
+                if hasattr(viewer, '_last_page_change_time'):
+                    import time
+                    recently_changed_page = (time.time() - viewer._last_page_change_time) < 2.0
+                
+                # Only hide if quality is genuinely good AND we're not in middle of page transition
+                if quality_is_good and not recently_changed_page:
+                    # Still wait a bit to ensure no more improvements are coming
+                    QTimer.singleShot(500, self._hide_preloaders_on_quality_complete)
+                    # Also clear status bar after completion
+                    QTimer.singleShot(1000, self._clear_rendering_status_on_complete)
+                elif quality >= target_quality * 0.95 and quality >= 5.0:
+                    # For very high quality, hide faster
+                    QTimer.singleShot(200, self._hide_preloaders_on_quality_complete)
+                    QTimer.singleShot(700, self._clear_rendering_status_on_complete)
+                    
+        except Exception as e:
+            print(f"Error updating preloader rendering status: {e}")
+    
+    def _hide_preloaders_on_quality_complete(self):
+        """Hide preloaders when rendering reaches high quality"""
+        try:
+            # Hide mini loading indicator
+            if (hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and 
+                self.mini_loading_widget.isVisible()):
+                self.hide_mini_loading_indicator()
+                
+            # Hide thumbnail loading indicator  
+            if (hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and 
+                self.thumb_loading_widget.isVisible()):
+                self._finish_thumbnail_loading()
+                
+            # Hide grid loading indicator
+            if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                self.grid_loading_widget.isVisible()):
+                self._finish_grid_loading()
+                
+        except Exception as e:
+            print(f"Error hiding preloaders on quality complete: {e}")
+
+    def _clear_rendering_status_on_complete(self):
+        """Clear rendering status from status bar when rendering is complete"""
+        try:
+            viewer = self.window() if hasattr(self, 'window') else self
+            if hasattr(viewer, 'status_bar'):
+                # Show final status with completion
+                current_page = getattr(self, 'current_page', 0)
+                zoom_percent = int(self.pdf_widget.zoom_factor * 100)
+                page_display = f"Page {current_page + 1}/{self.total_pages}"
+                zoom_display = f"Zoom: {zoom_percent}%"
+                
+                final_status = f"{page_display} | {zoom_display} | Ready"
+                viewer.status_bar.showMessage(final_status, 3000)  # Show for 3 seconds then clear
+                
+        except Exception as e:
+            print(f"Error clearing rendering status: {e}")
+
     def on_page_rendered(self, page_num: int, image: QImage, quality: float = 2.0):
+        # Update preloaders with rendering progress
+        self._update_preloader_rendering_status(page_num, quality)
+        
         # Get actual page dimensions from PDF document for accurate aspect ratios
         page_width = image.width()
         page_height = image.height()
@@ -6214,8 +6813,11 @@ Press 'L' to cycle through modes."""
                         self.pdf_widget.grid_textures[page_num] = texture
                         self.pdf_widget.update()
                 else:
+                    # Single page mode: ALSO add to grid_textures for persistence during resize
                     if page_num == self.current_page:
                         self.pdf_widget.set_page_texture(texture, image.width(), image.height())
+                        # Add to grid_textures cache for resize persistence (same as grid mode)
+                        self.pdf_widget.grid_textures[page_num] = texture
             except AttributeError as e:
                 print(f"Warning: Texture cache method missing: {e}")
                 # Recreate texture cache if it's missing the add_texture method
@@ -6251,6 +6853,10 @@ Press 'L' to cycle through modes."""
             pass
     
     def prev_page(self):
+        """Navigate to previous page with loading feedback"""
+        # Show immediate status feedback
+        self.show_page_navigation_status("previous")
+        
         if self.pdf_widget.grid_mode:
             # In grid mode, move by grid size
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
@@ -6260,14 +6866,24 @@ Press 'L' to cycle through modes."""
             if self.current_page > 0:
                 new_page = self.current_page - 1
             else:
-                return  # Already at first page
+                # Already at first page
+                self.status_bar.showMessage("Already at first page", 1000)
+                return
         
-        # Show loading indicator
-        self.show_navigation_loading_progress("previous", new_page)
-        
+        # Update current page
         self.current_page = new_page
+        
+        # Track page change timing for preloader logic
+        import time
+        self._last_page_change_time = time.time()
+        
         self.update_page_label()
-        self.render_current_page()
+        
+        # Show mini loading indicator for page rendering
+        self.show_mini_loading_indicator("Rendering page...")
+        
+        # Render with feedback
+        QTimer.singleShot(10, self._render_page_with_feedback)
         
         # Update thumbnails around new current page if selective loading is enabled
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
@@ -6289,6 +6905,10 @@ Press 'L' to cycle through modes."""
                 self.renderer.add_page_to_queue(self.current_page + 1)
     
     def next_page(self):
+        """Navigate to next page with loading feedback"""
+        # Show immediate status feedback
+        self.show_page_navigation_status("next")
+        
         if self.pdf_widget.grid_mode:
             # In grid mode, move by grid size
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
@@ -6299,14 +6919,24 @@ Press 'L' to cycle through modes."""
             if self.current_page < self.total_pages - 1:
                 new_page = self.current_page + 1
             else:
-                return  # Already at last page
+                # Already at last page
+                self.status_bar.showMessage("Already at last page", 1000)
+                return
         
-        # Show loading indicator
-        self.show_navigation_loading_progress("next", new_page)
-        
+        # Update current page
         self.current_page = new_page
+        
+        # Track page change timing for preloader logic
+        import time
+        self._last_page_change_time = time.time()
+        
         self.update_page_label()
-        self.render_current_page()
+        
+        # Show mini loading indicator for page rendering
+        self.show_mini_loading_indicator("Rendering page...")
+        
+        # Render with feedback
+        QTimer.singleShot(10, self._render_page_with_feedback)
         
         # Update thumbnails around new current page if selective loading is enabled
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
@@ -6326,23 +6956,6 @@ Press 'L' to cycle through modes."""
                 self.renderer.add_page_to_queue(self.current_page - 1, priority=False, quality=1.5)  # Ultra-fast preload
             if self.current_page < self.total_pages - 1:
                 self.renderer.add_page_to_queue(self.current_page + 1, priority=False, quality=1.5)  # Ultra-fast preload
-    
-    def update_page_info(self):
-        """Update page-related UI elements"""
-        if hasattr(self, 'page_label') and self.page_label:
-            self.page_label.setText(f"Page: {self.current_page + 1} / {self.total_pages}")
-        
-        # Update window title
-        if self.pdf_path:
-            filename = os.path.basename(self.pdf_path)
-            self.setWindowTitle(f"GPU PDF Viewer - {filename} - Page {self.current_page + 1}/{self.total_pages}")
-        
-        # Update status bar
-        if hasattr(self, 'status_bar') and self.status_bar:
-            zoom_percent = int(self.pdf_widget.zoom_factor * 100) if hasattr(self, 'pdf_widget') else 100
-            quality = self.pdf_widget.get_zoom_adjusted_quality() if hasattr(self, 'pdf_widget') else 1.0
-            filename = os.path.basename(self.pdf_path) if self.pdf_path else "No file"
-            self.status_bar.showMessage(f"{filename} | Page {self.current_page + 1}/{self.total_pages} | Zoom: {zoom_percent}% | Quality: {quality:.1f}")
     
     def update_page_label(self):
         # Safety check: Ensure page_label exists before trying to update it
@@ -6472,10 +7085,7 @@ Press 'L' to cycle through modes."""
             if not current_text or current_text.strip() == "":
                 current_text = "2x2"  # Default
                 self.grid_size_combo.setCurrentText(current_text)
-            
-            # Show grid loading progress
-            self.show_grid_loading_progress(current_text)
-            
+                
             self.change_grid_size(current_text)
         else:
             # SWITCHING TO SINGLE PAGE MODE - ROBUST TRANSITION
@@ -6527,7 +7137,7 @@ Press 'L' to cycle through modes."""
             QTimer.singleShot(50, lambda: self.pdf_widget.update())
     
     def change_grid_size(self, size_text):
-        """Change the grid layout size"""
+        """Change the grid layout size with comprehensive loading feedback"""
         if not self.grid_view_action.isChecked():
             return
         
@@ -6562,9 +7172,8 @@ Press 'L' to cycle through modes."""
             self.pdf_widget.grid_cols = cols
             self.pdf_widget.grid_rows = rows
             
-            # Show loading progress for grid size change (only if not already showing)
-            if not hasattr(self, 'loading_widget') or not self.loading_widget:
-                self.show_grid_loading_progress(size_text)
+            # Show comprehensive grid loading progress
+            self.show_grid_loading_progress(size_text)
             
             # Recompute layout and trigger a repaint with placeholders while rendering happens
             try:
@@ -6649,7 +7258,7 @@ if __name__ == "__main__":
     # Load PDF from command line if provided (after window is shown)
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) and sys.argv[1].endswith('.pdf'):
         # Use QTimer with longer delay to ensure UI is fully set up before loading PDF
-        QTimer.singleShot(300, lambda: viewer.load_pdf_with_progress(sys.argv[1]))
+        QTimer.singleShot(300, lambda: viewer.load_pdf(sys.argv[1]))
     
     # Hide the menu bar as per the change request
     viewer.menuBar().hide()
