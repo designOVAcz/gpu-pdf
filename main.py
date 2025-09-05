@@ -4114,6 +4114,12 @@ Press 'L' to cycle through modes."""
         if not hasattr(self, '_normal_geometry'):
             self._normal_geometry = self.saveGeometry()
         
+        # Store current PDF position to prevent jumping
+        if hasattr(self, 'pdf_widget') and self.pdf_widget:
+            self._stored_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
+            self._stored_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
+            self._stored_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
+        
         # Enter fullscreen
         self.showFullScreen()
         
@@ -4123,9 +4129,87 @@ Press 'L' to cycle through modes."""
         # WORKAROUND: Single well-timed mouse click simulation
         QTimer.singleShot(300, self.simulate_click_workaround)
         
+        # Restore PDF position after fullscreen transition
+        QTimer.singleShot(400, self._restore_fullscreen_position)
+        
         # Show helpful message
         if hasattr(self, 'status_bar'):
             self.status_bar.showMessage("Fullscreen Mode: Press F11 or Esc to exit, drag top area to move", 4000)
+    
+    def _restore_fullscreen_position(self):
+        """Restore PDF position after fullscreen transition"""
+        try:
+            if (hasattr(self, '_stored_zoom') and hasattr(self, 'pdf_widget') and self.pdf_widget):
+                print(f"🔧 RESTORING FULLSCREEN POSITION: zoom={self._stored_zoom:.2f}")
+                
+                # Restore zoom and pan position
+                if hasattr(self.pdf_widget, 'zoom_level'):
+                    self.pdf_widget.zoom_level = self._stored_zoom
+                if hasattr(self.pdf_widget, 'pan_x'):
+                    self.pdf_widget.pan_x = self._stored_pan_x
+                if hasattr(self.pdf_widget, 'pan_y'):
+                    self.pdf_widget.pan_y = self._stored_pan_y
+                
+                # Update display
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                
+        except Exception as e:
+            print(f"⚠️ Error restoring fullscreen position: {e}")
+    
+    def simulate_resize_click_workaround(self):
+        """WORKAROUND: Force OpenGL repaint after resize through mouse event simulation"""
+        if not hasattr(self, 'pdf_widget'):
+            return
+            
+        try:
+            print("🔧 RESIZE WORKAROUND: Simulating mouse click to fix white screen after resize...")
+            
+            # Get the center of the PDF widget
+            widget_center = self.pdf_widget.rect().center()
+            global_pos = self.pdf_widget.mapToGlobal(widget_center)
+            
+            # Convert QPoint to QPointF for mouse events
+            local_pos = QPointF(widget_center)
+            global_pos_f = QPointF(global_pos)
+            
+            # Create actual mouse press and release events
+            press_event = QMouseEvent(
+                QMouseEvent.Type.MouseButtonPress,
+                local_pos,
+                global_pos_f,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier
+            )
+            
+            release_event = QMouseEvent(
+                QMouseEvent.Type.MouseButtonRelease,
+                local_pos,
+                global_pos_f,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier
+            )
+            
+            # Send the actual mouse events
+            QApplication.postEvent(self.pdf_widget, press_event)
+            QApplication.processEvents()
+            
+            # Small delay between press and release
+            QTimer.singleShot(10, lambda: [
+                QApplication.postEvent(self.pdf_widget, release_event),
+                QApplication.processEvents()
+            ])
+            
+            print("✓ Resize mouse click simulation executed")
+            
+        except Exception as e:
+            print(f"✗ Error in resize mouse click simulation: {e}")
+            # Fallback to simple update
+            if hasattr(self, 'pdf_widget'):
+                self.pdf_widget.update()
+                QApplication.processEvents()
     
     def simulate_click_workaround(self):
         """WORKAROUND: Force OpenGL repaint through actual mouse event simulation"""
@@ -4301,6 +4385,12 @@ Press 'L' to cycle through modes."""
     
     def exit_fullscreen(self):
         """Exit fullscreen mode with mouse click simulation workaround"""
+        # Store current fullscreen position
+        if hasattr(self, 'pdf_widget') and self.pdf_widget:
+            current_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
+            current_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
+            current_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
+        
         # Remove fullscreen overlay
         if hasattr(self, '_fullscreen_overlay'):
             self._fullscreen_overlay.hide()
@@ -4316,6 +4406,10 @@ Press 'L' to cycle through modes."""
         
         # WORKAROUND: Single well-timed mouse click simulation
         QTimer.singleShot(300, self.simulate_click_workaround)
+        
+        # Restore PDF position after normal window transition
+        if 'current_zoom' in locals():
+            QTimer.singleShot(400, lambda: self._restore_pdf_position(current_zoom, current_pan_x, current_pan_y))
     
     def create_fullscreen_overlay(self):
         """Create a small overlay with window controls in fullscreen mode"""
@@ -4412,18 +4506,58 @@ Press 'L' to cycle through modes."""
             # Reposition overlay at top-right
             self._fullscreen_overlay.move(self.width() - 310, 10)
         
-        # Force content refresh on significant size changes (like fullscreen transitions)
+        # Smart resize handling to prevent excessive workarounds and position jumping
         if hasattr(self, 'pdf_widget') and self.pdf_widget and event.size().isValid():
             old_size = event.oldSize()
             new_size = event.size()
             
-            # Check if this is a significant size change (like fullscreen toggle)
+            # Only process significant size changes to reduce excessive calls
             if (old_size.isValid() and 
-                (abs(new_size.width() - old_size.width()) > 200 or 
-                 abs(new_size.height() - old_size.height()) > 200)):
+                (abs(new_size.width() - old_size.width()) > 20 or 
+                 abs(new_size.height() - old_size.height()) > 20)):
                 
-                # Trigger content refresh with a small delay
+                print(f"🔧 SIGNIFICANT RESIZE: {old_size.width()}x{old_size.height()} → {new_size.width()}x{new_size.height()}")
+                
+                # Store current PDF state to prevent position jumping
+                current_zoom = getattr(self.pdf_widget, 'zoom_level', 1.0)
+                current_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
+                current_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
+                
+                # Immediate content refresh while preserving position
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                
+                # Single, well-timed workaround instead of multiple calls
+                QTimer.singleShot(150, self.simulate_resize_click_workaround)
+                
+                # Restore PDF position after a brief delay
+                QTimer.singleShot(200, lambda: self._restore_pdf_position(current_zoom, current_pan_x, current_pan_y))
+                
+                # Also trigger regular content refresh
                 QTimer.singleShot(25, self._refresh_content_after_resize)
+    
+    def _restore_pdf_position(self, zoom, pan_x, pan_y):
+        """Restore PDF position and zoom after resize to prevent jumping"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                print(f"🔧 RESTORING PDF POSITION: zoom={zoom:.2f}, pan=({pan_x:.1f}, {pan_y:.1f})")
+                
+                # Restore zoom level
+                if hasattr(self.pdf_widget, 'zoom_level'):
+                    self.pdf_widget.zoom_level = zoom
+                
+                # Restore pan position
+                if hasattr(self.pdf_widget, 'pan_x'):
+                    self.pdf_widget.pan_x = pan_x
+                if hasattr(self.pdf_widget, 'pan_y'):
+                    self.pdf_widget.pan_y = pan_y
+                
+                # Update the display with restored position
+                self.pdf_widget.update()
+                QApplication.processEvents()
+                
+        except Exception as e:
+            print(f"⚠️ Error restoring PDF position: {e}")
     
     def _refresh_content_after_resize(self):
         """Refresh PDF content after significant window size changes"""
@@ -4510,11 +4644,18 @@ Press 'L' to cycle through modes."""
     
     def load_pdf_with_progress(self, file_path):
         """Load PDF with minimal progress indicator"""
+        # Close any existing loading widget first
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.close_loading_widget()
+            QApplication.processEvents()
+        
         # Create minimal loading widget - thin line with text
         self.loading_widget = QWidget(self)
+        self.loading_widget.setObjectName("pdfLoadingWidget")
         self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.loading_widget.raise_()  # Bring to front
         
         # Style the loading widget - very minimal light grey with white text
         self.loading_widget.setStyleSheet("""
@@ -4572,16 +4713,19 @@ Press 'L' to cycle through modes."""
     def center_loading_widget(self):
         """Center the loading widget on the main window (both horizontally and vertically)"""
         if hasattr(self, 'loading_widget') and self.loading_widget:
-            # Get current main window geometry
+            # Get current main window geometry and size
             main_rect = self.geometry()
+            main_size = self.size()
             loading_size = self.loading_widget.size()
             
-            # Calculate center position
-            x = main_rect.x() + (main_rect.width() - loading_size.width()) // 2
-            y = main_rect.y() + (main_rect.height() - loading_size.height()) // 2
+            # Calculate center position relative to main window
+            # Since the loading widget is a child of self, we use relative positioning
+            x = (main_size.width() - loading_size.width()) // 2
+            y = (main_size.height() - loading_size.height()) // 2
             
-            # Move to center position
+            # Move to center position (relative to parent)
             self.loading_widget.move(x, y)
+            print(f"📍 Loading widget positioned at ({x}, {y}) in window {main_size.width()}x{main_size.height()}")
     
     def load_pdf_step_by_step(self, file_path):
         """Load PDF in steps with progress updates"""
@@ -4726,6 +4870,9 @@ Press 'L' to cycle through modes."""
         # Close loading widget after a brief delay
         QTimer.singleShot(800, self.close_loading_widget)
         
+        # Backup force cleanup in case the normal close fails
+        QTimer.singleShot(2000, self.force_cleanup_loading_widget)
+        
         # Show completion message in status bar
         filename = os.path.basename(self.pdf_path)
         self.status_bar.showMessage(f"✓ Loaded: {filename} - {self.total_pages} pages, {self.thumbnails_generated} thumbnails generated", 5000)
@@ -4742,22 +4889,76 @@ Press 'L' to cycle through modes."""
     
     def close_loading_widget(self):
         """Close the loading widget"""
-        if hasattr(self, 'loading_widget') and self.loading_widget:
-            self.loading_widget.hide()
-            self.loading_widget.deleteLater()
+        try:
+            if hasattr(self, 'loading_widget') and self.loading_widget:
+                print("🔧 Closing loading widget...")
+                self.loading_widget.hide()
+                self.loading_widget.deleteLater()
+                self.loading_widget = None
+                print("✓ Loading widget closed")
+            if hasattr(self, 'loading_label'):
+                self.loading_label = None
+            if hasattr(self, 'progress_bar'):
+                self.progress_bar = None
+        except Exception as e:
+            print(f"✗ Error closing loading widget: {e}")
+            # Force cleanup
+            if hasattr(self, 'loading_widget'):
+                self.loading_widget = None
+            if hasattr(self, 'loading_label'):
+                self.loading_label = None
+            if hasattr(self, 'progress_bar'):
+                self.progress_bar = None
+    
+    def force_cleanup_loading_widget(self):
+        """Force cleanup of any persistent loading widgets"""
+        print("🔧 FORCE CLEANUP: Checking for persistent loading widgets...")
+        try:
+            # Find and remove any loading widgets that might be stuck
+            loading_widget_names = ["pdfLoadingWidget", "gridLoadingWidget", "thumbnailLoadingWidget", "navigationLoadingWidget"]
+            for child in self.findChildren(QWidget):
+                if hasattr(child, 'objectName') and child.objectName() in loading_widget_names:
+                    print(f"🔧 FORCE CLEANUP: Removing persistent widget: {child.objectName()}")
+                    child.hide()
+                    child.deleteLater()
+            
+            # Also check for widgets with 'loading' in their object name (generic backup)
+            for child in self.findChildren(QWidget):
+                if hasattr(child, 'objectName') and 'loading' in child.objectName().lower():
+                    print(f"🔧 FORCE CLEANUP: Removing generic loading widget: {child}")
+                    child.hide()
+                    child.deleteLater()
+            
+            # Clear all loading widget references
             self.loading_widget = None
-        if hasattr(self, 'loading_label'):
             self.loading_label = None
-        if hasattr(self, 'progress_bar'):
             self.progress_bar = None
+            if hasattr(self, 'loading_progress_bar'):
+                self.loading_progress_bar = None
+            if hasattr(self, 'loading_timer'):
+                if self.loading_timer:
+                    self.loading_timer.stop()
+                self.loading_timer = None
+            
+            print("✓ FORCE CLEANUP: Complete")
+            
+        except Exception as e:
+            print(f"✗ FORCE CLEANUP ERROR: {e}")
     
     def show_grid_loading_progress(self, grid_size):
         """Show minimal loading indicator for grid processing"""
+        # Close any existing loading widget first
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.close_loading_widget()
+            QApplication.processEvents()
+        
         # Create minimal loading widget
         self.loading_widget = QWidget(self)
+        self.loading_widget.setObjectName("gridLoadingWidget")
         self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.loading_widget.raise_()  # Bring to front
         
         # Style the loading widget - very minimal light grey with grey text
         self.loading_widget.setStyleSheet("""
@@ -4838,11 +5039,18 @@ Press 'L' to cycle through modes."""
     
     def show_thumbnail_loading_progress(self, page_num):
         """Show minimal loading indicator for thumbnail navigation"""
+        # Close any existing loading widget first
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.close_loading_widget()
+            QApplication.processEvents()
+        
         # Create minimal loading widget
         self.loading_widget = QWidget(self)
+        self.loading_widget.setObjectName("thumbnailLoadingWidget")
         self.loading_widget.setFixedSize(300, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.loading_widget.raise_()  # Bring to front
         
         # Style the loading widget - very minimal light grey with grey text
         self.loading_widget.setStyleSheet("""
@@ -4923,11 +5131,18 @@ Press 'L' to cycle through modes."""
     
     def show_navigation_loading_progress(self, direction, page_num):
         """Show minimal loading indicator for page navigation (next/prev)"""
+        # Close any existing loading widget first
+        if hasattr(self, 'loading_widget') and self.loading_widget:
+            self.close_loading_widget()
+            QApplication.processEvents()
+        
         # Create minimal loading widget
         self.loading_widget = QWidget(self)
+        self.loading_widget.setObjectName("navigationLoadingWidget")
         self.loading_widget.setFixedSize(250, 25)
-        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.loading_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.loading_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.loading_widget.raise_()  # Bring to front
         
         # Style the loading widget - very minimal light grey with grey text
         self.loading_widget.setStyleSheet("""
@@ -5004,6 +5219,9 @@ Press 'L' to cycle through modes."""
         if hasattr(self, 'progress_bar') and self.progress_bar:
             self.progress_bar.setValue(100)
         QTimer.singleShot(100, self.close_loading_widget)
+        
+        # Backup force cleanup
+        QTimer.singleShot(1000, self.force_cleanup_loading_widget)
     
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
         try:
