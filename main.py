@@ -3997,7 +3997,7 @@ Press F12 to refresh stats"""
     def create_left_panel(self):
         """Create the left panel with thumbnails"""
         panel = QWidget()
-        panel.setFixedWidth(200)
+        panel.setFixedWidth(180)
         panel.setStyleSheet("""
             QWidget { 
                 background-color: rgb(38, 38, 38); 
@@ -5465,6 +5465,16 @@ Press 'L' to cycle through modes."""
             # Start progress animation
             self._animate_mini_progress(0)
             
+            # FIXED: Add automatic timeout to prevent stuck mini preloaders
+            if not hasattr(self, '_mini_timeout_timer'):
+                self._mini_timeout_timer = QTimer()
+                self._mini_timeout_timer.setSingleShot(True)
+                self._mini_timeout_timer.timeout.connect(self._force_hide_mini_preloader_on_timeout)
+            
+            # Set timeout for 2 seconds from last operation
+            self._mini_timeout_timer.start(2000)
+            print(f"⏱️ Mini preloader timeout set for 2 seconds")
+            
             print(f"🔄 Ultra-minimal 1px loading indicator shown: {message}")
             
         except Exception as e:
@@ -5509,6 +5519,10 @@ Press 'L' to cycle through modes."""
     def hide_mini_loading_indicator(self):
         """Hide mini loading indicator"""
         try:
+            # Stop any timeout timer
+            if hasattr(self, '_mini_timeout_timer'):
+                self._mini_timeout_timer.stop()
+                
             if hasattr(self, 'mini_loading_timer') and self.mini_loading_timer:
                 self.mini_loading_timer.stop()
                 self.mini_loading_timer = None
@@ -5527,6 +5541,14 @@ Press 'L' to cycle through modes."""
             
         except Exception as e:
             print(f"Error hiding mini loading indicator: {e}")
+
+    def _force_hide_mini_preloader_on_timeout(self):
+        """Force hide mini preloader after timeout to prevent stuck preloaders"""
+        try:
+            print("⏰ TIMEOUT: Force hiding mini preloader after 2 seconds")
+            self.hide_mini_loading_indicator()
+        except Exception as e:
+            print(f"Error in mini preloader timeout: {e}")
 
     def _render_page_with_feedback(self):
         """Render current page and hide loading indicator when done"""
@@ -5614,6 +5636,16 @@ Press 'L' to cycle through modes."""
         # Start progress animation
         self._animate_grid_progress(0)
         
+        # FIXED: Add automatic timeout to prevent stuck preloaders
+        if not hasattr(self, '_grid_timeout_timer'):
+            self._grid_timeout_timer = QTimer()
+            self._grid_timeout_timer.setSingleShot(True)
+            self._grid_timeout_timer.timeout.connect(self._force_hide_grid_preloader_on_timeout)
+        
+        # Set timeout for 3 seconds from last operation
+        self._grid_timeout_timer.start(3000)
+        print(f"⏱️ Grid preloader timeout set for 3 seconds")
+        
         print(f"🔄 Ultra-minimal grid loading indicator shown: {grid_info}")
 
     def _position_grid_loading_widget(self):
@@ -5681,6 +5713,10 @@ Press 'L' to cycle through modes."""
     def hide_grid_loading_indicator(self):
         """Hide grid loading indicator"""
         try:
+            # Stop any timeout timer
+            if hasattr(self, '_grid_timeout_timer'):
+                self._grid_timeout_timer.stop()
+                
             if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
                 self.grid_loading_widget.hide()
                 self.grid_loading_widget.deleteLater()
@@ -5698,70 +5734,13 @@ Press 'L' to cycle through modes."""
         except Exception as e:
             print(f"Error hiding grid loading indicator: {e}")
 
-    def show_thumbnail_loading_progress(self, page_num):
-        """Show ultra-minimal loading indicator for thumbnail navigation"""
-        # Close any existing mini loader
-        self.hide_mini_loading_indicator()
-        
-        # Create ultra-minimal thumbnail loading widget
-        self.thumb_loading_widget = QWidget(self)
-        self.thumb_loading_widget.setObjectName("thumbnailLoadingWidget")
-        self.thumb_loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-            }
-            QProgressBar {
-                border: none;
-                background-color: rgba(240, 240, 240, 120);
-                border-radius: 0px;
-            }
-            QProgressBar::chunk {
-                background-color: rgba(100, 100, 100, 200);
-                border-radius: 0px;
-            }
-            QLabel {
-                color: rgba(120, 120, 120, 220);
-                font-size: 9px;
-                font-weight: normal;
-                background: transparent;
-            }
-        """)
-        
-        # Create ultra-minimal layout
-        layout = QVBoxLayout(self.thumb_loading_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
-        
-        # Page info - small grey text
-        page_info = f"Loading page {page_num + 1}"
-        self.thumb_page_label = QLabel(page_info)
-        self.thumb_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.thumb_page_label)
-        
-        # 1px progress line
-        self.thumb_progress_bar = QProgressBar()
-        self.thumb_progress_bar.setRange(0, 100)
-        self.thumb_progress_bar.setValue(0)
-        self.thumb_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
-        self.thumb_progress_bar.setTextVisible(False)
-        layout.addWidget(self.thumb_progress_bar)
-        
-        # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
-        self.thumb_loading_widget.setFixedSize(120, 20)
-        pdf_area_rect = self.pdf_container.geometry()
-        self.thumb_loading_widget.move(
-            pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
-            pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
-        )
-        
-        # Show widget
-        self.thumb_loading_widget.show()
-        self.thumb_loading_widget.raise_()
-        
-        # Start progress animation
-        self._animate_thumbnail_progress(0)
-        
-        print(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
+    def _force_hide_grid_preloader_on_timeout(self):
+        """Force hide grid preloader after timeout to prevent stuck preloaders"""
+        try:
+            print("⏰ TIMEOUT: Force hiding grid preloader after 3 seconds")
+            self.hide_grid_loading_indicator()
+        except Exception as e:
+            print(f"Error in grid preloader timeout: {e}")
 
     def _animate_thumbnail_progress(self, value):
         """Animate ultra-minimal thumbnail loading progress with rendering stages"""
@@ -5812,6 +5791,10 @@ Press 'L' to cycle through modes."""
     def hide_thumbnail_loading_indicator(self):
         """Hide thumbnail loading indicator"""
         try:
+            # Stop any timeout timer
+            if hasattr(self, '_thumb_timeout_timer'):
+                self._thumb_timeout_timer.stop()
+                
             if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget:
                 self.thumb_loading_widget.hide()
                 self.thumb_loading_widget.deleteLater()
@@ -5826,6 +5809,172 @@ Press 'L' to cycle through modes."""
             
         except Exception as e:
             print(f"Error hiding thumbnail loading indicator: {e}")
+
+    def _force_hide_thumb_preloader_on_timeout(self):
+        """Force hide thumbnail preloader after timeout to prevent stuck preloaders"""
+        try:
+            print("⏰ TIMEOUT: Force hiding thumbnail preloader after 2.5 seconds")
+            self.hide_thumbnail_loading_indicator()
+        except Exception as e:
+            print(f"Error in thumbnail preloader timeout: {e}")
+
+    def show_thumbnail_loading_progress(self, progress, total=None, message="Loading thumbnails..."):
+        """Show thumbnail loading progress with progress value and total"""
+        # If only one parameter is passed (old method), handle it as page number
+        if isinstance(progress, int) and total is None:
+            page_num = progress
+            # Close any existing mini loader
+            self.hide_mini_loading_indicator()
+            
+            # Create ultra-minimal thumbnail loading widget
+            self.thumb_loading_widget = QWidget(self)
+            self.thumb_loading_widget.setObjectName("thumbnailLoadingWidget")
+            self.thumb_loading_widget.setStyleSheet("""
+                QWidget {
+                    background-color: transparent;
+                }
+                QProgressBar {
+                    border: none;
+                    background-color: rgba(240, 240, 240, 120);
+                    border-radius: 0px;
+                }
+                QProgressBar::chunk {
+                    background-color: rgba(100, 100, 100, 200);
+                    border-radius: 0px;
+                }
+                QLabel {
+                    color: rgba(120, 120, 120, 220);
+                    font-size: 9px;
+                    font-weight: normal;
+                    background: transparent;
+                }
+            """)
+            
+            # Create ultra-minimal layout
+            layout = QVBoxLayout(self.thumb_loading_widget)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(3)
+            
+            # Page info - small grey text
+            page_info = f"Loading page {page_num + 1}"
+            self.thumb_page_label = QLabel(page_info)
+            self.thumb_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(self.thumb_page_label)
+            
+            # 1px progress line
+            self.thumb_progress_bar = QProgressBar()
+            self.thumb_progress_bar.setRange(0, 100)
+            self.thumb_progress_bar.setValue(0)
+            self.thumb_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
+            self.thumb_progress_bar.setTextVisible(False)
+            layout.addWidget(self.thumb_progress_bar)
+            
+            # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
+            self.thumb_loading_widget.setFixedSize(120, 20)
+            pdf_area_rect = self.pdf_container.geometry()
+            self.thumb_loading_widget.move(
+                pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
+                pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
+            )
+            
+            # Show widget
+            self.thumb_loading_widget.show()
+            self.thumb_loading_widget.raise_()
+            
+            # Start progress animation
+            self._animate_thumbnail_progress(0)
+            
+            # FIXED: Add automatic timeout to prevent stuck thumbnail preloaders
+            if not hasattr(self, '_thumb_timeout_timer'):
+                self._thumb_timeout_timer = QTimer()
+                self._thumb_timeout_timer.setSingleShot(True)
+                self._thumb_timeout_timer.timeout.connect(self._force_hide_thumb_preloader_on_timeout)
+            
+            # Set timeout for 2.5 seconds from last operation
+            self._thumb_timeout_timer.start(2500)
+            print(f"⏱️ Thumbnail preloader timeout set for 2.5 seconds")
+            
+            print(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
+            return
+        
+        # New batch processing method
+        # Close any existing loading indicators
+        self.hide_mini_loading_indicator()
+        self.hide_thumbnail_loading_indicator()
+        
+        # Create batch loading widget
+        self.thumb_loading_widget = QWidget(self)
+        self.thumb_loading_widget.setObjectName("thumbnailBatchLoadingWidget")
+        self.thumb_loading_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+            }
+            QProgressBar {
+                border: none;
+                background-color: rgba(240, 240, 240, 120);
+                border-radius: 0px;
+            }
+            QProgressBar::chunk {
+                background-color: rgba(100, 100, 100, 200);
+                border-radius: 0px;
+            }
+            QLabel {
+                color: rgba(120, 120, 120, 220);
+                font-size: 9px;
+                font-weight: normal;
+                background: transparent;
+            }
+        """)
+        
+        # Create layout
+        layout = QVBoxLayout(self.thumb_loading_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+        
+        # Progress info - small grey text
+        self.thumb_page_label = QLabel(message)
+        self.thumb_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.thumb_page_label)
+        
+        # Progress bar
+        self.thumb_progress_bar = QProgressBar()
+        self.thumb_progress_bar.setRange(0, 100)
+        self.thumb_progress_bar.setValue(int(progress))
+        self.thumb_progress_bar.setFixedHeight(1)  # Ultra-thin 1px line
+        self.thumb_progress_bar.setTextVisible(False)
+        layout.addWidget(self.thumb_progress_bar)
+        
+        # Ultra-compact size and center in PDF viewing area
+        self.thumb_loading_widget.setFixedSize(140, 20)
+        pdf_area_rect = self.pdf_container.geometry()
+        self.thumb_loading_widget.move(
+            pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2,
+            pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
+        )
+        
+        # Show widget
+        self.thumb_loading_widget.show()
+        self.thumb_loading_widget.raise_()
+        
+        print(f"🔄 Batch thumbnail loading: {progress:.1f}% - {message}")
+
+    def _update_thumbnail_progress(self, progress, message="Loading..."):
+        """Update batch thumbnail loading progress"""
+        try:
+            if hasattr(self, 'thumb_progress_bar') and self.thumb_progress_bar:
+                self.thumb_progress_bar.setValue(int(progress))
+            
+            if hasattr(self, 'thumb_page_label') and self.thumb_page_label:
+                self.thumb_page_label.setText(message)
+                
+            # Update status bar as well
+            self.status_bar.showMessage(f"{message} ({progress:.1f}%)")
+        except Exception as e:
+            print(f"Error updating thumbnail progress: {e}")
+
+    def hide_thumbnail_loading_progress(self):
+        """Hide thumbnail loading progress indicator"""
+        self.hide_thumbnail_loading_indicator()
 
     def resizeEvent(self, event):
         """Enhanced resize event with all loading indicator repositioning"""
@@ -6151,7 +6300,7 @@ Press 'L' to cycle through modes."""
                 
                 if pages_to_add:
                     # Load additional thumbnails without clearing existing ones
-                    self._load_additional_thumbnails(pages_to_add)
+                    self._load_additional_thumbnails_batched(pages_to_add)
                     return
             else:
                 # Clear existing thumbnails for full reload
@@ -6165,9 +6314,96 @@ Press 'L' to cycle through modes."""
             if self._selective_thumbnails_enabled or force_clear:
                 self._create_placeholder_thumbnails(start_page, end_page)
             
-            # Start a worker thread to generate real thumbnails and emit signals safely
-            if self.thumbnail_worker:
-                # Properly disconnect signals before stopping
+            # Stop any existing batch processing
+            self._stop_batch_processing()
+            
+            # Create page list for batch processing
+            pages_to_load = list(range(start_page, end_page + 1))
+            
+            # Determine if we need batch processing for large sets
+            total_pages = len(pages_to_load)
+            if total_pages > 25:  # Use batch processing for large thumbnail sets
+                print(f"🔄 Starting batch processing for {total_pages} thumbnails")
+                self._start_batch_thumbnail_generation(pages_to_load, current_scroll_pos)
+            else:
+                # Use original worker for small sets
+                self._start_traditional_thumbnail_generation(pages_to_load, current_scroll_pos, start_page, end_page)
+            
+        except Exception as e:
+            print(f"Error starting thumbnail generation: {e}")
+    
+    def _stop_batch_processing(self):
+        """Stop any existing batch processing"""
+        # Stop batch timer
+        if hasattr(self, '_batch_timer') and self._batch_timer:
+            self._batch_timer.stop()
+            self._batch_timer = None
+        
+        # Clear batch data
+        self._batch_pages = []
+        self._batch_index = 0
+        self._batch_scroll_pos = None
+        
+        # Stop existing worker
+        if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+            try:
+                self.thumbnail_worker.thumbnailReady.disconnect()
+                self.thumbnail_worker.finished.disconnect()
+            except:
+                pass
+            self.thumbnail_worker.stop()
+            self.thumbnail_worker.wait()
+    
+    def _start_batch_thumbnail_generation(self, pages_to_load, current_scroll_pos):
+        """Start batch-based thumbnail generation for large sets"""
+        # Initialize batch processing variables
+        self._batch_pages = pages_to_load
+        self._batch_index = 0
+        self._batch_scroll_pos = current_scroll_pos
+        self._batch_size = 8  # Process 8 thumbnails per batch
+        self._batch_delay = 50  # 50ms delay between batches (20 batches per second)
+        
+        total_batches = (len(pages_to_load) + self._batch_size - 1) // self._batch_size
+        print(f"🚀 Starting batch processing: {len(pages_to_load)} pages in {total_batches} batches")
+        
+        # Show batch loading progress
+        self.show_thumbnail_loading_progress(0, len(pages_to_load), "Batch loading thumbnails...")
+        
+        # Initialize batch timer
+        if not hasattr(self, '_batch_timer') or not self._batch_timer:
+            self._batch_timer = QTimer()
+            self._batch_timer.setSingleShot(True)  # Important: single shot timer
+            self._batch_timer.timeout.connect(self._process_next_thumbnail_batch)
+        
+        # Start processing first batch immediately
+        print("📦 Starting first batch immediately...")
+        self._process_next_thumbnail_batch()
+    
+    def _process_next_thumbnail_batch(self):
+        """Process the next batch of thumbnails"""
+        try:
+            if not hasattr(self, '_batch_pages') or self._batch_index >= len(self._batch_pages):
+                # All batches completed
+                print(f"✅ Batch processing completed - processed {self._batch_index} thumbnails")
+                self._finish_batch_processing()
+                return
+            
+            # Calculate current batch
+            start_idx = self._batch_index
+            end_idx = min(start_idx + self._batch_size, len(self._batch_pages))
+            current_batch = self._batch_pages[start_idx:end_idx]
+            
+            # Update progress
+            progress = (self._batch_index / len(self._batch_pages)) * 100
+            remaining = len(self._batch_pages) - self._batch_index
+            batch_num = self._batch_index // self._batch_size + 1
+            total_batches = (len(self._batch_pages) + self._batch_size - 1) // self._batch_size
+            self._update_thumbnail_progress(progress, f"Batch {batch_num}/{total_batches}, {remaining} remaining...")
+            
+            print(f"🔄 Processing batch {batch_num}/{total_batches}: pages {current_batch} (index: {self._batch_index}/{len(self._batch_pages)})")
+            
+            # Process current batch
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
                 try:
                     self.thumbnail_worker.thumbnailReady.disconnect()
                     self.thumbnail_worker.finished.disconnect()
@@ -6176,26 +6412,96 @@ Press 'L' to cycle through modes."""
                 self.thumbnail_worker.stop()
                 self.thumbnail_worker.wait()
             
-            # Create worker with limited page range and GPU widget reference
-            pages_to_load = list(range(start_page, end_page + 1))
+            # Create worker for current batch
             self.thumbnail_worker = ThumbnailWorker(
-                self.pdf_doc, 
-                page_list=pages_to_load, 
-                limit=len(pages_to_load), 
+                self.pdf_doc,
+                page_list=current_batch,
+                limit=len(current_batch),
                 parent=self,
-                gpu_widget=self.pdf_widget  # Pass GPU widget for texture cache access
+                gpu_widget=self.pdf_widget
             )
             self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
-            self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(current_scroll_pos))
+            self.thumbnail_worker.finished.connect(self._on_batch_finished)
             
-            if self._selective_thumbnails_enabled:
-                self.status_bar.showMessage(f"Loading thumbnails {start_page+1}-{end_page+1}...")
-            else:
-                self.status_bar.showMessage("Loading thumbnails...")
-            
+            # Start worker for current batch
             self.thumbnail_worker.start()
+            
+            # Update batch index AFTER starting the worker
+            self._batch_index = end_idx
+            
         except Exception as e:
-            print(f"Error starting thumbnail generation: {e}")
+            print(f"Error processing thumbnail batch: {e}")
+            self._finish_batch_processing()
+    
+    def _on_batch_finished(self):
+        """Handle completion of a single batch"""
+        print(f"📦 Batch finished, scheduling next batch in {self._batch_delay}ms...")
+        # Schedule next batch with delay for UI responsiveness
+        if hasattr(self, '_batch_timer') and self._batch_timer:
+            self._batch_timer.setSingleShot(True)  # Ensure single shot
+            self._batch_timer.start(self._batch_delay)
+        else:
+            print("⚠️ Warning: Batch timer not available, starting next batch immediately")
+            QTimer.singleShot(self._batch_delay, self._process_next_thumbnail_batch)
+    
+    def _finish_batch_processing(self):
+        """Complete batch processing and cleanup"""
+        try:
+            # Stop timer
+            if hasattr(self, '_batch_timer') and self._batch_timer:
+                self._batch_timer.stop()
+            
+            # Hide progress indicators
+            self.hide_thumbnail_loading_progress()
+            
+            # Restore scroll position if needed
+            if self._batch_scroll_pos is not None:
+                QTimer.singleShot(100, lambda: self.thumbnail_list.verticalScrollBar().setValue(self._batch_scroll_pos))
+            
+            # Update status
+            total_loaded = len(self._batch_pages) if hasattr(self, '_batch_pages') else 0
+            self.status_bar.showMessage(f"Loaded {total_loaded} thumbnails in batches", 2000)
+            
+            print(f"✅ Batch processing completed - {total_loaded} thumbnails loaded")
+            
+            # Clear batch data
+            self._batch_pages = []
+            self._batch_index = 0
+            self._batch_scroll_pos = None
+            
+        except Exception as e:
+            print(f"Error finishing batch processing: {e}")
+    
+    def _start_traditional_thumbnail_generation(self, pages_to_load, current_scroll_pos, start_page, end_page):
+        """Start traditional thumbnail generation for small sets"""
+        # Start a worker thread to generate real thumbnails and emit signals safely
+        if self.thumbnail_worker:
+            # Properly disconnect signals before stopping
+            try:
+                self.thumbnail_worker.thumbnailReady.disconnect()
+                self.thumbnail_worker.finished.disconnect()
+            except:
+                pass
+            self.thumbnail_worker.stop()
+            self.thumbnail_worker.wait()
+        
+        # Create worker with limited page range and GPU widget reference
+        self.thumbnail_worker = ThumbnailWorker(
+            self.pdf_doc, 
+            page_list=pages_to_load, 
+            limit=len(pages_to_load), 
+            parent=self,
+            gpu_widget=self.pdf_widget  # Pass GPU widget for texture cache access
+        )
+        self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+        self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(current_scroll_pos))
+        
+        if self._selective_thumbnails_enabled:
+            self.status_bar.showMessage(f"Loading thumbnails {start_page+1}-{end_page+1}...")
+        else:
+            self.status_bar.showMessage("Loading thumbnails...")
+        
+        self.thumbnail_worker.start()
     
     def _create_placeholder_thumbnails(self, start_page, end_page):
         """Create instant placeholder thumbnails for immediate responsiveness"""
@@ -6225,30 +6531,43 @@ Press 'L' to cycle through modes."""
             print(f"Error creating placeholder thumbnails: {e}")
     
     def _load_additional_thumbnails(self, page_list):
-        """Load additional thumbnails without clearing existing ones"""
+        """Load additional thumbnails without clearing existing ones - deprecated, use batched version"""
+        self._load_additional_thumbnails_batched(page_list)
+    
+    def _load_additional_thumbnails_batched(self, page_list):
+        """Load additional thumbnails using batch processing for better performance"""
         try:
-            if self.thumbnail_worker:
-                # Properly disconnect signals before stopping
-                try:
-                    self.thumbnail_worker.thumbnailReady.disconnect()
-                    self.thumbnail_worker.finished.disconnect()
-                except:
-                    pass
-                self.thumbnail_worker.stop()
-                self.thumbnail_worker.wait()
+            # Stop any existing processing
+            self._stop_batch_processing()
             
-            self.thumbnail_worker = ThumbnailWorker(
-                self.pdf_doc, 
-                page_list=page_list, 
-                limit=len(page_list), 
-                parent=self,
-                gpu_widget=self.pdf_widget  # Pass GPU widget for texture cache access
-            )
-            self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
-            self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(None))
-            
-            self.status_bar.showMessage(f"Loading {len(page_list)} additional thumbnails...")
-            self.thumbnail_worker.start()
+            # Determine if we need batch processing
+            if len(page_list) > 15:  # Use batch processing for medium to large sets
+                print(f"🔄 Starting batch processing for {len(page_list)} additional thumbnails")
+                self._start_batch_thumbnail_generation(page_list, None)  # No scroll preservation for additional loads
+            else:
+                # Use traditional worker for small additional sets
+                if self.thumbnail_worker:
+                    # Properly disconnect signals before stopping
+                    try:
+                        self.thumbnail_worker.thumbnailReady.disconnect()
+                        self.thumbnail_worker.finished.disconnect()
+                    except:
+                        pass
+                    self.thumbnail_worker.stop()
+                    self.thumbnail_worker.wait()
+                
+                self.thumbnail_worker = ThumbnailWorker(
+                    self.pdf_doc, 
+                    page_list=page_list, 
+                    limit=len(page_list), 
+                    parent=self,
+                    gpu_widget=self.pdf_widget  # Pass GPU widget for texture cache access
+                )
+                self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+                self.thumbnail_worker.finished.connect(lambda: self._on_thumbnails_finished(None))
+                
+                self.status_bar.showMessage(f"Loading {len(page_list)} additional thumbnails...")
+                self.thumbnail_worker.start()
         except Exception as e:
             print(f"Error loading additional thumbnails: {e}")
     
