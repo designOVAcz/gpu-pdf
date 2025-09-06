@@ -2825,6 +2825,55 @@ class GPUPDFWidget(QOpenGLWidget):
                         
         except Exception as e:
             print(f"Error in periodic quality verification: {e}")
+
+    def _check_grid_completion_and_hide_preloader(self):
+        """Check if all pages in current grid are complete and hide grid preloader if so"""
+        try:
+            if not self.pdf_widget.grid_mode:
+                return
+                
+            current_page = getattr(self, 'current_page', 0)
+            pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+            start_page = current_page
+            end_page = min(start_page + pages_needed, self.total_pages)
+            
+            # Get target quality for checking completion
+            target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+            
+            # Check completion status of all pages in current grid
+            completed_pages = 0
+            total_pages_in_grid = end_page - start_page
+            
+            for page_num in range(start_page, end_page):
+                existing_texture = self.pdf_widget.texture_cache.get_texture(page_num)
+                if existing_texture:
+                    current_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
+                    # Consider page complete if quality is good enough
+                    if current_quality >= max(3.5, target_quality * 0.8):  # 80% of target or 3.5 minimum
+                        completed_pages += 1
+            
+            # Calculate grid completion percentage
+            completion_percentage = (completed_pages / total_pages_in_grid) * 100 if total_pages_in_grid > 0 else 100
+            
+            # Hide grid preloader if grid is mostly complete (85% or more)
+            if completion_percentage >= 85:
+                print(f"🎯 Grid completion: {completion_percentage:.1f}% ({completed_pages}/{total_pages_in_grid}) - hiding grid preloader")
+                
+                # Update grid info to show completion before hiding
+                if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                    self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
+                    self.grid_info_label.setText(f"Grid Complete: {completion_percentage:.0f}%")
+                    
+                # Hide grid preloader after short delay
+                QTimer.singleShot(300, self._finish_grid_loading)
+            else:
+                # Update grid info with overall progress
+                if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                    self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
+                    self.grid_info_label.setText(f"Grid Progress: {completion_percentage:.0f}% ({completed_pages}/{total_pages_in_grid})")
+                    
+        except Exception as e:
+            print(f"Error checking grid completion: {e}")
     
     def _schedule_delayed_quality_check(self):
         """Schedule a delayed quality check to avoid lag during rapid zoom changes"""
@@ -6713,6 +6762,9 @@ Press 'L' to cycle through modes."""
                     if start_page <= page_num < end_page:
                         progress = f"Page {page_num + 1}: {quality_status} {progress_percent}%"
                         self.grid_info_label.setText(progress)
+                        
+                        # FIXED: Check if ALL pages in grid are complete for grid preloader hiding
+                        self._check_grid_completion_and_hide_preloader()
             
             # More intelligent preloader hiding - focus on actual quality achievement
             if page_num == current_page:
