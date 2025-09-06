@@ -2604,6 +2604,14 @@ class GPUPDFWidget(QOpenGLWidget):
         else:
             self.page_width = page_width
             self.page_height = page_height
+            
+            # Finish thumbnail loading when page texture is successfully set
+            if hasattr(self, 'parent') and self.parent() and hasattr(self.parent(), 'force_finish_thumbnail_loading'):
+                try:
+                    self.parent().force_finish_thumbnail_loading()
+                except Exception as e:
+                    print(f"Error finishing thumbnail loading from texture set: {e}")
+        
         # Only trigger repaint if widget has a valid GL context
         try:
             if self.context() is not None:
@@ -5766,9 +5774,9 @@ Press 'L' to cycle through modes."""
                 
                 # Continue smooth animation
                 if value < 100:
-                    # Realistic rendering speed
-                    next_value = min(100, value + 2)
-                    QTimer.singleShot(70, lambda: self._animate_thumbnail_progress(next_value))
+                    # Faster rendering speed - complete in about 2 seconds
+                    next_value = min(100, value + 4)  # Increment by 4 instead of 2
+                    QTimer.singleShot(50, lambda: self._animate_thumbnail_progress(next_value))  # 50ms instead of 70ms
                 else:
                     # Complete after brief delay - hide when fully loaded
                     QTimer.singleShot(300, self._finish_thumbnail_loading)
@@ -5787,6 +5795,15 @@ Press 'L' to cycle through modes."""
             
         except Exception as e:
             print(f"Error finishing thumbnail loading: {e}")
+
+    def force_finish_thumbnail_loading(self):
+        """Force finish thumbnail loading - can be called externally"""
+        try:
+            if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and self.thumb_loading_widget.isVisible():
+                print("🔄 Force finishing thumbnail loading...")
+                self._finish_thumbnail_loading()
+        except Exception as e:
+            print(f"Error force finishing thumbnail loading: {e}")
 
     def hide_thumbnail_loading_indicator(self):
         """Hide thumbnail loading indicator"""
@@ -5813,7 +5830,7 @@ Press 'L' to cycle through modes."""
     def _force_hide_thumb_preloader_on_timeout(self):
         """Force hide thumbnail preloader after timeout to prevent stuck preloaders"""
         try:
-            print("⏰ TIMEOUT: Force hiding thumbnail preloader after 2.5 seconds")
+            print("⏰ TIMEOUT: Force hiding thumbnail preloader after 4 seconds")
             self.hide_thumbnail_loading_indicator()
         except Exception as e:
             print(f"Error in thumbnail preloader timeout: {e}")
@@ -5890,9 +5907,9 @@ Press 'L' to cycle through modes."""
                 self._thumb_timeout_timer.setSingleShot(True)
                 self._thumb_timeout_timer.timeout.connect(self._force_hide_thumb_preloader_on_timeout)
             
-            # Set timeout for 2.5 seconds from last operation
-            self._thumb_timeout_timer.start(2500)
-            print(f"⏱️ Thumbnail preloader timeout set for 2.5 seconds")
+            # Set timeout for 4 seconds (longer than animation duration of ~3.5s)
+            self._thumb_timeout_timer.start(4000)
+            print(f"⏱️ Thumbnail preloader timeout set for 4 seconds")
             
             print(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
             return
