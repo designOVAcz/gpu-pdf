@@ -831,9 +831,12 @@ class ThumbnailWorker(QThread):
     def _process_single_thumbnail(self, page_num):
         """Process a single thumbnail with all Layer 1 optimizations"""
         try:
+            print(f"🔧 Processing thumbnail for page {page_num}")
+            
             # LAYER 1 OPTIMIZATION 1: Check disk cache first (fastest possible)
             cached_image = self._load_from_cache(page_num)
             if cached_image:
+                print(f"💾 Found cached thumbnail for page {page_num}")
                 self.thumbnailReady.emit(page_num, cached_image)
                 return True
             
@@ -861,19 +864,25 @@ class ThumbnailWorker(QThread):
                 elif avg_time > 0.1:  # Slower system
                     self._adaptive_quality = max(0.25, self._adaptive_quality - 0.01)
             
-            mat = fitz.Matrix(self._adaptive_quality, self._adaptive_quality)
+            # Increase quality slightly for better thumbnails
+            mat = fitz.Matrix(self._adaptive_quality + 0.1, self._adaptive_quality + 0.1)
             
             # Fast rendering with optimal settings
-            pix = page.get_pixmap(matrix=mat, alpha=False, annots=False)
+            try:
+                # Try with annotations for better visual representation
+                pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
+            except:
+                # Fall back to no annotations if it fails
+                pix = page.get_pixmap(matrix=mat, alpha=False, annots=False)
             
             if pix:
                 # LAYER 1 OPTIMIZATION 4: Use WebP for best compression/speed balance
                 try:
-                    img_data = pix.tobytes("webp", webp_quality=75)
+                    img_data = pix.tobytes("webp", webp_quality=85)  # Slightly higher quality
                     qimage = QImage.fromData(img_data, "WEBP")
                 except:
                     # Fallback to JPEG if WebP not available
-                    img_data = pix.tobytes("jpeg", jpg_quality=75)
+                    img_data = pix.tobytes("jpeg", jpg_quality=85)  # Slightly higher quality
                     qimage = QImage.fromData(img_data, "JPEG")
                 
                 if not qimage.isNull():
@@ -886,6 +895,7 @@ class ThumbnailWorker(QThread):
                     if len(self._render_times) > 20:
                         self._render_times.pop(0)  # Keep only recent times
                     
+                    print(f"✅ Emitting thumbnailReady signal for page {page_num}")
                     self.thumbnailReady.emit(page_num, qimage)
                     return True
             
@@ -6380,6 +6390,10 @@ Press 'L' to cycle through modes."""
         self._batch_size = 8  # Process 8 thumbnails per batch
         self._batch_delay = 50  # 50ms delay between batches (20 batches per second)
         
+        # Track start time for timeout detection
+        import time
+        self._batch_start_time = time.time()
+        
         total_batches = (len(pages_to_load) + self._batch_size - 1) // self._batch_size
         print(f"🚀 Starting batch processing: {len(pages_to_load)} pages in {total_batches} batches")
         
@@ -6392,6 +6406,15 @@ Press 'L' to cycle through modes."""
             self._batch_timer.setSingleShot(True)  # Important: single shot timer
             self._batch_timer.timeout.connect(self._process_next_thumbnail_batch)
         
+        # Initialize timeout timer to prevent hanging
+        if not hasattr(self, '_batch_timeout_timer'):
+            self._batch_timeout_timer = QTimer()
+            self._batch_timeout_timer.setSingleShot(True)
+            self._batch_timeout_timer.timeout.connect(self._check_batch_timeout)
+        
+        # Set timeout for 30 seconds total
+        self._batch_timeout_timer.start(30000)
+        
         # Start processing first batch immediately
         print("📦 Starting first batch immediately...")
         self._process_next_thumbnail_batch()
@@ -6399,6 +6422,12 @@ Press 'L' to cycle through modes."""
     def _process_next_thumbnail_batch(self):
         """Process the next batch of thumbnails"""
         try:
+            # Check if user has interrupted or if enough thumbnails are already visible
+            if self._should_abort_batch_processing():
+                print("🛑 Aborting batch processing - user interaction detected or thumbnails sufficient")
+                self._finish_batch_processing()
+                return
+                
             if not hasattr(self, '_batch_pages') or self._batch_index >= len(self._batch_pages):
                 # All batches completed
                 print(f"✅ Batch processing completed - processed {self._batch_index} thumbnails")
@@ -6440,6 +6469,8 @@ Press 'L' to cycle through modes."""
             self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
             self.thumbnail_worker.finished.connect(self._on_batch_finished)
             
+            print(f"📦 Created ThumbnailWorker for batch pages: {current_batch}")
+            
             # Start worker for current batch
             self.thumbnail_worker.start()
             
@@ -6448,6 +6479,8 @@ Press 'L' to cycle through modes."""
             
         except Exception as e:
             print(f"Error processing thumbnail batch: {e}")
+            import traceback
+            traceback.print_exc()
             self._finish_batch_processing()
     
     def _on_batch_finished(self):
@@ -6468,6 +6501,10 @@ Press 'L' to cycle through modes."""
             if hasattr(self, '_batch_timer') and self._batch_timer:
                 self._batch_timer.stop()
             
+            # Stop timeout timer
+            if hasattr(self, '_batch_timeout_timer') and self._batch_timeout_timer:
+                self._batch_timeout_timer.stop()
+            
             # Hide progress indicators
             self.hide_thumbnail_loading_progress()
             
@@ -6486,8 +6523,93 @@ Press 'L' to cycle through modes."""
             self._batch_index = 0
             self._batch_scroll_pos = None
             
+            # Add loading indicators if in selective mode
+            if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
+                self._add_loading_indicators()
+            
+            # Force loading any visible thumbnails that might still be placeholders
+            QTimer.singleShot(300, self._force_load_visible_thumbnails)
+            
         except Exception as e:
             print(f"Error finishing batch processing: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _interrupt_batch_processing_on_navigation(self):
+        """Interrupt ongoing batch processing when user navigates pages"""
+        try:
+            # Check if batch processing is active
+            if (hasattr(self, '_batch_pages') and self._batch_pages and 
+                hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and 
+                self.thumb_loading_widget.isVisible()):
+                
+                print("🛑 Interrupting batch processing due to user navigation")
+                
+                # Force finish batch processing
+                self._finish_batch_processing()
+                
+                # Clear any visible batch progress indicators
+                self.hide_thumbnail_loading_progress()
+                
+                # Update status to indicate interruption
+                self.status_bar.showMessage("Thumbnail loading interrupted", 1500)
+                
+        except Exception as e:
+            print(f"Error interrupting batch processing: {e}")
+    
+    def _check_batch_timeout(self):
+        """Check if batch processing has timed out and force completion"""
+        try:
+            if not hasattr(self, '_batch_start_time'):
+                return
+                
+            import time
+            current_time = time.time()
+            elapsed = current_time - self._batch_start_time
+            
+            # If batch processing has been running for more than 30 seconds, force stop
+            if elapsed > 30:
+                print(f"⏰ TIMEOUT: Forcing batch processing completion after {elapsed:.1f} seconds")
+                self._finish_batch_processing()
+                self.status_bar.showMessage("Thumbnail loading timed out", 2000)
+                
+        except Exception as e:
+            print(f"Error checking batch timeout: {e}")
+    
+    def _should_abort_batch_processing(self):
+        """Check if batch processing should be aborted due to user interaction or sufficient thumbnails"""
+        try:
+            # Check if user has navigated away recently
+            if hasattr(self, '_last_page_change_time'):
+                import time
+                time_since_nav = time.time() - self._last_page_change_time
+                if time_since_nav < 2.0:  # If user navigated within last 2 seconds
+                    return True
+            
+            # Check if we already have enough thumbnails visible
+            if hasattr(self, 'thumbnail_list'):
+                visible_thumbnails = 0
+                real_thumbnails = 0
+                
+                for i in range(self.thumbnail_list.count()):
+                    item = self.thumbnail_list.item(i)
+                    if item:
+                        # Check if it's a real thumbnail (not placeholder)
+                        thumbnail_type = item.data(Qt.ItemDataRole.UserRole + 1)
+                        if thumbnail_type == "real":
+                            real_thumbnails += 1
+                        visible_thumbnails += 1
+                
+                # If we have enough real thumbnails around current page, abort batch processing
+                if real_thumbnails >= 20:  # Sufficient thumbnails loaded
+                    print(f"📦 Sufficient thumbnails loaded ({real_thumbnails} real thumbnails), aborting batch processing")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error checking batch abort condition: {e}")
+            return False
     
     def _start_traditional_thumbnail_generation(self, pages_to_load, current_scroll_pos, start_page, end_page):
         """Start traditional thumbnail generation for small sets"""
@@ -6527,8 +6649,15 @@ Press 'L' to cycle through modes."""
             placeholder_img = QImage(120, 160, QImage.Format.Format_RGB32)
             placeholder_img.fill(QColor(60, 60, 60))  # Dark gray placeholder - clean and simple
             
+            # Add some visual indication that it's loading
+            painter = QPainter(placeholder_img)
+            painter.setPen(QColor(120, 120, 120))
+            painter.setFont(QFont("Arial", 10))
+            painter.drawText(placeholder_img.rect(), Qt.AlignmentFlag.AlignCenter, "Loading...")
+            painter.end()
+            
             for page_num in range(start_page, end_page + 1):
-                # Create clean placeholder for each page (no page numbers)
+                # Create clean placeholder for each page
                 page_placeholder = placeholder_img.copy()
                 
                 # Create thumbnail item with clean placeholder
@@ -6592,27 +6721,52 @@ Press 'L' to cycle through modes."""
         # Accept either (page_num, QImage) from the new worker
         # or (page_num, QIcon, QListWidgetItem) from older code paths.
         try:
+            print(f"🖼️ Thumbnail ready for page {page_num}, type: {type(img_or_icon)}")
+            
             # OPTIMIZATION: Look for existing placeholder to replace
             existing_item = None
             for i in range(self.thumbnail_list.count()):
                 item_at_i = self.thumbnail_list.item(i)
                 if item_at_i and item_at_i.data(Qt.ItemDataRole.UserRole) == page_num:
                     existing_item = item_at_i
+                    current_type = item_at_i.data(Qt.ItemDataRole.UserRole + 1)
+                    print(f"🔄 Found existing item for page {page_num}, current type: {current_type}")
                     break
             
             if isinstance(img_or_icon, QImage):
                 qimage = img_or_icon
 
+                # Ensure we have a valid image
+                if qimage.isNull():
+                    print(f"⚠️ Error: Null image for page {page_num}")
+                    return
+
+                # Scale with proper aspect ratio
                 thumb = qimage.scaled(120, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                
+                if thumb.isNull():
+                    print(f"⚠️ Error: Scaled thumbnail is null for page {page_num}")
+                    return
+                    
                 pixmap = QPixmap.fromImage(thumb)
+                
+                if pixmap.isNull():
+                    print(f"⚠️ Error: Null pixmap for page {page_num}")
+                    return
+                    
                 qt_icon = QIcon(pixmap)
                 
                 if existing_item:
                     # Replace existing placeholder or outdated thumbnail
+                    print(f"✅ Replacing placeholder for page {page_num} with real thumbnail")
                     existing_item.setIcon(qt_icon)
                     existing_item.setData(Qt.ItemDataRole.UserRole + 1, "real")  # Mark as real thumbnail
+                    
+                    # Force thumbnail list update
+                    self.thumbnail_list.update()
                     return
                 else:
+                    print(f"➕ Creating new thumbnail item for page {page_num}")
                     # Create new item
                     item = QListWidgetItem(qt_icon, f"{page_num + 1}")
                     item.setData(Qt.ItemDataRole.UserRole, page_num)
@@ -6662,10 +6816,12 @@ Press 'L' to cycle through modes."""
                     # Only update status every few thumbnails to reduce UI chatter
                     if page_num % 5 == 0 or page_num < 5:
                         self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1})")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    print(f"Error with icon thumbnail: {e}")
+        except Exception as e:
+            print(f"Error in _on_thumbnail_ready: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _on_thumbnails_finished(self, restore_scroll_pos=None):
         """Handle thumbnail generation completion with optional scroll restoration"""
@@ -6710,6 +6866,9 @@ Press 'L' to cycle through modes."""
     
     def thumbnail_clicked(self, item):
         """Handle thumbnail click to navigate to page with enhanced loading feedback"""
+        # FIXED: Stop any ongoing batch processing when user clicks thumbnail
+        self._interrupt_batch_processing_on_navigation()
+        
         if item:
             page_num = item.data(Qt.ItemDataRole.UserRole)
             
@@ -6857,6 +7016,58 @@ Press 'L' to cycle through modes."""
         # CRITICAL: 10ms delay allows UI to update first
         QTimer.singleShot(10, queue_texture)
     
+    def _force_load_visible_thumbnails(self):
+        """Immediately prioritize loading thumbnails that are currently visible in the viewport"""
+        try:
+            # Find all visible items that are still placeholders
+            visible_pages = []
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if not item:
+                    continue
+                
+                # Check if item is visible in viewport
+                item_rect = self.thumbnail_list.visualItemRect(item)
+                if item_rect.intersects(self.thumbnail_list.viewport().rect()):
+                    page_num = item.data(Qt.ItemDataRole.UserRole)
+                    item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+                    
+                    # Only prioritize actual page thumbnails that are placeholders
+                    if page_num is not None and page_num >= 0 and item_type == "placeholder":
+                        visible_pages.append(page_num)
+            
+            if visible_pages:
+                print(f"🔍 Prioritizing {len(visible_pages)} visible thumbnails: {visible_pages}")
+                
+                # Create a dedicated worker just for these visible thumbnails
+                if hasattr(self, 'priority_thumbnail_worker') and self.priority_thumbnail_worker:
+                    try:
+                        self.priority_thumbnail_worker.thumbnailReady.disconnect()
+                        self.priority_thumbnail_worker.finished.disconnect()
+                    except:
+                        pass
+                    self.priority_thumbnail_worker.stop()
+                    self.priority_thumbnail_worker.wait()
+                
+                # Create a new worker with high priority
+                self.priority_thumbnail_worker = ThumbnailWorker(
+                    self.pdf_doc, 
+                    page_list=visible_pages, 
+                    limit=len(visible_pages), 
+                    parent=self,
+                    gpu_widget=self.pdf_widget
+                )
+                
+                # Connect signals
+                self.priority_thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+                self.priority_thumbnail_worker.finished.connect(lambda: print("Priority thumbnails loaded"))
+                
+                # Start loading with high priority
+                self.priority_thumbnail_worker.start()
+                
+        except Exception as e:
+            print(f"Error prioritizing visible thumbnails: {e}")
+            
     def _on_thumbnail_scroll(self, value):
         """Handle thumbnail list scrolling to trigger loading more thumbnails"""
         if not (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled):
@@ -6874,8 +7085,17 @@ Press 'L' to cycle through modes."""
             self._scroll_load_timer.setSingleShot(True)
             self._scroll_load_timer.timeout.connect(self._handle_edge_scroll)
         
+        # Setup a separate timer for visible thumbnail loading
+        if not hasattr(self, '_visible_load_timer'):
+            self._visible_load_timer = QTimer()
+            self._visible_load_timer.setSingleShot(True)
+            self._visible_load_timer.timeout.connect(self._force_load_visible_thumbnails)
+        
         if self._scroll_load_timer.isActive():
             self._scroll_load_timer.stop()
+        
+        if self._visible_load_timer.isActive():
+            self._visible_load_timer.stop()
         
         # Check if scrolled near top or bottom (within 15% of edges for earlier detection)
         near_top = value <= max_value * 0.15 and value < 100
@@ -6884,6 +7104,9 @@ Press 'L' to cycle through modes."""
         if near_top or near_bottom:
             self._edge_scroll_direction = 'up' if near_top else 'down'
             self._scroll_load_timer.start(150)  # Reduced delay from 300ms to 150ms for more responsive loading
+        
+        # Always trigger visible thumbnail loading after scrolling stops (short delay)
+        self._visible_load_timer.start(100)
     
     def _handle_edge_scroll(self):
         """Handle loading more thumbnails when scrolled to edge - OPTIMIZED for smooth scrolling"""
@@ -6893,16 +7116,25 @@ Press 'L' to cycle through modes."""
         start_page, end_page = self._current_thumb_range
         
         if self._edge_scroll_direction == 'up' and start_page > 0:
-            # Load earlier pages - SMALL BATCHES for smooth performance
-            new_start = max(0, start_page - 8)  # Reduced from 15 to 8 pages
-            center_page = (new_start + end_page) // 2
-            self.generate_thumbnails(around_page=center_page, radius=12, preserve_scroll=True)  # Reduced from 20 to 12
+            # Load earlier pages - optimize for performance and thumbnail quality
+            new_start = max(0, start_page - 12)  # Increased from 8 to 12 pages
+            # Calculate center for better distribution
+            center_page = max(new_start + 8, (new_start + end_page) // 2)
+            # Use slightly larger radius for better user experience
+            self.generate_thumbnails(around_page=center_page, radius=15, preserve_scroll=True)
+            print(f"⬆️ Loading earlier pages around {center_page} (range: {new_start}-{end_page})")
             
         elif self._edge_scroll_direction == 'down' and end_page < self.total_pages - 1:
-            # Load later pages - SMALL BATCHES for smooth performance
-            new_end = min(self.total_pages - 1, end_page + 8)  # Reduced from 15 to 8 pages
-            center_page = (start_page + new_end) // 2
-            self.generate_thumbnails(around_page=center_page, radius=12, preserve_scroll=True)  # Reduced from 20 to 12
+            # Load later pages - optimize for performance and thumbnail quality
+            new_end = min(self.total_pages - 1, end_page + 12)  # Increased from 8 to 12 pages
+            # Calculate center for better distribution
+            center_page = min(end_page + 8, (start_page + new_end) // 2)
+            # Use slightly larger radius for better user experience
+            self.generate_thumbnails(around_page=center_page, radius=15, preserve_scroll=True)
+            print(f"⬇️ Loading later pages around {center_page} (range: {start_page}-{new_end})")
+            
+        # Immediately start loading at least a few visible thumbnails
+        self._force_load_visible_thumbnails()
     
     def go_to_page(self, page_num):
         """Navigate to a specific page with the safest possible rendering path."""
@@ -7244,6 +7476,9 @@ Press 'L' to cycle through modes."""
     
     def prev_page(self):
         """Navigate to previous page with loading feedback"""
+        # FIXED: Stop any ongoing batch processing when user navigates
+        self._interrupt_batch_processing_on_navigation()
+        
         # Show immediate status feedback
         self.show_page_navigation_status("previous")
         
@@ -7296,6 +7531,9 @@ Press 'L' to cycle through modes."""
     
     def next_page(self):
         """Navigate to next page with loading feedback"""
+        # FIXED: Stop any ongoing batch processing when user navigates
+        self._interrupt_batch_processing_on_navigation()
+        
         # Show immediate status feedback
         self.show_page_navigation_status("next")
         
