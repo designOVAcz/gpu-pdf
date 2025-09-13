@@ -7,16 +7,18 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. Desig
 *   **GPU-Accelerated Rendering**: OpenGL-powered fast page rendering with texture caching
 *   **Dual View Modes**: Single-page for detailed reading, grid view for document overview
 *   **Smooth Navigation**: Zoom, pan, scroll with responsive controls
-*   **Loading Indicators**: Minimal progress feedback for all operations
+*   **Loading Indicators**: Minimal progress feedback for all operations (PDF loading, grid switching, page navigation)
 *   **Auto-Refresh Fix**: Automatic click simulation to resolve fullscreen white screen issues
 *   **Asynchronous Processing**: Background thumbnail and page loading for responsive UI
 *   **File Association**: Double-click PDF files to open directly
+*   **Slideshow Mode**: Automatic page progression with customizable timing intervals
 
 ## Controls
 
-*   **Mouse**: Scroll pages, drag to pan, click thumbnails to navigate
-*   **Keyboard**: `G` for grid view, `F11` for fullscreen, `Ctrl+O` to open files
+*   **Mouse**: Scroll pages, drag to pan, click thumbnails to navigate, middle-click for next page
+*   **Keyboard**: `G` for grid view, `F11` for fullscreen, `Ctrl+O` to open files, `S` for slideshow
 *   **Grid Sizes**: `1-4` keys or Tab to cycle through 2x2, 3x1, 3x2, 5x1 layouts
+*   **Slideshow**: `S` to start/stop, dropdown menu to select timing (5s, 10s, 30s, 60s, 120s)
 
 ## Requirements
 
@@ -35,7 +37,6 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. Desig
     ```bash
     pip install PyQt6 PyOpenGL PyMuPDF
     ```
-3.  Build and tested on Windows OS
 
 ## Usage
 
@@ -54,6 +55,7 @@ A fast, GPU-accelerated PDF viewer built with Python, PyQt6, and PyOpenGL. Desig
     *   **Grid View**: Press `G` to toggle, use `1-4` keys for different layouts
     *   **Thumbnails**: Click any thumbnail to jump to that page
     *   **Fullscreen**: Press `F11` (auto-fixes white screen issues)
+    *   **Slideshow**: Press `S` to start automatic page progression, select timing from dropdown (defaults to 30 seconds)
 
 ---
 
@@ -63,18 +65,10 @@ Compile to standalone executable using PyInstaller:
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --icon=pdf_viewer_icon.ico --name="GPU PDF Viewer" --clean --noconfirm main.py
+python -m PyInstaller --onefile --windowed --name="GPU PDF Viewer" --clean main.py
 ```
 
 Binary will be in `dist/` folder. Build on target OS for best compatibility.
 
 ---
-
-## License
-
-MIT License.
-
-
-
-
 
