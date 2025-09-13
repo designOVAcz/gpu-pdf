@@ -58,7 +58,7 @@ try:
                                 QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
     from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
-                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon)
+                            QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon, QMouseEvent, QGuiApplication)
     from PyQt6.QtCore import QPoint
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture
@@ -1101,8 +1101,26 @@ class GPUPDFWidget(QOpenGLWidget):
     def __init__(self):
         super().__init__()
         
-        # Set widget attributes for transparency - GitHub reference fix
+        # Set widget attributes for transparency and native window to fix popups in fullscreen
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)  # Required for fullscreen popups
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)  # Allow transparent painting
+        
+        # Ensure no automatic background filling for transparency
+        self.setAutoFillBackground(False)
+        
+        # Set background to match container color - enhanced CSS
+        self.setStyleSheet("""
+            background-color: rgb(38, 38, 38);
+            border: none;
+        """)
+        
+        # Set palette to match container color
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor(38, 38, 38))  # Match container
+        palette.setColor(palette.ColorRole.Window, QColor(38, 38, 38))  # Window background
+        palette.setColor(palette.ColorRole.Base, QColor(38, 38, 38))  # Base color
+        self.setPalette(palette)
         
         self.texture_cache = GPUTextureCache()
         self.current_page = 0
@@ -1117,9 +1135,20 @@ class GPUPDFWidget(QOpenGLWidget):
         
         # Enable context menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.show_context_menu)
+        self.customContextMenuRequested.connect(self._handle_context_menu_request)
 
-    # Remove Qt palette/stylesheet background for OpenGL widget to avoid blending issues
+        # Set transparent background for loader
+        self.setStyleSheet("""
+            background-color: transparent;
+            border: none;
+        """)
+        
+        # Set transparent palette for loader
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor(0, 0, 0, 0))  # Transparent
+        palette.setColor(palette.ColorRole.Window, QColor(0, 0, 0, 0))  # Transparent window background
+        palette.setColor(palette.ColorRole.Base, QColor(0, 0, 0, 0))  # Transparent base color
+        self.setPalette(palette)
 
         # Zoom-adaptive quality settings - optimized for sharp text with smooth filtering
         self.base_quality = 4.5  # Higher base quality for very sharp text at 100% zoom
@@ -1189,6 +1218,25 @@ class GPUPDFWidget(QOpenGLWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     
+    def contextMenuEvent(self, event):
+        """Handle context menu events, forwarding to parent in fullscreen mode."""
+        if self.window().isFullScreen():
+            # In fullscreen, forward the event to the parent window
+            global_pos = self.mapToGlobal(event.pos())
+            self.window().show_main_context_menu(global_pos)
+            event.accept()
+        else:
+            # In normal mode, show the widget's own context menu
+            self.show_context_menu(event.pos())
+            event.accept()
+    
+    def _handle_context_menu_request(self, pos):
+        """Handle custom context menu requests (for combo boxes, etc.)"""
+        if self.window().isFullScreen():
+            self.window().show_main_context_menu(self.mapToGlobal(pos))
+        else:
+            self.show_context_menu(pos)
+    
     def initializeGL(self):
         """Initialize OpenGL context - minimal setup for fast startup"""
         glEnable(GL_TEXTURE_2D)
@@ -1196,8 +1244,8 @@ class GPUPDFWidget(QOpenGLWidget):
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # Standard alpha blending
         glEnable(GL_MULTISAMPLE)  # Enable multisampling if available
         
-        # Match container background color exactly: rgb(38, 38, 38)
-        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
+        # Use container background color to match thumbnail panel from start
+        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)  # Match container: rgb(38, 38, 38)
     
     def update(self, *args, **kwargs):
         """Frame rate limited update method for better performance"""
@@ -1230,8 +1278,8 @@ class GPUPDFWidget(QOpenGLWidget):
         try:
             # GPU-ONLY PANNING: Keep existing textures visible, stop CPU processing only
             if getattr(self, '_skip_heavy_processing', False) or getattr(self, '_ultra_fast_mode', False):
-                # CLEAR BACKGROUND
-                glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
+                # CLEAR BACKGROUND - use container color to match thumbnail panel
+                glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)  # Match container color
                 glClear(GL_COLOR_BUFFER_BIT)
                 
                 if self.grid_mode:
@@ -1246,7 +1294,12 @@ class GPUPDFWidget(QOpenGLWidget):
             import time
             frame_start_time = time.time()
             
-            glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
+            # Use transparent clear for loading states, container color when content is available
+            viewer = self.window()
+            has_content = (hasattr(viewer, 'pdf_doc') and viewer.pdf_doc is not None)
+            
+            # Always use container color to match thumbnail background
+            glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)  # Always match container color
             glClear(GL_COLOR_BUFFER_BIT)
             
             current_time = time.time()
@@ -1255,9 +1308,14 @@ class GPUPDFWidget(QOpenGLWidget):
             # Performance monitoring
             self._update_performance_stats(frame_start_time)
             
-            # Detect interactions
+            # Detect interactions and slideshow state
             renderer_busy = (hasattr(self, 'renderer') and self.renderer and 
                            hasattr(self.renderer, 'is_busy') and self.renderer.is_busy())
+            
+            # Check if slideshow is active (get from parent viewer)
+            viewer = self.window() if hasattr(self, 'window') and callable(self.window) else None
+            slideshow_active = (viewer and hasattr(viewer, '_auto_advance_active') and 
+                              viewer._auto_advance_active)
             
             is_actively_interacting = (getattr(self, '_fast_zoom_mode', False) or 
                                      getattr(self, '_active_panning', False) or
@@ -1272,6 +1330,9 @@ class GPUPDFWidget(QOpenGLWidget):
                 max_items = 0  # Zero processing during grid interactions
             elif is_actively_interacting:
                 max_items = 0  # Zero processing during interactions
+            elif slideshow_active:
+                # Reduce processing during slideshow to prevent hanging loaders
+                max_items = 1  # Minimal processing during slideshow
             else:
                 # 🚀 LAYER 2 OPTIMIZATION: Adaptive processing based on performance
                 effective_zoom = self.zoom_factor
@@ -1475,50 +1536,29 @@ class GPUPDFWidget(QOpenGLWidget):
                 pass
     
     def render_loading_state(self):
-        """Render a subtle spinner wheel loading indicator"""
+        """Render a minimal loading indicator with transparent background"""
         import math
         
-        # Small, subtle spinner wheel in the bottom-right corner
-        spinner_size = 0.08  # Small size
-        spinner_x = 0.8      # Position near right edge
-        spinner_y = -0.8     # Position near bottom edge
+        # SKIP rendering entirely - just show transparent background
+        # This prevents any loader from appearing while preserving functionality
+        return
         
-        # Subtle gray color with low opacity
-        glColor4f(0.5, 0.5, 0.5, 0.4)  # Light gray, semi-transparent
+        # The code below is disabled to prevent any visible loader
+        # Ultra-minimal loading indicator: just a tiny animated dot in corner
+        glColor4f(0.7, 0.7, 0.7, 0.3)  # Very light gray, very transparent
         
-        # Draw spinning wheel with 8 segments
-        num_segments = 8
-        segment_angle = 2.0 * math.pi / num_segments
+        # Single animated dot in bottom-right corner
+        dot_x = 0.95
+        dot_y = -0.95
+        dot_size = 0.005
         
-        for i in range(num_segments):
-            # Calculate rotation based on time
-            rotation = self.animation_time * 4.0  # Moderate spin speed
-            angle = i * segment_angle + rotation
-            
-            # Fade each segment based on position (creates spinning effect)
-            fade = (i / num_segments) * 0.8 + 0.2  # Range from 0.2 to 1.0
-            glColor4f(0.4, 0.4, 0.4, fade * 0.3)  # Very subtle
-            
-            # Calculate segment positions
-            inner_radius = spinner_size * 0.3
-            outer_radius = spinner_size
-            
-            x1 = spinner_x + math.cos(angle) * inner_radius
-            y1 = spinner_y + math.sin(angle) * inner_radius
-            x2 = spinner_x + math.cos(angle) * outer_radius
-            y2 = spinner_y + math.sin(angle) * outer_radius
-            x3 = spinner_x + math.cos(angle + segment_angle * 0.8) * outer_radius
-            y3 = spinner_y + math.sin(angle + segment_angle * 0.8) * outer_radius
-            x4 = spinner_x + math.cos(angle + segment_angle * 0.8) * inner_radius
-            y4 = spinner_y + math.sin(angle + segment_angle * 0.8) * inner_radius
-            
-            # Draw segment as a quad
-            glBegin(GL_QUADS)
-            glVertex2f(x1, y1)
-            glVertex2f(x2, y2)
-            glVertex2f(x3, y3)
-            glVertex2f(x4, y4)
-            glEnd()
+        # Simple pulsing effect
+        pulse = (math.sin(self.animation_time * 3) + 1) * 0.5  # 0-1 range
+        current_size = dot_size * (0.5 + pulse * 0.5)  # Size varies 0.5x to 1.0x
+        
+        glBegin(GL_POINTS)
+        glVertex2f(dot_x, dot_y)
+        glEnd()
         
         glColor3f(1.0, 1.0, 1.0)  # Reset to white
         
@@ -3131,6 +3171,25 @@ class GPUPDFWidget(QOpenGLWidget):
         # Add separator
         menu.addSeparator()
         
+        # Slideshow section
+        viewer = self.window()
+        if hasattr(viewer, '_auto_advance_active'):
+            if viewer._auto_advance_active:
+                if viewer._is_timer_paused:
+                    slideshow_action = menu.addAction("▶ Resume Slideshow")
+                else:
+                    slideshow_action = menu.addAction("⏸ Pause Slideshow")
+                stop_slideshow_action = menu.addAction("⏹ Stop Slideshow")
+            else:
+                slideshow_action = menu.addAction("▶ Start Slideshow")
+                stop_slideshow_action = None
+        else:
+            slideshow_action = menu.addAction("▶ Start Slideshow")
+            stop_slideshow_action = None
+        
+        # Add separator
+        menu.addSeparator()
+        
         # Zoom section
         zoom_in_action = menu.addAction("Zoom In (+)")
         zoom_out_action = menu.addAction("Zoom Out (-)")
@@ -3150,13 +3209,25 @@ class GPUPDFWidget(QOpenGLWidget):
         action = menu.exec(self.mapToGlobal(position))
         
         # Handle actions
-        viewer = self.window()
         if action == next_page_action:
             if hasattr(viewer, 'next_page'):
                 viewer.next_page()
         elif action == prev_page_action:
             if hasattr(viewer, 'prev_page'):
                 viewer.prev_page()
+        elif action == slideshow_action:
+            if hasattr(viewer, '_auto_advance_active'):
+                if viewer._auto_advance_active:
+                    # Toggle pause/resume
+                    viewer.toggle_timer_pause()
+                else:
+                    # Start slideshow
+                    viewer.start_slideshow()
+            elif hasattr(viewer, 'start_slideshow'):
+                viewer.start_slideshow()
+        elif action == stop_slideshow_action and stop_slideshow_action:
+            if hasattr(viewer, 'stop_slideshow'):
+                viewer.stop_slideshow()
         elif action == zoom_in_action:
             self.zoom_in(position)
         elif action == zoom_out_action:
@@ -3470,6 +3541,101 @@ class GPUPDFWidget(QOpenGLWidget):
         self.check_quality_change()
 
 
+class CircularCountdown(QWidget):
+    """Circular countdown timer widget for slideshow"""
+    
+    def __init__(self, total_time=3, parent=None):
+        super().__init__(parent)
+        self.total_time = total_time
+        self.remaining_time = total_time
+        self.displayed_time = total_time
+        self.is_paused = False
+        self.parent_viewer = None
+        
+        # Widget properties
+        self.setFixedSize(28, 28)
+        self.setStyleSheet("background: transparent; border: none;")
+        
+        # Animation for smooth countdown
+        self.animation_timer = QTimer()
+        self.animation_timer.timeout.connect(self._animate_display)
+        self.animation_timer.start(50)  # 20 FPS for smooth animation
+    
+    def set_parent_viewer(self, viewer):
+        """Set reference to parent viewer for pause/resume functionality"""
+        self.parent_viewer = viewer
+    
+    def set_total_time(self, time_seconds):
+        """Set the total countdown time"""
+        self.total_time = time_seconds
+        self.remaining_time = time_seconds
+        self.displayed_time = time_seconds
+        self.update()
+    
+    def set_remaining_time(self, time_seconds):
+        """Set the remaining countdown time"""
+        self.remaining_time = time_seconds
+        self.update()
+    
+    def set_paused(self, paused):
+        """Set pause state"""
+        self.is_paused = paused
+        self.update()
+    
+    def _animate_display(self):
+        """Animate the displayed time for smooth countdown"""
+        # Smoothly animate towards the target remaining time
+        diff = self.remaining_time - self.displayed_time
+        if abs(diff) > 0.1:
+            self.displayed_time += diff * 0.2  # Smooth interpolation
+        else:
+            self.displayed_time = self.remaining_time
+        
+        # Only update if there's a visible change
+        if abs(self.displayed_time - self.remaining_time) < 0.01:
+            self.displayed_time = self.remaining_time
+        self.update()
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        
+        # Draw subtle background ring
+        painter.setPen(QPen(QColor("#3d3e40"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(rect)
+        
+        # Draw smooth progress arc
+        if self.total_time > 0 and self.displayed_time > 0:
+            fraction = self.displayed_time / self.total_time
+            angle = int(360 * 16 * fraction)
+            
+            # Use different color when paused
+            color = "#ff8080" if self.is_paused else "#80b2ff"
+            painter.setPen(QPen(QColor(color), 3))
+            painter.drawArc(rect, 90 * 16, -angle)
+        
+        # Draw pause symbol if paused
+        if self.is_paused:
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            center_x = rect.center().x()
+            center_y = rect.center().y()
+            bar_width = 2
+            bar_height = 8
+            bar1_rect = QRect(center_x - 3, center_y - bar_height//2, bar_width, bar_height)
+            bar2_rect = QRect(center_x + 1, center_y - bar_height//2, bar_width, bar_height)
+            painter.drawRect(bar1_rect)
+            painter.drawRect(bar2_rect)
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.parent_viewer:
+            # Only allow pause/resume when timer is active
+            if self.parent_viewer._auto_advance_active:
+                self.parent_viewer.toggle_timer_pause()
+        super().mousePressEvent(event)
+
+
 class PDFViewer(QMainWindow):
     """Main PDF viewer application"""
     
@@ -3482,12 +3648,36 @@ class PDFViewer(QMainWindow):
         self.total_pages = 0
         self.render_quality = 3.0
         
+        # Slideshow functionality
+        self._auto_advance_active = False
+        self.timer_interval = 30  # Default 30 seconds to match combo box default
+        self.timer_remaining = 0
+        self._is_timer_paused = False
+        
+        # Auto-advance timer for slideshow
+        self.auto_advance_timer = QTimer()
+        self.auto_advance_timer.setSingleShot(False)
+        self.auto_advance_timer.timeout.connect(self._on_auto_advance_timer)
+        
+        # Ring timer for visual countdown
+        self.ring_update_timer = QTimer() 
+        self.ring_update_timer.setSingleShot(False)
+        self.ring_update_timer.timeout.connect(self._on_ring_update_timer)
+        
+        # Auto advance timer for slideshow
+        self.auto_advance_timer = QTimer()
+        self.auto_advance_timer.setSingleShot(False)
+        self.auto_advance_timer.timeout.connect(self._on_auto_advance_timer)
+        
         self.renderer = None
         self.thumbnail_worker = None
         
         # Enable drag and drop
         self.setAcceptDrops(True)
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptDrops, True)
+        
+        # Enable context menu for main window (especially useful in fullscreen)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         
         # Defer UI setup to after window is shown
         QTimer.singleShot(0, self.setup_ui_deferred)
@@ -4239,6 +4429,59 @@ Press F12 to refresh stats"""
         self.zoom_slider.setMaximumWidth(150)
         self.zoom_slider.valueChanged.connect(self.zoom_changed)
         toolbar.addWidget(self.zoom_slider)
+        
+        toolbar.addSeparator()
+        
+        # Add slideshow controls
+        self.create_slideshow_controls(toolbar)
+
+    def create_slideshow_controls(self, toolbar):
+        """Create slideshow controls for the toolbar"""
+        # Timer interval selector
+        timer_label = QLabel("Timer:")
+        timer_label.setStyleSheet("QLabel { color: #ffffff; padding-right: 5px; }")
+        toolbar.addWidget(timer_label)
+        
+        self.timer_combo = QComboBox()
+        self.timer_combo.addItems([
+            "5 seconds", "10 seconds", 
+            "30 seconds", "1 minute", "2 minutes", "5 minutes"
+        ])
+        self.timer_combo.setCurrentText("30 seconds")
+        self.timer_combo.currentTextChanged.connect(self.update_timer_interval)
+        self.timer_combo.setToolTip("Select slideshow timer interval")
+        self.timer_combo.setMaximumWidth(100)
+        toolbar.addWidget(self.timer_combo)
+        
+        # Play/Pause button
+        self.play_pause_btn = QPushButton("▶")
+        self.play_pause_btn.setFixedSize(30, 30)
+        self.play_pause_btn.clicked.connect(self.toggle_slideshow)
+        self.play_pause_btn.setToolTip("Start/Stop slideshow (Space)")
+        self.play_pause_btn.setStyleSheet("""
+            QPushButton {
+                background: #2d2d30;
+                color: #80b2ff;
+                border: 1px solid #3f3f46;
+                border-radius: 15px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #3f3f46;
+                border-color: #80b2ff;
+            }
+            QPushButton:pressed {
+                background: #1a1a1a;
+            }
+        """)
+        toolbar.addWidget(self.play_pause_btn)
+        
+        # Circular countdown timer
+        self.countdown_widget = CircularCountdown(3, self)
+        self.countdown_widget.set_parent_viewer(self)
+        self.countdown_widget.setToolTip("Timer progress (click to pause/resume)")
+        toolbar.addWidget(self.countdown_widget)
     
     def setup_shortcuts(self):
         """Setup keyboard shortcuts"""
@@ -4258,6 +4501,9 @@ Press F12 to refresh stats"""
         # Grid layout mode shortcuts
         QShortcut(QKeySequence("L"), self, self.cycle_grid_layout_mode)
         QShortcut(QKeySequence("Shift+L"), self, self.show_layout_mode_info)
+        
+        # Slideshow controls
+        QShortcut(QKeySequence("Space"), self, self.toggle_slideshow)
         
         # Grid view toggle shortcut
         QShortcut(QKeySequence("G"), self, self.toggle_grid_view_shortcut)
@@ -4407,34 +4653,40 @@ Press 'L' to cycle through modes."""
         QTimer.singleShot(100, lambda: self.restore_combo_box_state(current_grid_size, grid_enabled))
 
     def enter_fullscreen(self):
-        """Enter fullscreen mode with mouse click simulation workaround from GitHub reference"""
-        # Store the current window state
-        if not hasattr(self, '_normal_geometry'):
+        """Enter fullscreen mode with improved popup handling."""
+        # Store the current window state if not already in fullscreen
+        if not self.isFullScreen():
             self._normal_geometry = self.saveGeometry()
-        
+            self._is_fullscreen = True
+
         # Store current PDF position to prevent jumping
         if hasattr(self, 'pdf_widget') and self.pdf_widget:
             self._stored_zoom = getattr(self.pdf_widget, 'zoom_factor', 1.0)
             self._stored_pan_x = getattr(self.pdf_widget, 'pan_x', 0.0)
             self._stored_pan_y = getattr(self.pdf_widget, 'pan_y', 0.0)
-        
-        # Enter fullscreen
-        self.showFullScreen()
-        
+
+        # Use window state for fullscreen with popup compatibility
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowFullScreen)
+        # Ensure popups can appear above fullscreen window
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+
+        # CRITICAL: Ensure context menu policy is set for fullscreen
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
         # Create fullscreen control overlay (delayed to avoid interference)
         QTimer.singleShot(100, self.create_fullscreen_overlay)
-        
+
         # Apply aggressive fullscreen refresh to fix white screen
         QTimer.singleShot(200, self.aggressive_fullscreen_refresh)
-        
+
         # Restore position after fullscreen transition
         QTimer.singleShot(300, self._restore_fullscreen_position)
-        
+
         # Show help message
         self.status_bar.showMessage("Fullscreen mode: Press F11 to exit, drag top area to move", 4000)
 
     def exit_fullscreen(self):
-        """Exit fullscreen mode with fixes from GitHub reference"""
+        """Exit fullscreen mode using Qt.WindowState.WindowFullScreen."""
         # Store current position before exiting fullscreen
         if hasattr(self, 'pdf_widget') and self.pdf_widget:
             current_zoom = getattr(self.pdf_widget, 'zoom_factor', 1.0)
@@ -4447,11 +4699,23 @@ Press 'L' to cycle through modes."""
             self._fullscreen_overlay.deleteLater()
             delattr(self, '_fullscreen_overlay')
         
-        # FIXED: Properly restore window state and controls
-        # Exit fullscreen
-        self.showNormal()
+        # Use window state to exit fullscreen
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowFullScreen)
+
+        # Restore the original geometry if it was saved
+        if hasattr(self, '_normal_geometry'):
+            self.restoreGeometry(self._normal_geometry)
+            del self._normal_geometry
+
+        # Restore the main context menu policy for the window
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         
-        # Force window flags restoration to ensure title bar and controls are visible
+        # Restore PDF position after exiting
+        QTimer.singleShot(100, lambda: self._restore_pdf_position(current_zoom, current_pan_x, current_pan_y))
+        
+        # Update status bar
+        self.status_bar.showMessage("Exited fullscreen.", 3000)
+        self._is_fullscreen = False
         self.setWindowFlags(Qt.WindowType.Window | 
                            Qt.WindowType.WindowTitleHint | 
                            Qt.WindowType.WindowCloseButtonHint |
@@ -4700,6 +4964,9 @@ Press 'L' to cycle through modes."""
         self._fullscreen_overlay.setFixedSize(150, 40)
         self._fullscreen_overlay.move(self.width() - 160, 10)
         
+        # Ensure overlay doesn't interfere with context menu
+        self._fullscreen_overlay.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        
         # Initially hide, show on mouse movement
         self._fullscreen_overlay.hide()
         
@@ -4713,9 +4980,13 @@ Press 'L' to cycle through modes."""
         self._fullscreen_overlay.mouseMoveEvent = self._overlay_mouse_move
 
     def _overlay_mouse_press(self, event):
-        """Handle mouse press on overlay for dragging window"""
+        """Handle mouse press on overlay for dragging window and context menu"""
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Show context menu when right-clicking on overlay
+            self.show_main_context_menu(event.pos())
             event.accept()
 
     def _overlay_mouse_move(self, event):
@@ -5113,19 +5384,15 @@ Press 'L' to cycle through modes."""
         QApplication.processEvents()
 
     def center_loading_widget(self):
-        """Center ultra-minimal loading widget in PDF viewing area (excluding thumbnails)"""
+        """Position ultra-minimal loading widget in top-right corner"""
         if hasattr(self, 'loading_widget') and self.loading_widget:
-            # Get PDF container geometry for centering (this is the area excluding thumbnails)
-            pdf_area_rect = self.pdf_container.geometry()
-            loading_size = self.loading_widget.size()
+            # Position in top-right corner of the main window
+            x = self.width() - 150
+            y = 10
             
-            # Calculate center position relative to PDF viewing area
-            x = pdf_area_rect.x() + (pdf_area_rect.width() - loading_size.width()) // 2
-            y = pdf_area_rect.y() + (pdf_area_rect.height() - loading_size.height()) // 2
-            
-            # Move to center position in PDF area
+            # Move to top-right corner position
             self.loading_widget.move(x, y)
-            print(f"📍 Ultra-minimal loading widget positioned at ({x}, {y}) in PDF area {pdf_area_rect.width()}x{pdf_area_rect.height()}")
+            print(f"📍 Ultra-minimal loading widget positioned at top-right corner ({x}, {y})")
 
     def load_pdf_step_by_step(self, file_path):
         """Load PDF in steps with progress updates from GitHub reference - PRESERVING CURRENT SETTINGS"""
@@ -5468,13 +5735,10 @@ Press 'L' to cycle through modes."""
             self.mini_progress_bar.setTextVisible(False)
             layout.addWidget(self.mini_progress_bar)
             
-            # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
+            # Ultra-compact size and position in top-right corner
             self.mini_loading_widget.setFixedSize(120, 20)
-            pdf_area_rect = self.pdf_container.geometry()
-            self.mini_loading_widget.move(
-                pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
-                pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
-            )
+            # Position in top-right corner of the main window
+            self.mini_loading_widget.move(self.width() - 150, 10)
             
             # Show widget
             self.mini_loading_widget.show()
@@ -5641,8 +5905,8 @@ Press 'L' to cycle through modes."""
         self.grid_progress_bar.setTextVisible(False)
         layout.addWidget(self.grid_progress_bar)
         
-        # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
-        self.grid_loading_widget.setFixedSize(140, 20)
+        # Wider size to accommodate longer text
+        self.grid_loading_widget.setFixedSize(200, 20)
         
         # Show widget first
         self.grid_loading_widget.show()
@@ -5667,16 +5931,12 @@ Press 'L' to cycle through modes."""
         print(f"🔄 Ultra-minimal grid loading indicator shown: {grid_info}")
 
     def _position_grid_loading_widget(self):
-        """Position grid loading widget in center of PDF viewing area"""
+        """Position grid loading widget in top-right corner"""
         try:
             if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
-                # Get PDF container geometry for centering (this is the area excluding thumbnails)
-                pdf_area_rect = self.pdf_container.geometry()
-                self.grid_loading_widget.move(
-                    pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2,
-                    pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
-                )
-                print(f"📍 Grid loading widget positioned at PDF area center: {pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2}, {pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2}")
+                # Position in top-right corner with wider widget
+                self.grid_loading_widget.move(self.width() - 220, 10)
+                print(f"📍 Grid loading widget positioned at top-right corner: {self.width() - 220}, 10")
         except Exception as e:
             print(f"Error positioning grid loading widget: {e}")
 
@@ -5853,27 +6113,31 @@ Press 'L' to cycle through modes."""
             # Close any existing mini loader
             self.hide_mini_loading_indicator()
             
-            # Create ultra-minimal thumbnail loading widget
-            self.thumb_loading_widget = QWidget(self)
+            # Create ultra-minimal thumbnail loading widget - parent it to thumbnail list
+            self.thumb_loading_widget = QWidget(self.thumbnail_list)
             self.thumb_loading_widget.setObjectName("thumbnailLoadingWidget")
             self.thumb_loading_widget.setStyleSheet("""
-                QWidget {
-                    background-color: transparent;
+                #thumbnailLoadingWidget {
+                    background: none;
+                    border: none;
+                    opacity: 0;
                 }
                 QProgressBar {
                     border: none;
-                    background-color: rgba(240, 240, 240, 120);
-                    border-radius: 0px;
+                    background: none;
+                    opacity: 0;
                 }
                 QProgressBar::chunk {
-                    background-color: rgba(100, 100, 100, 200);
-                    border-radius: 0px;
+                    background: none;
+                    opacity: 0;
                 }
                 QLabel {
-                    color: rgba(120, 120, 120, 220);
+                    color: rgba(120, 120, 120, 180);
                     font-size: 9px;
                     font-weight: normal;
-                    background: transparent;
+                    background: none;
+                    border: none;
+                    opacity: 1;
                 }
             """)
             
@@ -5898,11 +6162,8 @@ Press 'L' to cycle through modes."""
             
             # Ultra-compact size and center in PDF viewing area (excluding thumbnails)
             self.thumb_loading_widget.setFixedSize(120, 20)
-            pdf_area_rect = self.pdf_container.geometry()
-            self.thumb_loading_widget.move(
-                pdf_area_rect.x() + (pdf_area_rect.width() - 120) // 2,
-                pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
-            )
+            # Position in top-right corner
+            self.thumb_loading_widget.move(self.width() - 170, 10)
             
             # Show widget
             self.thumb_loading_widget.show()
@@ -5929,27 +6190,31 @@ Press 'L' to cycle through modes."""
         self.hide_mini_loading_indicator()
         self.hide_thumbnail_loading_indicator()
         
-        # Create batch loading widget
-        self.thumb_loading_widget = QWidget(self)
+        # Create batch loading widget - parent it to thumbnail list
+        self.thumb_loading_widget = QWidget(self.thumbnail_list)
         self.thumb_loading_widget.setObjectName("thumbnailBatchLoadingWidget")
         self.thumb_loading_widget.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
+            #thumbnailBatchLoadingWidget {
+                background: none;
+                border: none;
+                opacity: 0;
             }
             QProgressBar {
                 border: none;
-                background-color: rgba(240, 240, 240, 120);
-                border-radius: 0px;
+                background: none;
+                opacity: 0;
             }
             QProgressBar::chunk {
-                background-color: rgba(100, 100, 100, 200);
-                border-radius: 0px;
+                background: none;
+                opacity: 0;
             }
             QLabel {
-                color: rgba(120, 120, 120, 220);
+                color: rgba(120, 120, 120, 180);
                 font-size: 9px;
                 font-weight: normal;
-                background: transparent;
+                background: none;
+                border: none;
+                opacity: 1;
             }
         """)
         
@@ -5971,13 +6236,10 @@ Press 'L' to cycle through modes."""
         self.thumb_progress_bar.setTextVisible(False)
         layout.addWidget(self.thumb_progress_bar)
         
-        # Ultra-compact size and center in PDF viewing area
+        # Ultra-compact size and position in top-right corner
         self.thumb_loading_widget.setFixedSize(140, 20)
-        pdf_area_rect = self.pdf_container.geometry()
-        self.thumb_loading_widget.move(
-            pdf_area_rect.x() + (pdf_area_rect.width() - 140) // 2,
-            pdf_area_rect.y() + (pdf_area_rect.height() - 20) // 2
-        )
+        # Position in top-right corner
+        self.thumb_loading_widget.move(self.width() - 170, 10)
         
         # Show widget
         self.thumb_loading_widget.show()
@@ -6008,6 +6270,9 @@ Press 'L' to cycle through modes."""
         super().resizeEvent(event)
         
         # Reposition all loading indicators if visible
+        if hasattr(self, 'loading_widget') and self.loading_widget and self.loading_widget.isVisible():
+            self.loading_widget.move(self.width() - 150, 10)
+            
         if hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and self.mini_loading_widget.isVisible():
             self.mini_loading_widget.move(self.width() - 150, 10)
             
@@ -6015,10 +6280,7 @@ Press 'L' to cycle through modes."""
             self.thumb_loading_widget.move(self.width() - 170, 10)
             
         if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and self.grid_loading_widget.isVisible():
-            self.grid_loading_widget.move(
-                (self.width() - 300) // 2,
-                (self.height() - 100) // 2
-            )
+            self.grid_loading_widget.move(self.width() - 220, 10)
 
     def generate_thumbnails_deferred(self, force_new_pdf=False):
         """Generate thumbnails after main view is ready"""
@@ -6647,11 +6909,11 @@ Press 'L' to cycle through modes."""
         try:
             # Create a simple, clean placeholder image without numbers
             placeholder_img = QImage(120, 160, QImage.Format.Format_RGB32)
-            placeholder_img.fill(QColor(60, 60, 60))  # Dark gray placeholder - clean and simple
+            placeholder_img.fill(QColor(38, 38, 38))  # Match thumbnail panel background exactly
             
             # Add some visual indication that it's loading
             painter = QPainter(placeholder_img)
-            painter.setPen(QColor(120, 120, 120))
+            painter.setPen(QColor(80, 80, 80))  # Subtle text color
             painter.setFont(QFont("Arial", 10))
             painter.drawText(placeholder_img.rect(), Qt.AlignmentFlag.AlignCenter, "Loading...")
             painter.end()
@@ -7697,6 +7959,10 @@ Press 'L' to cycle through modes."""
 
     def toggle_grid_view(self):
         """Toggle between single page and grid view"""
+        # Clean up any loading states before switching views (especially during slideshow)
+        if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+            self._cleanup_loading_states()
+        
         # Ensure both toolbar and menu actions are in sync
         checked_state = self.grid_view_action.isChecked()
         self.grid_view_menu_action.setChecked(checked_state)
@@ -7763,6 +8029,11 @@ Press 'L' to cycle through modes."""
             
             # STEP 7: Update widget after brief delay to ensure all state is reset
             QTimer.singleShot(50, lambda: self.pdf_widget.update())
+        
+        # Clean up any loading states that might have appeared during the transition
+        if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+            QTimer.singleShot(200, self._cleanup_loading_states)
+            QTimer.singleShot(500, self._cleanup_loading_states)
     
     def change_grid_size(self, size_text):
         """Change the grid layout size with comprehensive loading feedback"""
@@ -7817,8 +8088,316 @@ Press 'L' to cycle through modes."""
             
             # Kick off rendering of grid pages in background
             self.render_current_page()
+            
+            # Clean up any loading states that might hang during grid operations (especially during slideshow)
+            if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+                QTimer.singleShot(300, self._cleanup_loading_states)
+                QTimer.singleShot(1000, self._cleanup_loading_states)
         except ValueError:
             pass
+
+    def update_timer_interval(self, text):
+        """Update the timer interval based on combo box selection"""
+        time_map = {
+            "5 seconds": 5,
+            "10 seconds": 10,
+            "30 seconds": 30,
+            "1 minute": 60,
+            "2 minutes": 120,
+            "5 minutes": 300
+        }
+        
+        new_interval = time_map.get(text, 30)  # Default to 30 seconds instead of 3
+        self.timer_interval = new_interval
+        self.timer_remaining = new_interval
+        
+        # Update countdown widget
+        if hasattr(self, 'countdown_widget'):
+            self.countdown_widget.set_total_time(new_interval)
+            self.countdown_widget.set_remaining_time(new_interval)
+
+    def toggle_slideshow(self):
+        """Toggle slideshow on/off"""
+        if self._auto_advance_active:
+            self.stop_slideshow()
+        else:
+            self.start_slideshow()
+
+    def start_slideshow(self):
+        """Start the slideshow"""
+        if not self.pdf_doc or self.total_pages <= 1:
+            return
+        
+        # Clean up any existing loading states before starting
+        self._cleanup_loading_states()
+            
+        self._auto_advance_active = True
+        self.timer_remaining = self.timer_interval
+        self._is_timer_paused = False
+        
+        # Update UI
+        self.play_pause_btn.setText("⏸")
+        self.play_pause_btn.setToolTip("Pause slideshow (Space)")
+        
+        # Start timers
+        self.auto_advance_timer.start(1000)  # 1 second intervals
+        self.ring_update_timer.start(100)    # Smooth countdown animation
+        
+        self.status_bar.showMessage(f"Slideshow started - {self.timer_interval}s intervals", 2000)
+
+    def stop_slideshow(self):
+        """Stop the slideshow"""
+        self._auto_advance_active = False
+        self._is_timer_paused = False
+        
+        # Stop timers
+        self.auto_advance_timer.stop()
+        self.ring_update_timer.stop()
+        
+        # Clean up any hanging loading states
+        self._cleanup_loading_states()
+        
+        # Update UI
+        self.play_pause_btn.setText("▶")
+        self.play_pause_btn.setToolTip("Start slideshow (Space)")
+        
+        # Reset countdown
+        self.timer_remaining = self.timer_interval
+        if hasattr(self, 'countdown_widget'):
+            self.countdown_widget.set_remaining_time(self.timer_remaining)
+            self.countdown_widget.set_paused(False)
+        
+        self.status_bar.showMessage("Slideshow stopped", 2000)
+
+    def toggle_timer_pause(self):
+        """Toggle timer pause/resume"""
+        if not self._auto_advance_active:
+            return
+            
+        self._is_timer_paused = not self._is_timer_paused
+        
+        if hasattr(self, 'countdown_widget'):
+            self.countdown_widget.set_paused(self._is_timer_paused)
+        
+        status = "paused" if self._is_timer_paused else "resumed"
+        self.status_bar.showMessage(f"Slideshow {status}", 1000)
+
+    def _on_auto_advance_timer(self):
+        """Handle auto advance timer tick"""
+        if not self._auto_advance_active or self._is_timer_paused:
+            return
+            
+        self.timer_remaining -= 1
+        
+        if self.timer_remaining <= 0:
+            # Clean up any hanging loading states before page change
+            self._cleanup_loading_states()
+            
+            # Advance to next page
+            if self.current_page < self.total_pages - 1:
+                self.next_page()
+            else:
+                # Loop back to first page
+                self.go_to_page(1)
+            
+            # Clean up any new loading states that might have appeared after page change
+            QTimer.singleShot(100, self._cleanup_loading_states)
+            QTimer.singleShot(500, self._cleanup_loading_states)
+            
+            # Reset timer
+            self.timer_remaining = self.timer_interval
+
+    def _cleanup_loading_states(self):
+        """Clean up any hanging loading states during slideshow transitions"""
+        try:
+            # FORCE FINISH ANY THUMBNAIL LOADING IMMEDIATELY
+            if hasattr(self, 'force_finish_thumbnail_loading'):
+                self.force_finish_thumbnail_loading()
+            
+            # HIDE ANY THUMBNAIL LOADING INDICATORS
+            if hasattr(self, 'hide_thumbnail_loading_indicator'):
+                self.hide_thumbnail_loading_indicator()
+                
+            # FORCE FINISH AND HIDE GRID LOADING INDICATORS
+            if hasattr(self, '_finish_grid_loading'):
+                self._finish_grid_loading()
+            if hasattr(self, 'hide_grid_loading_indicator'):
+                self.hide_grid_loading_indicator()
+            
+            # FORCE FINISH ALL LOADING PROCESSES
+            if hasattr(self, '_finish_thumbnail_loading'):
+                self._finish_thumbnail_loading()
+                
+            # Stop any loading timers that might be running
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                # AGGRESSIVE: Reset animation time to prevent hanging spinners
+                if hasattr(self.pdf_widget, 'animation_time'):
+                    self.pdf_widget.animation_time = 0.0
+                
+                # AGGRESSIVE: Force disable any loading flags
+                for attr in ['_show_loading', '_is_loading', '_loading_visible', 
+                            '_rendering_in_progress', '_loading_spinner_active', '_show_spinner']:
+                    if hasattr(self.pdf_widget, attr):
+                        setattr(self.pdf_widget, attr, False)
+                
+                # AGGRESSIVE: Clear any OpenGL loading state
+                if hasattr(self.pdf_widget, 'makeCurrent') and callable(self.pdf_widget.makeCurrent):
+                    self.pdf_widget.makeCurrent()
+                    # Force immediate clear and redraw
+                    try:
+                        from OpenGL.GL import glClear, glClearColor, GL_COLOR_BUFFER_BIT
+                        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
+                        glClear(GL_COLOR_BUFFER_BIT)
+                    except:
+                        pass  # Ignore OpenGL errors
+                
+                # AGGRESSIVE: Force multiple immediate updates to clear visuals
+                self.pdf_widget.update()
+                QTimer.singleShot(10, self.pdf_widget.update)
+                QTimer.singleShot(50, self.pdf_widget.update)
+                QTimer.singleShot(100, self.pdf_widget.update)
+            
+            # Clean up any widget-level loading timers
+            timer_attrs = ['loading_timer', 'mini_loading_timer', '_thumb_timeout_timer', '_grid_timeout_timer']
+            for timer_attr in timer_attrs:
+                if hasattr(self, timer_attr):
+                    timer = getattr(self, timer_attr)
+                    if timer:
+                        timer.stop()
+                        setattr(self, timer_attr, None)
+                
+            # AGGRESSIVE: Hide and cleanup all possible loading widgets
+            loading_widget_attrs = ['thumb_loading_widget', 'loading_widget', 'progress_widget', 
+                                   'grid_loading_widget', 'mini_loading_widget']
+            for widget_attr in loading_widget_attrs:
+                if hasattr(self, widget_attr):
+                    widget = getattr(self, widget_attr)
+                    if widget:
+                        widget.hide()
+                        try:
+                            widget.deleteLater()
+                        except:
+                            pass
+                        setattr(self, widget_attr, None)
+                        
+            # AGGRESSIVE: Clear loading progress references
+            progress_attrs = ['grid_progress_bar', 'grid_status_label', 'grid_info_label', 
+                             'thumb_progress_bar', 'thumb_page_label']
+            for attr in progress_attrs:
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+                
+            # AGGRESSIVE: Force complete widget refresh
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                # Force repaint event to completely refresh visuals
+                self.pdf_widget.repaint()
+                
+        except Exception as e:
+            # Silently handle any cleanup errors to avoid disrupting slideshow
+            pass
+
+    def _on_ring_update_timer(self):
+        """Update the countdown ring display"""
+        if hasattr(self, 'countdown_widget'):
+            self.countdown_widget.set_remaining_time(self.timer_remaining)
+
+    def show_main_context_menu(self, position):
+        """Display main window context menu (useful in fullscreen mode)"""
+        menu = QMenu(self)
+        
+        # Slideshow section
+        if hasattr(self, '_auto_advance_active'):
+            if self._auto_advance_active:
+                if self._is_timer_paused:
+                    slideshow_action = menu.addAction("▶ Resume Slideshow")
+                else:
+                    slideshow_action = menu.addAction("⏸ Pause Slideshow")
+                stop_slideshow_action = menu.addAction("⏹ Stop Slideshow")
+            else:
+                slideshow_action = menu.addAction("▶ Start Slideshow")
+                stop_slideshow_action = None
+        else:
+            slideshow_action = menu.addAction("▶ Start Slideshow")
+            stop_slideshow_action = None
+        
+        # Add separator
+        menu.addSeparator()
+        
+        # Navigation section
+        next_page_action = menu.addAction("Next Page")
+        prev_page_action = menu.addAction("Previous Page")
+        
+        # Add separator
+        menu.addSeparator()
+        
+        # View options
+        if hasattr(self, 'grid_view_action'):
+            toggle_grid_action = menu.addAction("Toggle Grid View")
+            if self.grid_view_action.isChecked():
+                toggle_grid_action.setText("Exit Grid View")
+            else:
+                toggle_grid_action.setText("Grid View")
+        else:
+            toggle_grid_action = None
+            
+        # Fullscreen toggle
+        if self.isFullScreen():
+            fullscreen_action = menu.addAction("Exit Fullscreen (F11)")
+        else:
+            fullscreen_action = menu.addAction("Enter Fullscreen (F11)")
+        
+        # Get action from menu
+        action = menu.exec(position)
+        
+        # Handle actions
+        if action == next_page_action:
+            if hasattr(self, 'next_page'):
+                self.next_page()
+        elif action == prev_page_action:
+            if hasattr(self, 'prev_page'):
+                self.prev_page()
+        elif action == slideshow_action:
+            if hasattr(self, '_auto_advance_active'):
+                if self._auto_advance_active:
+                    # Toggle pause/resume
+                    self.toggle_timer_pause()
+                else:
+                    # Start slideshow
+                    self.start_slideshow()
+            elif hasattr(self, 'start_slideshow'):
+                self.start_slideshow()
+        elif action == stop_slideshow_action and stop_slideshow_action:
+            if hasattr(self, 'stop_slideshow'):
+                self.stop_slideshow()
+        elif action == toggle_grid_action and toggle_grid_action:
+            if hasattr(self, 'toggle_grid_view'):
+                self.toggle_grid_view()
+        elif action == fullscreen_action:
+            if hasattr(self, 'toggle_fullscreen'):
+                self.toggle_fullscreen()
+
+    def contextMenuEvent(self, event):
+        """Handle context menu events for the entire window"""
+        local_pos = event.pos()
+        pdf_widget = getattr(self, 'pdf_widget', None)
+        
+        if pdf_widget and pdf_widget.geometry().contains(local_pos):
+            # Right-click on PDF widget area
+            pdf_local_pos = pdf_widget.mapFrom(self, local_pos)
+            pdf_widget.show_context_menu(pdf_local_pos)
+        else:
+            # Right-click on main window area (toolbars, etc.)
+            self.show_main_context_menu(self.mapToGlobal(local_pos))
+        event.accept()
+
+    def mousePressEvent(self, event):
+        """Handle mouse press events for context menu in fullscreen"""
+        if event.button() == Qt.MouseButton.RightButton:
+            # Show context menu on right-click, especially useful in fullscreen
+            self.show_main_context_menu(event.pos())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
     
     def closeEvent(self, event):
         if hasattr(self, 'renderer') and self.renderer:
