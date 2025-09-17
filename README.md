@@ -65,10 +65,11 @@ Compile to standalone executable using PyInstaller:
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --name="GPU PDF Viewer" --clean main.py
+pyinstaller --noconfirm --onefile --windowed --icon=working_icon.ico --name="GPU PDF Viewer" main.py
 ```
 
 Binary will be in `dist/` folder. Build on target OS for best compatibility.
 
 ---
+
 
