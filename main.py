@@ -9861,12 +9861,23 @@ Press 'L' to cycle through modes."""
         
         # Update thumbnails around new current page if selective loading is enabled
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
-            # Check if we need to extend thumbnail range
-            if hasattr(self, '_current_thumb_range'):
-                start_page, end_page = self._current_thumb_range
-                # If we're near the beginning of loaded range, load more earlier pages
-                if self.current_page <= start_page + 5 and start_page > 0:
-                    self.generate_thumbnails(around_page=self.current_page, radius=20, preserve_scroll=True)
+            # Check if we already have all thumbnails loaded
+            existing_thumbs = 0
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]:
+                    existing_thumbs += 1
+            
+            # Only regenerate if we don't have most pages loaded already
+            if existing_thumbs < (self.total_pages * 0.8):  # Less than 80% of pages loaded
+                # Check if we need to extend thumbnail range
+                if hasattr(self, '_current_thumb_range'):
+                    start_page, end_page = self._current_thumb_range
+                    # If we're near the beginning of loaded range, load more earlier pages
+                    if self.current_page <= start_page + 5 and start_page > 0:
+                        self.generate_thumbnails(around_page=self.current_page, radius=20, preserve_scroll=True)
+            else:
+                console.log(f"📋 Keeping all {existing_thumbs} existing thumbnails during prev navigation (not regenerating)")
         
         # Clean up distant textures to save memory
         self.pdf_widget.cleanup_distant_textures()
@@ -9936,9 +9947,20 @@ Press 'L' to cycle through modes."""
         # Start async page rendering
         self._render_page_async()
         
-        # Update thumbnails if needed
+        # Update thumbnails if needed - BUT DON'T CLEAR EXISTING THUMBNAILS
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
-            QTimer.singleShot(100, lambda: self.generate_thumbnails(around_page=self.current_page, preserve_scroll=True))
+            # Check if we already have all thumbnails loaded
+            existing_thumbs = 0
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]:
+                    existing_thumbs += 1
+            
+            # Only regenerate if we don't have most pages loaded already
+            if existing_thumbs < (self.total_pages * 0.8):  # Less than 80% of pages loaded
+                QTimer.singleShot(100, lambda: self.generate_thumbnails(around_page=self.current_page, preserve_scroll=True))
+            else:
+                console.log(f"📋 Keeping all {existing_thumbs} existing thumbnails during navigation (not regenerating)")
         
         # Auto-scroll to current page thumbnail
         QTimer.singleShot(100, self._scroll_to_current_thumbnail)
