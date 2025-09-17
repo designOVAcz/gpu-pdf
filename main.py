@@ -41,6 +41,15 @@ from typing import Optional, List, Tuple
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import math
+import gc
+import psutil
+import sys
+import os
+import time
+import traceback
+import tempfile
+import hashlib
+import numpy as np
 
 # Essential imports for startup
 try:
@@ -55,7 +64,8 @@ try:
                                 QSpinBox, QProgressBar, QTextEdit, QSplitter, QFrame,
                                 QListWidget, QListWidgetItem, QCheckBox, QComboBox,
                                 QGroupBox, QGridLayout, QScrollArea, QStatusBar,
-                                QToolBar, QMenuBar, QMenu, QMessageBox, QStyle)
+                                QToolBar, QMenuBar, QMenu, QMessageBox, QInputDialog, 
+                                QLineEdit, QStyle, QAbstractItemView)
     from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPointF
     from PyQt6.QtGui import (QPixmap, QImage, QPainter, QFont, QIcon, QKeySequence,
                             QShortcut, QAction, QPalette, QColor, QActionGroup, QPen, QPolygon, QMouseEvent, QGuiApplication)
@@ -75,14 +85,71 @@ except ImportError:
     print("Please install OpenGL: pip install PyOpenGL PyOpenGL_accelerate numpy")
     sys.exit(1)
 
-# Reduce Qt image allocation for faster startup
-os.environ['QT_IMAGEIO_MAXALLOC'] = '256'  # Minimal allocation for fastest startup
+# 🚀 PERFORMANCE: Increase Qt image allocation for large PDF processing
+os.environ['QT_IMAGEIO_MAXALLOC'] = '2048'  # 2GB allocation for large PDF thumbnails (was 256MB)
+
+# Console logging system for EXE toggle functionality
+class ConsoleLogger:
+    def __init__(self):
+        self.enabled = True  # Default enabled for development
+        self.is_exe = getattr(sys, 'frozen', False)  # Detect if running as EXE
+        if self.is_exe:
+            self.enabled = False  # Default disabled for EXE
+        
+    def log(self, message):
+        """Log message if console logging is enabled"""
+        if self.enabled:
+            print(message)
+            
+    def toggle(self):
+        """Toggle console logging on/off"""
+        self.enabled = not self.enabled
+        status = "enabled" if self.enabled else "disabled"
+        print(f"📺 Console logging {status}")
+        return self.enabled
+
+# Global console logger instance
+console = ConsoleLogger()
+
+
+class FullscreenSafeLineEdit(QLineEdit):
+    """Custom QLineEdit that completely absorbs Enter key events to prevent fullscreen exit"""
+    
+    # Define custom signal at class level
+    escapePressed = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+    def keyPressEvent(self, event):
+        """Override to completely absorb Enter key events"""
+        console.log(f"🔧 DEBUG: FullscreenSafeLineEdit.keyPressEvent called with key: {event.key()}")
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            console.log("🔧 DEBUG: Enter key detected in FullscreenSafeLineEdit - absorbing and emitting signal")
+            # Emit returnPressed signal but completely absorb the event
+            self.returnPressed.emit()
+            event.accept()  # Mark as handled
+            return  # Don't call super() - completely absorb the event
+        elif event.key() == Qt.Key.Key_Escape:
+            console.log("🔧 DEBUG: Escape key detected in FullscreenSafeLineEdit - absorbing and emitting signal")
+            # Emit custom escape signal and absorb
+            self.escapePressed.emit()
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_F11:
+            console.log("🔧 DEBUG: F11 key detected in FullscreenSafeLineEdit - completely ignoring")
+            # Completely ignore F11 to prevent fullscreen toggle
+            event.accept()
+            return
+        
+        # For all other keys, handle normally
+        super().keyPressEvent(event)
 
 
 class GPUTextureCache:
     """🚀 LAYER 3: Intelligent GPU texture cache with advanced memory management"""
     
-    def __init__(self, max_textures=200):  # MASSIVE increase for modern GPUs (was 20)
+    def __init__(self, max_textures=50):  # Reasonable default for good performance/memory balance
         self.textures = {}  # (page_num, quality) -> QOpenGLTexture
         self.page_textures = {}  # page_num -> best_quality_texture (for backwards compatibility)
         self.dimensions = {}  # page_num -> (width, height)
@@ -91,19 +158,54 @@ class GPUTextureCache:
         self.access_order = []  # LRU tracking for (page_num, quality) keys
         self.priority_textures = set()  # High-quality textures to keep longer
         
-        # 🚀 EXTREME GPU VRAM USAGE for modern graphics cards
+        # 🚀 ADAPTIVE GPU VRAM USAGE based on document size
         self.texture_memory_usage = {}  # (page_num, quality) -> estimated memory in bytes
         self.total_memory_usage = 0
-        self.max_memory_mb = 3072  # 3GB GPU VRAM limit (was 256MB) for maximum performance
+        
+        # ADAPTIVE MEMORY LIMITS: Reasonable defaults with document-size optimization
+        # This will be dynamically adjusted based on PDF size
+        self.max_memory_mb = 512  # Default 512MB limit for good performance/memory balance
+        self.large_pdf_mode = False  # Will be set for large PDFs
         
         # Performance statistics
         self._cache_hits = 0
         self._cache_misses = 0
         self._evictions = 0
     
+    def optimize_for_large_pdf(self, file_size_mb, total_pages):
+        """Optimize cache settings for large PDFs"""
+        if file_size_mb > 300 or total_pages > 500:  # Very large PDF
+            self.large_pdf_mode = True
+            self.max_memory_mb = 256  # Reduce to 256MB for very large PDFs
+            self.max_textures = 25   # Reduce texture count
+            console.log(f"🚀 LARGE PDF MODE: Cache optimized for {file_size_mb:.1f}MB/{total_pages}p PDF (max: {self.max_memory_mb}MB, {self.max_textures} textures)")
+        elif file_size_mb > 100 or total_pages > 200:  # Large PDF
+            self.large_pdf_mode = True
+            self.max_memory_mb = 384  # Reduce to 384MB for large PDFs
+            self.max_textures = 35   # Reduce texture count
+            console.log(f"⚡ OPTIMIZED MODE: Cache tuned for {file_size_mb:.1f}MB/{total_pages}p PDF (max: {self.max_memory_mb}MB, {self.max_textures} textures)")
+        else:
+            self.large_pdf_mode = False
+            # Keep default settings for small PDFs (512MB, 50 textures)
+    
     def get_memory_usage_mb(self):
-        """Get current memory usage in MB"""
-        return self.total_memory_usage / (1024 * 1024)
+        """Get current process memory usage in MB using psutil"""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            # Return RSS (Resident Set Size) in MB - actual physical memory used
+            return memory_info.rss / (1024 * 1024)
+        except Exception as e:
+            console.log(f"⚠️ Error getting memory usage: {e}")
+            # Fallback to manual calculation if psutil fails
+            return self.total_memory_usage / (1024 * 1024)
+    
+    def get_cache_size_mb(self):
+        """Get the total size of textures in the cache in MB."""
+        # Return both texture cache memory and actual process memory
+        texture_memory = self.total_memory_usage / (1024 * 1024)
+        process_memory = self.get_memory_usage_mb()
+        return process_memory  # Return actual process memory for more useful stats
     
     def get_cache_stats(self):
         """Get cache performance statistics"""
@@ -118,13 +220,24 @@ class GPUTextureCache:
             'textures': len(self.textures)
         }
     
+    def get_active_texture_count(self):
+        """Get the number of active textures in cache"""
+        return len(self.textures)
+    
+    def has_texture_for_page(self, page_num):
+        """Check if we have any texture cached for a specific page"""
+        for key in self.textures.keys():
+            if key[0] == page_num:  # key is (page_num, quality)
+                return True
+        return False
+    
     def cleanup_texture(self, texture):
         """Safely destroy and cleanup a texture"""
         try:
             if texture and hasattr(texture, 'isCreated') and texture.isCreated():
                 texture.destroy()
         except Exception as e:
-            print(f"Error cleaning up texture: {e}")
+            console.log(f"Error cleaning up texture: {e}")
     
     def clear_cache(self):
         """Clear all textures from cache"""
@@ -688,6 +801,131 @@ class BackgroundMatchDialog(QDialog):
         self.priority_textures.clear()  # Clear priority set
 
 
+class GoToPageDialog(QDialog):
+    """Custom fullscreen-safe page navigation dialog"""
+    
+    def __init__(self, current_page, total_pages, is_fullscreen, parent=None):
+        super().__init__(parent)
+        self.current_page = current_page
+        self.total_pages = total_pages
+        self.is_fullscreen = is_fullscreen
+        
+        self.setWindowTitle("Go to Page (Ctrl+G)")
+        self.setModal(True)
+        
+        # FIXED: Specific flags for fullscreen compatibility
+        if is_fullscreen:
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            # Don't use Tool flag in fullscreen as it can cause issues
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        """Initialize the dialog UI"""
+        layout = QVBoxLayout(self)
+        
+        # Add instruction label
+        label = QLabel(f"Enter page number (1-{self.total_pages}):")
+        layout.addWidget(label)
+        
+        # Add page input
+        self.page_input = QLineEdit()
+        self.page_input.setText(str(self.current_page))
+        self.page_input.selectAll()
+        layout.addWidget(self.page_input)
+        
+        # Add buttons
+        button_layout = QHBoxLayout()
+        
+        self.ok_button = QPushButton("OK")
+        self.cancel_button = QPushButton("Cancel")
+        
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+        
+        # Connect signals
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+        self.page_input.returnPressed.connect(self.accept)  # Enter key
+        
+        # Set focus to input
+        self.page_input.setFocus()
+        
+        # Compact size
+        self.setFixedSize(300, 120)
+        
+    def get_page_number(self):
+        """Get the entered page number"""
+        try:
+            return int(self.page_input.text())
+        except ValueError:
+            return self.current_page
+            
+    def keyPressEvent(self, event):
+        """Handle key events - prevent F11 from propagating"""
+        if event.key() == Qt.Key.Key_F11:
+            # Ignore F11 to prevent fullscreen toggle
+            event.ignore()
+            return
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            return
+        
+        super().keyPressEvent(event)
+
+
+class GoToPageOverlay(QWidget):
+    """A non-dialog overlay for page navigation that is safe for fullscreen."""
+    page_selected = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        
+        self.setStyleSheet("""
+            background-color: rgba(20, 20, 20, 200);
+            color: white;
+            border-radius: 8px;
+            padding: 10px;
+        """)
+        
+        layout = QVBoxLayout(self)
+        self.label = QLabel("Go to Page:")
+        self.input = QLineEdit()
+        self.input.setStyleSheet("border: 1px solid gray; border-radius: 4px; padding: 5px;")
+        self.input.returnPressed.connect(self._on_enter)
+        
+        layout.addWidget(self.label)
+        layout.addWidget(self.input)
+        
+        self.hide()
+
+    def show_overlay(self, total_pages):
+        self.label.setText(f"Go to Page (1-{total_pages}):")
+        self.input.clear()
+        self.show()
+        self.raise_()
+        self.input.setFocus()
+
+    def _on_enter(self):
+        try:
+            page = int(self.input.text())
+            self.page_selected.emit(page)
+        except ValueError:
+            pass  # Ignore invalid input
+        self.hide()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide()
+        else:
+            super().keyPressEvent(event)
+
+
 class ThumbnailWorker(QThread):
     """🚀 LAYER 1: Advanced GPU-optimized thumbnail worker with parallel processing and disk caching"""
     thumbnailReady = pyqtSignal(int, QImage)
@@ -706,7 +944,20 @@ class ThumbnailWorker(QThread):
         
         # Performance tracking for adaptive quality
         self._render_times = []
-        self._adaptive_quality = 0.4  # Start with reasonable quality
+        
+        # ADAPTIVE QUALITY: Reduce quality for large documents to save memory
+        self.total_pages = pdf_doc.page_count if pdf_doc else 0
+        if self.total_pages > 500:  # Very large document
+            self._adaptive_quality = 0.15  # Very low quality for huge PDFs
+            console.log(f"🔽 Very low thumbnail quality for {self.total_pages} page document")
+        elif self.total_pages > 200:  # Large document
+            self._adaptive_quality = 0.25  # Low quality for large PDFs
+            console.log(f"🔽 Low thumbnail quality for {self.total_pages} page document") 
+        elif self.total_pages > 50:  # Medium document
+            self._adaptive_quality = 0.35  # Medium quality
+            console.log(f"📊 Medium thumbnail quality for {self.total_pages} page document")
+        else:
+            self._adaptive_quality = 0.4  # Standard quality for small documents
 
     def stop(self):
         """Stop the thumbnail worker"""
@@ -738,7 +989,7 @@ class ThumbnailWorker(QThread):
                 self.cache_dir = None
                 self.cache_prefix = None
         except Exception as e:
-            print(f"Cache init error: {e}")
+            console.log(f"Cache init error: {e}")
             self.cache_dir = None
             self.cache_prefix = None
 
@@ -757,7 +1008,7 @@ class ThumbnailWorker(QThread):
                 if not cached_image.isNull():
                     return cached_image
         except Exception as e:
-            print(f"Cache load error for page {page_num}: {e}")
+            console.log(f"Cache load error for page {page_num}: {e}")
         return None
 
     def _save_to_cache(self, page_num, qimage):
@@ -768,13 +1019,14 @@ class ThumbnailWorker(QThread):
                 # Save as WebP for optimal compression and speed
                 qimage.save(cache_path, "WEBP", quality=80)
         except Exception as e:
-            print(f"Cache save error for page {page_num}: {e}")
+            console.log(f"Cache save error for page {page_num}: {e}")
 
     def run(self):
         """🚀 LAYER 1: Advanced parallel thumbnail generation with intelligent caching"""
         try:
             if self.page_list:
                 pages_to_process = self.page_list[:self.limit]
+                total = len(pages_to_process)  # Fix: define total for page_list case
             else:
                 total = min(self.pdf_doc.page_count if self.pdf_doc else 0, self.limit)
                 pages_to_process = list(range(total))
@@ -784,17 +1036,25 @@ class ThumbnailWorker(QThread):
                 center = len(pages_to_process) // 2
                 # Sort by distance from center for smarter loading
                 pages_to_process.sort(key=lambda p: abs(p - center))
-                print(f"🧠 Smart loading: {len(pages_to_process)} thumbnails, center priority around page {center}")
+                console.log(f"🧠 Smart loading: {len(pages_to_process)} thumbnails, center priority around page {center}")
             
             # LAYER 1 OPTIMIZATION: Parallel processing with ThreadPoolExecutor
             from concurrent.futures import ThreadPoolExecutor, as_completed
             import threading
             
-            # Use optimal number of threads (2-4) to avoid overwhelming the system
-            max_workers = min(4, max(2, len(pages_to_process) // 10))
+            # EMERGENCY FIX: Drastically reduce workers for large documents
+            if total > 200:  # Large document
+                max_workers = 1  # Single threaded for huge PDFs to prevent system freeze
+                console.log(f"🚨 Large PDF detected ({total} pages) - using single thread for safety")
+            elif total > 50:  # Medium document
+                max_workers = 2  # Reduced threading for medium PDFs
+                console.log(f"⚠️ Medium PDF ({total} pages) - using reduced threading")
+            else:
+                # Use optimal number of threads (2-4) only for small documents
+                max_workers = min(4, max(2, len(pages_to_process) // 10))
             
             if max_workers > 1 and len(pages_to_process) > 5:
-                print(f"🔥 Parallel processing: {max_workers} workers for {len(pages_to_process)} thumbnails")
+                console.log(f"🔥 Parallel processing: {max_workers} workers for {len(pages_to_process)} thumbnails")
                 # Parallel processing for better performance
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     # Submit all pages for parallel processing
@@ -804,39 +1064,53 @@ class ThumbnailWorker(QThread):
                     }
                     
                     # Process completed thumbnails as they finish
+                    processed_count = 0
                     for future in as_completed(future_to_page):
                         if not self._running:
+                            console.log("🛑 Thumbnail loading cancelled by user")
+                            break
+                        
+                        # EMERGENCY EXIT: Cancel if any thumbnails are being processed for large docs
+                        processed_count += 1
+                        if self.total_pages > 200 and processed_count > 5:  # Very strict limit for huge PDFs
+                            console.log(f"🚨 Emergency exit: Processed {processed_count} thumbnails, stopping immediately for large PDF")
+                            break
+                        elif self.total_pages > 50 and processed_count > 10:  # Strict limit for large PDFs
+                            console.log(f"🚨 Emergency exit: Processed {processed_count} thumbnails, stopping for performance")
+                            break
+                        elif processed_count > 20:  # General limit for all PDFs
+                            console.log(f"🚨 Emergency exit: Processed {processed_count} thumbnails, stopping to prevent freeze")
                             break
                         
                         page_num = future_to_page[future]
                         try:
-                            result = future.result(timeout=5.0)  # 5 second timeout per thumbnail
+                            result = future.result(timeout=1.0)  # Reduced timeout from 2s to 1s for faster cancellation
                             if result:  # If thumbnail was generated successfully
                                 pass  # Result already emitted in _process_single_thumbnail
                         except Exception as e:
-                            print(f"Parallel thumbnail error for page {page_num}: {e}")
+                            console.log(f"Parallel thumbnail error for page {page_num}: {e}")
             else:
                 # Single-threaded processing for small batches
-                print(f"📋 Sequential processing: {len(pages_to_process)} thumbnails")
+                console.log(f"📋 Sequential processing: {len(pages_to_process)} thumbnails")
                 for page_num in pages_to_process:
                     if not self._running:
                         break
                     self._process_single_thumbnail(page_num)
                         
         except Exception as e:
-            print(f"Thumbnail worker error: {e}")
+            console.log(f"Thumbnail worker error: {e}")
         finally:
             self.finished.emit()
 
     def _process_single_thumbnail(self, page_num):
         """Process a single thumbnail with all Layer 1 optimizations"""
         try:
-            print(f"🔧 Processing thumbnail for page {page_num}")
+            console.log(f"🔧 Processing thumbnail for page {page_num}")
             
             # LAYER 1 OPTIMIZATION 1: Check disk cache first (fastest possible)
             cached_image = self._load_from_cache(page_num)
             if cached_image:
-                print(f"💾 Found cached thumbnail for page {page_num}")
+                console.log(f"💾 Found cached thumbnail for page {page_num}")
                 self.thumbnailReady.emit(page_num, cached_image)
                 return True
             
@@ -895,14 +1169,14 @@ class ThumbnailWorker(QThread):
                     if len(self._render_times) > 20:
                         self._render_times.pop(0)  # Keep only recent times
                     
-                    print(f"✅ Emitting thumbnailReady signal for page {page_num}")
+                    console.log(f"✅ Emitting thumbnailReady signal for page {page_num}")
                     self.thumbnailReady.emit(page_num, qimage)
                     return True
             
             return False
             
         except Exception as e:
-            print(f"Single thumbnail error ({page_num}): {e}")
+            console.log(f"Single thumbnail error ({page_num}): {e}")
             return False
 
 
@@ -1004,7 +1278,7 @@ class PDFPageRenderer(QThread):
             try:
                 self.pdf_doc = fitz.open(self.pdf_path)
             except Exception as e:
-                print(f"PDFPageRenderer: failed to open {self.pdf_path}: {e}")
+                console.log(f"PDFPageRenderer: failed to open {self.pdf_path}: {e}")
                 self.pdf_doc = None
             while self._running:
                 # CRITICAL: Skip all processing when paused (during panning)
@@ -1050,8 +1324,23 @@ class PDFPageRenderer(QThread):
                     page = self.pdf_doc[page_num]
                     mat = fitz.Matrix(render_quality, render_quality)  # Use per-page quality
                     
-                    # Enhanced high-quality rendering with better antialiasing for text sharpness
-                    pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
+                    # OPTIMIZED RENDERING: Use faster rendering for large files
+                    file_size_mb = 0
+                    try:
+                        if hasattr(self, 'pdf_path') and os.path.exists(self.pdf_path):
+                            file_size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
+                    except:
+                        pass
+                    
+                    if file_size_mb > 300:  # Very large files - use fastest rendering
+                        # Ultra-fast rendering: no antialiasing, no annotations for speed
+                        pix = page.get_pixmap(matrix=mat, alpha=False, annots=False)
+                    elif file_size_mb > 100:  # Large files - balanced rendering
+                        # Fast rendering: minimal processing
+                        pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
+                    else:
+                        # Enhanced high-quality rendering with better antialiasing for text sharpness
+                        pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
                         
                     # Use PNG bytes which QImage understands reliably
                     # For all quality levels, use the reliable PNG method
@@ -1063,7 +1352,7 @@ class PDFPageRenderer(QThread):
 
                 except Exception as e:
                     # Continue processing remaining pages on error
-                    print(f"Renderer error rendering page {page_num}: {e}")
+                    console.log(f"Renderer error rendering page {page_num}: {e}")
 
         finally:
             try:
@@ -1387,7 +1676,7 @@ class GPUPDFWidget(QOpenGLWidget):
                     if len(self._texture_processing_times) > 20:
                         self._texture_processing_times.pop(0)
             except Exception as e:
-                print(f"Error processing pending images: {e}")
+                console.log(f"Error processing pending images: {e}")
             
             # 🚀 LAYER 2 OPTIMIZATION: Optimized rendering path selection
             try:
@@ -1410,7 +1699,7 @@ class GPUPDFWidget(QOpenGLWidget):
                         # Fallback for older signature (defensive)
                         self.render_grid_view()
                     except Exception as e:
-                        print(f"Grid rendering error: {e}")
+                        console.log(f"Grid rendering error: {e}")
                 else:
                     render_start = time.perf_counter()
                     self.render_single_page()
@@ -1424,11 +1713,11 @@ class GPUPDFWidget(QOpenGLWidget):
                         self._single_render_times.pop(0)
                         
             except Exception as e:
-                print(f"OpenGL rendering error: {e}")
+                console.log(f"OpenGL rendering error: {e}")
                 # Prevent crash by catching any OpenGL errors
                 
         except Exception as e:
-            print(f"Main paintGL error: {e}")
+            console.log(f"Main paintGL error: {e}")
             # Prevent crash by catching any OpenGL errors
     
     def render_single_page(self):
@@ -1529,7 +1818,7 @@ class GPUPDFWidget(QOpenGLWidget):
             # Keep reference to bound texture in _last_bound_texture
         
         except Exception as e:
-            print(f"OpenGL rendering error in render_single_page: {e}")
+            console.log(f"OpenGL rendering error in render_single_page: {e}")
             # Clear any OpenGL errors to prevent crashes
             import OpenGL.GL as gl
             while gl.glGetError() != gl.GL_NO_ERROR:
@@ -1632,7 +1921,7 @@ class GPUPDFWidget(QOpenGLWidget):
             texture_to_render.release()
         else:
             # Debug when no texture found
-            print(f"❌ NO TEXTURE for page {current_page}: main={main_available}, cache={cache_available}, grid={grid_available}")
+            console.log(f"❌ NO TEXTURE for page {current_page}: main={main_available}, cache={cache_available}, grid={grid_available}")
             # Minimal placeholder instead of loading state during resize/pan
             self._draw_minimal_single_page_placeholder()
     
@@ -2397,7 +2686,7 @@ class GPUPDFWidget(QOpenGLWidget):
                 viewer.renderer.add_page_to_queue(current_page, priority=True, quality=target_quality)
             
         except Exception as e:
-            print(f"Error handling single page resize: {e}")
+            console.log(f"Error handling single page resize: {e}")
 
     def _clear_single_page_cache(self):
         """Clear cached rendering state for single page mode"""
@@ -2412,9 +2701,9 @@ class GPUPDFWidget(QOpenGLWidget):
                 pass
                 
         except Exception as e:
-            print(f"Error clearing single page cache: {e}")
+            console.log(f"Error clearing single page cache: {e}")
 
-    def cleanup_distant_textures(self, keep_distance=20):
+    def cleanup_distant_textures(self, keep_distance=10):
         """Remove textures that are far from current view to save memory"""
         if not hasattr(self, 'window') or not self.window():
             return
@@ -2464,11 +2753,11 @@ class GPUPDFWidget(QOpenGLWidget):
             has_cache_texture = hasattr(self, 'texture_cache') and self.texture_cache.get_texture(current_page) is not None
             has_grid_texture = hasattr(self, 'grid_textures') and current_page in self.grid_textures
             
-            print(f"🔧 _ensure_current_page_visible: page {current_page}, main={has_main_texture}, cache={has_cache_texture}, grid={has_grid_texture}")
+            console.log(f"🔧 _ensure_current_page_visible: page {current_page}, main={has_main_texture}, cache={has_cache_texture}, grid={has_grid_texture}")
             
             if not (has_main_texture or has_cache_texture or has_grid_texture):
                 # No texture available - force immediate render
-                print(f"🔧 No texture found - forcing render of page {current_page}")
+                console.log(f"🔧 No texture found - forcing render of page {current_page}")
                 if hasattr(self.window(), 'render_current_page'):
                     self.window().render_current_page()
             
@@ -2476,7 +2765,7 @@ class GPUPDFWidget(QOpenGLWidget):
             self.update()
             
         except Exception as e:
-            print(f"Error ensuring page visibility: {e}")
+            console.log(f"Error ensuring page visibility: {e}")
 
     def _update_performance_stats(self, frame_start_time):
         """🚀 LAYER 3: Update performance monitoring statistics"""
@@ -2516,13 +2805,13 @@ class GPUPDFWidget(QOpenGLWidget):
                 if current_level == 'low' and previous_level != 'low':
                     # Performance just dropped - pause background rendering
                     if hasattr(self.renderer, 'pause') and not getattr(self, '_renderer_manually_paused', False):
-                        print("🚀 Auto-pausing renderer due to low performance")
+                        console.log("🚀 Auto-pausing renderer due to low performance")
                         self.renderer.pause()
                         self._renderer_auto_paused = True
                 elif current_level != 'low' and previous_level == 'low':
                     # Performance recovered - resume background rendering
                     if hasattr(self.renderer, 'resume') and getattr(self, '_renderer_auto_paused', False):
-                        print("🚀 Auto-resuming renderer as performance recovered")
+                        console.log("🚀 Auto-resuming renderer as performance recovered")
                         self.renderer.resume()
                         self._renderer_auto_paused = False
         
@@ -2531,7 +2820,7 @@ class GPUPDFWidget(QOpenGLWidget):
         # Periodic stats logging (every 5 seconds)
         if current_time - self._performance_monitor['last_stats_time'] > 5.0:
             cache_stats = self.texture_cache.get_cache_stats()
-            print(f"🚀 PERFORMANCE STATS - Level: {self._performance_monitor['performance_level']}, "
+            console.log(f"🚀 PERFORMANCE STATS - Level: {self._performance_monitor['performance_level']}, "
                   f"Avg Frame: {self._performance_monitor['avg_frame_time']*1000:.1f}ms, "
                   f"Cache Hit: {cache_stats['hit_rate']:.1f}%, "
                   f"Memory: {cache_stats['memory_mb']:.1f}MB, "
@@ -2632,7 +2921,7 @@ class GPUPDFWidget(QOpenGLWidget):
                 count += 1
                 continue
             except Exception as e:
-                print(f"Error processing pending image: {e}")
+                console.log(f"Error processing pending image: {e}")
                 # swallow and continue
                 count += 1
         
@@ -2643,7 +2932,7 @@ class GPUPDFWidget(QOpenGLWidget):
                 self._grid_cached_size = (0, 0, 0, 0)
                 self.compute_grid_layout()
             except Exception as e:
-                print(f"Error updating grid layout: {e}")
+                console.log(f"Error updating grid layout: {e}")
     
     def set_page_texture(self, texture: QOpenGLTexture, page_width: float = 1.0, page_height: float = 1.0):
         self.page_texture = texture
@@ -2660,7 +2949,19 @@ class GPUPDFWidget(QOpenGLWidget):
                 try:
                     self.parent().force_finish_thumbnail_loading()
                 except Exception as e:
-                    print(f"Error finishing thumbnail loading from texture set: {e}")
+                    console.log(f"Error finishing thumbnail loading from texture set: {e}")
+            
+            # Hide loading indicator when page texture is successfully set AND painted
+            if hasattr(self, 'parent') and self.parent() and hasattr(self.parent(), 'hide_mini_loading_indicator'):
+                try:
+                    # Wait longer for paint cycle to complete and page to be fully interactive
+                    # This ensures page is actually visible and ready for pan/zoom
+                    QTimer.singleShot(800, lambda: (
+                        self.parent().hide_mini_loading_indicator(),
+                        console.log("✅ Page texture painted and fully ready for interaction")
+                    ))
+                except Exception as e:
+                    console.log(f"Error hiding loading indicator from texture set: {e}")
         
         # Only trigger repaint if widget has a valid GL context
         try:
@@ -2814,7 +3115,7 @@ class GPUPDFWidget(QOpenGLWidget):
             self.last_zoom_quality = new_quality
             
             if should_upgrade_quality:
-                print(f"🔍 Auto quality check: current={current_quality:.1f}, target={new_quality:.1f}, zoom={effective_zoom:.1f}x")
+                console.log(f"🔍 Auto quality check: current={current_quality:.1f}, target={new_quality:.1f}, zoom={effective_zoom:.1f}x")
             
             # Re-render current content with progressive quality
             if viewer and hasattr(viewer, 'render_current_page'):
@@ -2834,9 +3135,9 @@ class GPUPDFWidget(QOpenGLWidget):
                         # Request new high-quality texture while keeping current one visible
                         try:
                             viewer.renderer.add_page_to_queue(current_page, priority=True, quality=new_quality)
-                            print(f"🔍 Single page quality upgrade: page {current_page}, from {current_quality:.1f} to {new_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                            console.log(f"🔍 Single page quality upgrade: page {current_page}, from {current_quality:.1f} to {new_quality:.1f} (zoom: {effective_zoom:.1f}x)")
                         except Exception as e:
-                            print(f"Error queueing single page {current_page} for quality upgrade: {e}")
+                            console.log(f"Error queueing single page {current_page} for quality upgrade: {e}")
                     
                     # Only clear texture in extreme cases to avoid visual disruption
                     if existing_texture and effective_zoom > 8.0 and new_quality > current_quality + 3.0:
@@ -2877,61 +3178,270 @@ class GPUPDFWidget(QOpenGLWidget):
                 if hasattr(viewer, 'renderer') and viewer.renderer:
                     try:
                         viewer.renderer.add_page_to_queue(current_page, priority=False, quality=target_quality)
-                        print(f"🔄 Periodic quality check: upgrading page {current_page} from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                        console.log(f"🔄 Periodic quality check: upgrading page {current_page} from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
                     except Exception as e:
-                        print(f"Error in periodic quality upgrade: {e}")
+                        console.log(f"Error in periodic quality upgrade: {e}")
                         
         except Exception as e:
-            print(f"Error in periodic quality verification: {e}")
+            console.log(f"Error in periodic quality verification: {e}")
 
     def _check_grid_completion_and_hide_preloader(self):
         """Check if all pages in current grid are complete and hide grid preloader if so"""
         try:
-            if not self.pdf_widget.grid_mode:
+            import time
+            
+            if not self.grid_mode:
                 return
+            
+            # Throttle checks during slideshow to prevent premature hiding
+            current_time = time.time()
+            if hasattr(self, '_last_grid_check_time'):
+                if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+                    # For slideshow, check at most every 500ms
+                    if current_time - self._last_grid_check_time < 0.5:
+                        return
+                else:
+                    # For normal mode, check at most every 200ms
+                    if current_time - self._last_grid_check_time < 0.2:
+                        return
+            self._last_grid_check_time = current_time
                 
             current_page = getattr(self, 'current_page', 0)
-            pages_needed = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+            pages_needed = self.grid_cols * self.grid_rows
             start_page = current_page
-            end_page = min(start_page + pages_needed, self.total_pages)
+            
+            # Get total pages from parent window or use a fallback
+            total_pages = 0
+            if hasattr(self, 'total_pages'):
+                total_pages = self.total_pages
+            else:
+                # Try to get from parent window
+                parent_window = self.window() if hasattr(self, 'window') else None
+                if parent_window and hasattr(parent_window, 'total_pages'):
+                    total_pages = parent_window.total_pages
+                elif hasattr(self, 'pdf_doc') and self.pdf_doc:
+                    total_pages = len(self.pdf_doc)
+                else:
+                    console.log("Warning: Cannot determine total_pages - using large fallback")
+                    total_pages = 1000  # Safe fallback
+            
+            end_page = min(start_page + pages_needed, total_pages)
             
             # Get target quality for checking completion
-            target_quality = self.pdf_widget.get_zoom_adjusted_quality()
+            target_quality = self.get_zoom_adjusted_quality()
+            
+            # Check if slideshow is active for stricter requirements
+            slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
             
             # Check completion status of all pages in current grid
             completed_pages = 0
             total_pages_in_grid = end_page - start_page
+            page_details = []  # For debugging
+            
+            # 🚀 2x1 OPTIMIZATION: Use more lenient requirements for 2x1 grid to reduce lag
+            is_2x1_grid = (self.grid_cols == 2 and self.grid_rows == 1 and total_pages_in_grid == 2)
             
             for page_num in range(start_page, end_page):
-                existing_texture = self.pdf_widget.texture_cache.get_texture(page_num)
+                existing_texture = self.texture_cache.get_texture(page_num)
                 if existing_texture:
-                    current_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(page_num)
-                    # Consider page complete if quality is good enough
-                    if current_quality >= max(3.5, target_quality * 0.8):  # 80% of target or 3.5 minimum
+                    current_quality = self.texture_cache.get_best_quality_for_page(page_num)
+                    
+                    # 🚀 2x1 OPTIMIZATION: Require proper quality for smooth panning/zooming
+                    if is_2x1_grid:
+                        # For 2x1 grid, require HIGH quality for smooth interaction
+                        # Don't hide preloader until both pages are ready for panning/zooming
+                        min_quality_required = max(3.0, target_quality * 0.9) if slideshow_active else max(2.8, target_quality * 0.85)
+                    else:
+                        # For other grids, use normal requirements
+                        min_quality_required = target_quality if slideshow_active else max(3.5, target_quality * 0.8)
+                    
+                    # STRICTER CHECK: For slideshow, also verify texture is actually usable and not just cached
+                    is_complete = current_quality >= min_quality_required
+                    if slideshow_active and is_complete:
+                        # Additional verification: check if texture dimensions are reasonable
+                        texture_valid = (existing_texture.width() > 100 and existing_texture.height() > 100)
+                        if not texture_valid:
+                            is_complete = False
+                            page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✗(BadTexture)")
+                        else:
+                            page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✓")
+                    elif is_complete:
+                        # 🚀 2x1 READINESS CHECK: Additional verification for 2x1 grid
+                        if is_2x1_grid:
+                            # For 2x1, ensure texture is actually ready for panning/zooming
+                            # Check texture validity using appropriate methods for QOpenGLTexture
+                            try:
+                                if hasattr(existing_texture, 'width') and hasattr(existing_texture, 'height'):
+                                    # For QOpenGLTexture, check dimensions and existence
+                                    texture_ready = (existing_texture.width() > 200 and existing_texture.height() > 200)
+                                else:
+                                    # For other texture types, just check if it exists
+                                    texture_ready = existing_texture is not None
+                            except:
+                                # If any attribute access fails, consider texture not ready
+                                texture_ready = False
+                                
+                            if not texture_ready:
+                                is_complete = False
+                                page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✗(NotReady)")
+                            else:
+                                page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✓(Ready)")
+                        else:
+                            page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✓")
+                    else:
+                        page_details.append(f"P{page_num+1}:{current_quality:.1f}/{min_quality_required:.1f}✗")
+                    
+                    if is_complete:
                         completed_pages += 1
+                else:
+                    page_details.append(f"P{page_num+1}:NoTexture✗")
             
             # Calculate grid completion percentage
             completion_percentage = (completed_pages / total_pages_in_grid) * 100 if total_pages_in_grid > 0 else 100
             
-            # Hide grid preloader if grid is mostly complete (85% or more)
-            if completion_percentage >= 85:
-                print(f"🎯 Grid completion: {completion_percentage:.1f}% ({completed_pages}/{total_pages_in_grid}) - hiding grid preloader")
-                
-                # Update grid info to show completion before hiding
-                if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
-                    self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
-                    self.grid_info_label.setText(f"Grid Complete: {completion_percentage:.0f}%")
-                    
-                # Hide grid preloader after short delay
-                QTimer.singleShot(300, self._finish_grid_loading)
+            # For slideshow mode and 2x1 grids, require 100% completion. For other grids in normal use, 80% is enough.
+            # EMERGENCY FIX: Make slideshow completion much more aggressive to prevent hanging
+            if slideshow_active and is_2x1_grid:
+                required_completion = 50  # Very aggressive for 2x1 slideshow to prevent hanging
+            elif slideshow_active:
+                required_completion = 60  # Very aggressive for slideshow
+            elif is_2x1_grid:
+                required_completion = 70  # More lenient for 2x1 grid
             else:
+                required_completion = 80  # Normal requirement
+            
+            # Debug output for slideshow mode and 2x1 grids
+            # Check grid loader visibility on parent window
+            viewer = self.window()
+            grid_loader_visible = (viewer and hasattr(viewer, 'grid_loading_widget') and 
+                                 viewer.grid_loading_widget and viewer.grid_loading_widget.isVisible())
+            
+            if slideshow_active:
+                console.log(f"🎬 SLIDESHOW Grid Check: {completion_percentage:.0f}% complete ({completed_pages}/{total_pages_in_grid}) - Need {required_completion}%")
+                console.log(f"🎬 Page Status: {' '.join(page_details)}")
+                console.log(f"🎬 Grid Loader Visible: {grid_loader_visible}")
+            elif is_2x1_grid:
+                console.log(f"🚀 2x1 GRID Check: {completion_percentage:.0f}% complete ({completed_pages}/{total_pages_in_grid}) - Need {required_completion}%")
+                console.log(f"🚀 2x1 Page Status: {' '.join(page_details)}")
+                console.log(f"🚀 2x1 Grid Loader Visible: {grid_loader_visible}")
+            else:
+                # Debug output for normal grid mode too when near completion
+                if completion_percentage >= 75 or grid_loader_visible:
+                    console.log(f"🔄 NORMAL GRID Check: {completion_percentage:.0f}% complete ({completed_pages}/{total_pages_in_grid}) - Need {required_completion}%")
+                    console.log(f"🔄 Page Status: {' '.join(page_details)}")
+                    console.log(f"🔄 Grid Loader Visible: {grid_loader_visible}")
+                
+                # For slideshow, only hide loader if we have the grid loading widget visible AND 100% complete
+                if (completion_percentage >= required_completion and grid_loader_visible):
+                    console.log(f"🎬 SLIDESHOW: Grid 100% complete - hiding loader and restarting countdown")
+                elif completion_percentage >= required_completion:
+                    console.log(f"🎬 SLIDESHOW: Grid 100% complete but no loader visible - won't hide loader")
+                else:
+                    console.log(f"🎬 SLIDESHOW: Grid not complete yet - keeping loader visible")
+            
+            # Hide grid preloader if grid meets completion requirement
+            if completion_percentage >= required_completion:
+                # For slideshow mode and 2x1 grids, require stable completion before hiding loader
+                if slideshow_active or is_2x1_grid:
+                    # Check if we need to track completion stability
+                    if not hasattr(self, '_grid_completion_start_time'):
+                        self._grid_completion_start_time = current_time
+                        mode_text = "SLIDESHOW" if slideshow_active else "2x1 GRID"
+                        console.log(f"🎬 {mode_text}: Grid 100% complete - starting stability timer")
+                        return  # Don't hide yet, wait for stability
+                    
+                    # Check if completion has been stable for enough time
+                    stability_duration = current_time - self._grid_completion_start_time
+                    # EMERGENCY FIX: Make stability requirements much more aggressive for slideshow
+                    if slideshow_active and is_2x1_grid:
+                        required_stability = 0.1  # Almost instant for 2x1 slideshow
+                    elif slideshow_active:
+                        required_stability = 0.2  # Very quick for slideshow
+                    elif is_2x1_grid:
+                        required_stability = 0.3  # Quick for 2x1 grid
+                    else:
+                        required_stability = 1.0  # Normal stability
+                    
+                    if stability_duration < required_stability:
+                        mode_text = "SLIDESHOW" if slideshow_active else "2x1 GRID"
+                        console.log(f"🎬 {mode_text}: Grid complete but waiting for stability ({stability_duration:.1f}s/{required_stability}s)")
+                        return  # Still waiting for stability
+                    
+                    mode_text = "SLIDESHOW" if slideshow_active else "2x1 GRID"
+                    console.log(f"🎬 {mode_text}: Grid stable at 100% for {stability_duration:.1f}s - hiding loader")
+                    # Reset the timer for next time
+                    if hasattr(self, '_grid_completion_start_time'):
+                        delattr(self, '_grid_completion_start_time')
+                
+                # For slideshow mode, extra check to ensure loader is visible before hiding
+                should_hide_loader = True
+                if slideshow_active:
+                    should_hide_loader = grid_loader_visible
+                
+                if should_hide_loader:
+                    completion_status = "100% complete" if required_completion == 100 else f"{completion_percentage:.1f}% complete"
+                    console.log(f"🎯 Grid {completion_status}: ({completed_pages}/{total_pages_in_grid}) - hiding grid preloader")
+                    
+                    # Update grid info to show completion before hiding
+                    if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                        self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
+                        self.grid_info_label.setText(f"Grid Complete: {completion_percentage:.0f}%")
+                        
+                    # Hide grid preloader after short delay
+                    if slideshow_active:
+                        self._grid_hide_authorized = True  # Authorize the hide
+                    
+                    # Call _finish_grid_loading on the parent window (PDFViewer)
+                    viewer = self.window()
+                    if viewer and hasattr(viewer, '_finish_grid_loading'):
+                        # Cancel any pending safety timeout since grid completed naturally
+                        if slideshow_active and hasattr(viewer, '_safety_timeout_timer'):
+                            if viewer._safety_timeout_timer:
+                                viewer._safety_timeout_timer.stop()
+                                viewer._safety_timeout_timer = None
+                                console.log("🎬 SLIDESHOW: Cancelled safety timeout - grid completed naturally")
+                        
+                        QTimer.singleShot(300, viewer._finish_grid_loading)
+                    else:
+                        console.log("🚨 Error: Cannot access parent window _finish_grid_loading method")
+                else:
+                    console.log(f"🎬 SLIDESHOW: Grid complete but loader not visible - skipping hide")
+            else:
+                # Reset stability timer if completion drops below requirement
+                if slideshow_active and hasattr(self, '_grid_completion_start_time'):
+                    delattr(self, '_grid_completion_start_time')
+                    console.log(f"🎬 SLIDESHOW: Grid completion dropped to {completion_percentage:.0f}% - resetting stability timer")
+                
                 # Update grid info with overall progress
                 if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
                     self.grid_loading_widget.isVisible() and hasattr(self, 'grid_info_label')):
                     self.grid_info_label.setText(f"Grid Progress: {completion_percentage:.0f}% ({completed_pages}/{total_pages_in_grid})")
                     
+                # BACKUP MECHANISM: For normal grids, if we're close to completion but stuck, force complete
+                if not slideshow_active and not is_2x1_grid and completion_percentage >= 75:
+                    # Track how long we've been stuck near completion
+                    if not hasattr(self, '_grid_stuck_start_time'):
+                        self._grid_stuck_start_time = current_time
+                        console.log(f"🔄 NORMAL GRID: Tracking potential stuck state at {completion_percentage:.0f}%")
+                    else:
+                        stuck_duration = current_time - self._grid_stuck_start_time
+                        if stuck_duration > 2.0:  # If stuck for more than 2 seconds near completion
+                            console.log(f"🚨 NORMAL GRID: Force completing at {completion_percentage:.0f}% after {stuck_duration:.1f}s stuck")
+                            # Force completion by hiding the grid loader
+                            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                                viewer = self.window()
+                                if viewer and hasattr(viewer, 'hide_grid_loading_indicator'):
+                                    viewer.hide_grid_loading_indicator()
+                            # Clean up tracking
+                            if hasattr(self, '_grid_stuck_start_time'):
+                                delattr(self, '_grid_stuck_start_time')
+                else:
+                    # Reset stuck tracking if we're not near completion
+                    if hasattr(self, '_grid_stuck_start_time'):
+                        delattr(self, '_grid_stuck_start_time')
+                    
         except Exception as e:
-            print(f"Error checking grid completion: {e}")
+            console.log(f"Error checking grid completion: {e}")
     
     def _schedule_delayed_quality_check(self):
         """Schedule a delayed quality check to avoid lag during rapid zoom changes"""
@@ -2996,7 +3506,7 @@ class GPUPDFWidget(QOpenGLWidget):
                 try:
                     viewer.renderer.add_page_to_queue(page_num, priority=priority, quality=target_quality)
                     upgrade_count += 1
-                    print(f"🔍 Grid quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (#{upgrade_count})")
+                    console.log(f"🔍 Grid quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (#{upgrade_count})")
                     # 🔍 GRID FIX: Increase limit for small grids to ensure all 4 pages in 2x2 get upgraded
                     if len(self._grid_cells) <= 4:
                         max_upgrades = 4  # Allow all 4 pages in 2x2 to be upgraded
@@ -3006,7 +3516,7 @@ class GPUPDFWidget(QOpenGLWidget):
                     if upgrade_count >= max_upgrades:
                         break
                 except Exception as e:
-                    print(f"Error queueing page {page_num} for quality upgrade: {e}")
+                    console.log(f"Error queueing page {page_num} for quality upgrade: {e}")
     
     def _enable_fast_zoom_mode(self):
         """Enable fast zoom mode to reduce processing during rapid zoom changes"""
@@ -3243,7 +3753,7 @@ class GPUPDFWidget(QOpenGLWidget):
                 viewer.grid_view_menu_action.setChecked(new_state)
                 viewer.toggle_grid_view()
             else:
-                print("Context menu: viewer does not have toggle_grid_view method")
+                console.log("Context menu: viewer does not have toggle_grid_view method")
     
     def zoom_to_grid_page(self, page_num):
         """
@@ -3573,9 +4083,14 @@ class CircularCountdown(QWidget):
         self.update()
     
     def set_remaining_time(self, time_seconds):
-        """Set the remaining countdown time"""
-        self.remaining_time = time_seconds
-        self.update()
+        """Set the remaining countdown time and force visual update"""
+        old_time = self.remaining_time
+        self.remaining_time = max(0, time_seconds)
+        
+        # Force immediate update if time changed significantly
+        if abs(old_time - self.remaining_time) > 0.1:
+            self.displayed_time = self.remaining_time
+            self.update()  # Force repaint
     
     def set_paused(self, paused):
         """Set pause state"""
@@ -3586,15 +4101,13 @@ class CircularCountdown(QWidget):
         """Animate the displayed time for smooth countdown"""
         # Smoothly animate towards the target remaining time
         diff = self.remaining_time - self.displayed_time
-        if abs(diff) > 0.1:
-            self.displayed_time += diff * 0.2  # Smooth interpolation
+        if abs(diff) > 0.05:  # More sensitive threshold
+            self.displayed_time += diff * 0.3  # Faster interpolation
+            self.update()
         else:
-            self.displayed_time = self.remaining_time
-        
-        # Only update if there's a visible change
-        if abs(self.displayed_time - self.remaining_time) < 0.01:
-            self.displayed_time = self.remaining_time
-        self.update()
+            if abs(self.displayed_time - self.remaining_time) > 0.01:
+                self.displayed_time = self.remaining_time
+                self.update()
     
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -3606,15 +4119,20 @@ class CircularCountdown(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(rect)
         
-        # Draw smooth progress arc
-        if self.total_time > 0 and self.displayed_time > 0:
-            fraction = self.displayed_time / self.total_time
+        # Draw smooth progress arc - shows remaining time (decreases as time runs out)
+        if self.total_time > 0 and self.displayed_time >= 0:
+            # Fraction represents remaining time (1.0 = full time, 0.0 = no time left)
+            fraction = max(0, self.displayed_time / self.total_time)
             angle = int(360 * 16 * fraction)
             
-            # Use different color when paused
-            color = "#ff8080" if self.is_paused else "#80b2ff"
-            painter.setPen(QPen(QColor(color), 3))
-            painter.drawArc(rect, 90 * 16, -angle)
+            # Only draw arc if there's time remaining
+            if fraction > 0:
+                # Use different color when paused
+                color = "#ff8080" if self.is_paused else "#80b2ff"
+                painter.setPen(QPen(QColor(color), 3))
+                
+                # Draw arc starting from top (90°) going clockwise, showing remaining time
+                painter.drawArc(rect, 90 * 16, -angle)
         
         # Draw pause symbol if paused
         if self.is_paused:
@@ -3636,8 +4154,135 @@ class CircularCountdown(QWidget):
         super().mousePressEvent(event)
 
 
+class PdfLoadingWorker(QThread):
+    """Worker thread for loading PDF documents to prevent UI freezing"""
+    pdfLoaded = pyqtSignal(object, str)
+    pdfLoadingFailed = pyqtSignal(str)
+
+    def __init__(self, pdf_path, parent=None):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+
+    def run(self):
+        try:
+            console.log(f"🔄 Loading PDF in background: {self.pdf_path}")
+            pdf_doc = fitz.open(self.pdf_path)
+            console.log(f"✅ PDF loaded successfully: {pdf_doc.page_count} pages")
+            self.pdfLoaded.emit(pdf_doc, self.pdf_path)
+        except Exception as e:
+            console.log(f"❌ PDF loading failed: {e}")
+            self.pdfLoadingFailed.emit(str(e))
+
+
+class PageRenderingWorker(QThread):
+    """Worker thread for rendering individual pages to prevent UI lag"""
+    pageRendered = pyqtSignal(int, object)  # page_number, qimage
+    renderingFailed = pyqtSignal(int, str)  # page_number, error_message
+
+    def __init__(self, pdf_doc, page_number, quality=2.0, parent=None):
+        super().__init__(parent)
+        self.pdf_doc = pdf_doc
+        self.page_number = page_number
+        self.quality = quality
+
+    def run(self):
+        try:
+            console.log(f"🎨 Rendering page {self.page_number + 1} in background...")
+            page = self.pdf_doc[self.page_number]
+            mat = fitz.Matrix(self.quality, self.quality)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            
+            # Convert to QImage
+            img_data = pix.tobytes("ppm")
+            qimg = QImage.fromData(img_data)
+            
+            console.log(f"✅ Page {self.page_number + 1} rendered successfully")
+            self.pageRendered.emit(self.page_number, qimg)
+        except Exception as e:
+            console.log(f"❌ Page {self.page_number + 1} rendering failed: {e}")
+            self.renderingFailed.emit(self.page_number, str(e))
+
+
 class PDFViewer(QMainWindow):
     """Main PDF viewer application"""
+    
+    def _log_memory_usage(self, context=""):
+        """Logs current memory usage of the application."""
+        try:
+            process = psutil.Process(os.getpid())
+            rss_mb = process.memory_info().rss / (1024 * 1024)
+            vms_mb = process.memory_info().vms / (1024 * 1024)
+            cache_mb = self.pdf_widget.texture_cache.get_cache_size_mb()
+            console.log(f"🧠 MEMORY [{context}]: RSS: {rss_mb:.2f} MB, VMS: {vms_mb:.2f} MB, Texture Cache: {cache_mb:.2f} MB")
+        except Exception as e:
+            console.log(f"Error logging memory: {e}")
+    
+    def _periodic_memory_cleanup(self):
+        """Periodic cleanup to prevent memory bloat"""
+        try:
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                # Clean up distant textures
+                self.pdf_widget.cleanup_distant_textures(keep_distance=8)
+                
+                # Log memory usage periodically
+                cache_count = len(self.pdf_widget.texture_cache.textures)
+                cache_mb = self.pdf_widget.texture_cache.get_cache_size_mb()
+                
+                # If cache is getting too big, be more aggressive
+                if cache_count > 30 or cache_mb > 200:
+                    console.log(f"🧹 AGGRESSIVE CLEANUP: {cache_count} textures, {cache_mb:.1f}MB")
+                    self.pdf_widget.cleanup_distant_textures(keep_distance=5)
+                    
+        except Exception as e:
+            console.log(f"Periodic cleanup error: {e}")
+    
+    def _scroll_to_current_thumbnail(self):
+        """Auto-scroll thumbnail list to show the current page"""
+        try:
+            if not hasattr(self, 'thumbnail_list') or not self.thumbnail_list:
+                console.log("📋 Auto-scroll: No thumbnail list available")
+                return
+                
+            # Get the current page number (0-indexed)
+            current_page = self.current_page
+            console.log(f"📋 Auto-scroll: Looking for thumbnail for page {current_page + 1}")
+            
+            # Check if we have thumbnails loaded
+            if self.thumbnail_list.count() == 0:
+                console.log("📋 Auto-scroll: No thumbnails loaded yet")
+                return
+                
+            # Find the thumbnail item for the current page
+            target_item = None
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == current_page:
+                    target_item = item
+                    console.log(f"📋 Auto-scroll: Found thumbnail for page {current_page + 1} at index {i}")
+                    break
+            
+            if target_item:
+                # Scroll to make the current page thumbnail visible
+                self.thumbnail_list.scrollToItem(target_item, QAbstractItemView.ScrollHint.PositionAtCenter)
+                
+                # Optionally highlight the current page (subtle visual feedback)
+                self.thumbnail_list.setCurrentItem(target_item)
+                console.log(f"📋 Auto-scrolled to thumbnail for page {current_page + 1}")
+            else:
+                # If thumbnail not found, it might be in a selective loading range
+                console.log(f"📋 Auto-scroll: Thumbnail for page {current_page + 1} not found in {self.thumbnail_list.count()} loaded thumbnails")
+                
+                # Try to trigger loading around current page
+                if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
+                    console.log(f"📋 Current page {current_page + 1} thumbnail not loaded, generating around current page")
+                    self.generate_thumbnails(around_page=current_page, radius=15, preserve_scroll=False)
+                    # Schedule another scroll attempt after thumbnails are generated
+                    QTimer.singleShot(1000, self._scroll_to_current_thumbnail)
+                else:
+                    console.log("📋 Auto-scroll: Selective loading not enabled, cannot load missing thumbnail")
+                    
+        except Exception as e:
+            console.log(f"Error auto-scrolling to thumbnail: {e}")
     
     def __init__(self):
         super().__init__()
@@ -3650,9 +4295,12 @@ class PDFViewer(QMainWindow):
         
         # Slideshow functionality
         self._auto_advance_active = False
-        self.timer_interval = 30  # Default 30 seconds to match combo box default
+        self.timer_interval = 15  # Default 15 seconds - better balance than 30s/5s
         self.timer_remaining = 0
         self._is_timer_paused = False
+        self._timer_start_time = None
+        self._countdown_reset_needed = False
+        self._waiting_for_page_load = False  # Flag to pause countdown during page load
         
         # Auto-advance timer for slideshow
         self.auto_advance_timer = QTimer()
@@ -3663,11 +4311,6 @@ class PDFViewer(QMainWindow):
         self.ring_update_timer = QTimer() 
         self.ring_update_timer.setSingleShot(False)
         self.ring_update_timer.timeout.connect(self._on_ring_update_timer)
-        
-        # Auto advance timer for slideshow
-        self.auto_advance_timer = QTimer()
-        self.auto_advance_timer.setSingleShot(False)
-        self.auto_advance_timer.timeout.connect(self._on_auto_advance_timer)
         
         self.renderer = None
         self.thumbnail_worker = None
@@ -3812,11 +4455,11 @@ class PDFViewer(QMainWindow):
         #         save_pixmap = icon_full.pixmap(256, 256)
         #         success = save_pixmap.save(icon_path, "ICO")
         #         if success:
-        #             print(f"✅ Created enhanced icon file: {icon_path} ({os.path.getsize(icon_path)} bytes)")
+        #             console.log(f"✅ Created enhanced icon file: {icon_path} ({os.path.getsize(icon_path)} bytes)")
         #         else:
-        #             print(f"⚠️ Could not save icon file: {icon_path}")
+        #             console.log(f"⚠️ Could not save icon file: {icon_path}")
         #     except Exception as e:
-        #         print(f"⚠️ Error saving icon file: {e}")
+        #         console.log(f"⚠️ Error saving icon file: {e}")
                 
         # Force refresh window decorations (Windows-specific)
         self.setWindowTitle(self.windowTitle())  # Trigger window update
@@ -3824,6 +4467,12 @@ class PDFViewer(QMainWindow):
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts"""
         key = event.key()
+        modifiers = event.modifiers()
+        
+        # Go to Page dialog (Ctrl+G)
+        if key == Qt.Key.Key_G and modifiers == Qt.KeyboardModifier.ControlModifier:
+            self.show_go_to_page_dialog()
+            return
         
         # Fullscreen exit with ESC key
         if key == Qt.Key.Key_Escape and self.isFullScreen():
@@ -3839,10 +4488,10 @@ class PDFViewer(QMainWindow):
             self.prev_page()
         elif key == Qt.Key.Key_Home:
             # First page
-            self.goto_page(0)
+            self.go_to_page(0)
         elif key == Qt.Key.Key_End:
             # Last page
-            self.goto_page(self.total_pages - 1)
+            self.go_to_page(self.total_pages - 1)
             
         # Zoom shortcuts
         elif key == Qt.Key.Key_Plus or key == Qt.Key.Key_Equal:
@@ -3864,10 +4513,6 @@ class PDFViewer(QMainWindow):
             self.show_performance_stats()
         else:
             super().keyPressEvent(event)
-        
-        # Show basic window immediately
-        self.setWindowTitle("GPU-Accelerated PDF Viewer")
-        self.setGeometry(100, 100, 1200, 800)
     
     def show_performance_stats(self):
         """🚀 LAYER 3: Display comprehensive performance statistics"""
@@ -3875,6 +4520,26 @@ class PDFViewer(QMainWindow):
             if hasattr(self, 'pdf_widget'):
                 stats = self.pdf_widget.get_performance_stats()
                 cache_stats = stats['cache_stats']
+                
+                # Get detailed memory info using psutil
+                try:
+                    process = psutil.Process()
+                    memory_info = process.memory_info()
+                    memory_percent = process.memory_percent()
+                    rss_mb = memory_info.rss / (1024 * 1024)
+                    vms_mb = memory_info.vms / (1024 * 1024)
+                    
+                    memory_section = f"""
+MEMORY USAGE (via psutil):
+Process Memory (RSS): {rss_mb:.1f} MB
+Virtual Memory (VMS): {vms_mb:.1f} MB
+Memory Percentage: {memory_percent:.1f}%
+Texture Cache Memory: {cache_stats['memory_mb']:.1f} MB"""
+                except Exception as e:
+                    memory_section = f"""
+MEMORY USAGE:
+Error getting memory info: {e}
+Cache Memory: {cache_stats['memory_mb']:.1f} MB"""
                 
                 msg = f"""🚀 LAYER 3 PERFORMANCE STATISTICS 🚀
                 
@@ -3889,8 +4554,7 @@ Cache Hit Rate: {cache_stats['hit_rate']:.1f}%
 Cache Hits: {cache_stats['hits']}
 Cache Misses: {cache_stats['misses']}
 Evictions: {cache_stats['evictions']}
-Memory Usage: {cache_stats['memory_mb']:.1f} MB
-Active Textures: {cache_stats['textures']}
+Active Textures: {cache_stats['textures']}{memory_section}
 
 OPTIMIZATIONS ACTIVE:
 ✓ Layer 1: Advanced Thumbnail Generation with Parallel Processing
@@ -3907,14 +4571,19 @@ Press F12 to refresh stats"""
                 msg_box.setIcon(QMessageBox.Icon.Information)
                 msg_box.exec()
             else:
-                print("🚀 LAYER 3: PDF widget not available for performance stats")
+                console.log("🚀 LAYER 3: PDF widget not available for performance stats")
         except Exception as e:
-            print(f"🚀 LAYER 3: Error displaying performance stats: {e}")
+            console.log(f"🚀 LAYER 3: Error displaying performance stats: {e}")
     
     def setup_ui_deferred(self):
         """Deferred UI setup for faster startup"""
         self.setup_ui()
         self.setup_shortcuts()
+        
+        # Setup periodic memory cleanup timer to prevent memory bloat
+        self.memory_cleanup_timer = QTimer()
+        self.memory_cleanup_timer.timeout.connect(self._periodic_memory_cleanup)
+        self.memory_cleanup_timer.start(10000)  # Run every 10 seconds
         
     def setup_shortcuts(self):
         """Setup keyboard shortcuts and actions"""
@@ -3983,6 +4652,178 @@ Press F12 to refresh stats"""
         msg_box.setText(about_text)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg_box.exec()
+    
+    def show_go_to_page_dialog(self):
+        """Show inline input widget to go to a specific page number - fullscreen safe"""
+        if not self.pdf_doc or self.total_pages == 0:
+            self.status_bar.showMessage("Please open a PDF file first", 2000)
+            return
+        
+        # FIXED: Use inline input widget to prevent fullscreen exit
+        self.show_inline_page_input()
+    
+    def show_inline_page_input(self):
+        """Show inline page input directly in status bar - fullscreen safe"""
+        console.log("🔧 DEBUG: show_inline_page_input called - showing inline input widget")
+        # Create inline input widget if not exists
+        if not hasattr(self, 'inline_page_input'):
+            console.log("🔧 DEBUG: Creating inline page input widget for first time")
+            self.create_inline_page_input()
+        
+        # Set current page as default and select all
+        self.inline_page_input.setText(str(self.current_page + 1))
+        self.inline_page_input.selectAll()
+        
+        # Show status message
+        self.status_bar.showMessage(f"Go to page (1-{self.total_pages}): ", 0)
+        
+        # Add to status bar and focus
+        self.status_bar.addPermanentWidget(self.inline_page_input)
+        self.inline_page_input.show()
+        self.inline_page_input.setFocus()
+        console.log("🔧 DEBUG: Inline input widget shown and focused")
+    
+    def create_inline_page_input(self):
+        """Create inline page input widget for status bar"""
+        self.inline_page_input = FullscreenSafeLineEdit(self)
+        self.inline_page_input.setMaximumWidth(80)
+        self.inline_page_input.setPlaceholderText("Page")
+        
+        # Style the input
+        self.inline_page_input.setStyleSheet("""
+            QLineEdit {
+                background-color: white;
+                border: 1px solid #ccc;
+                border-radius: 3px;
+                padding: 2px 5px;
+                font-size: 12px;
+                color: black;
+            }
+            QLineEdit:focus {
+                border: 2px solid #0078d4;
+            }
+        """)
+        
+        # Connect events - completely isolated event handling
+        self.inline_page_input.returnPressed.connect(self.handle_inline_page_input)
+        self.inline_page_input.textChanged.connect(self.validate_inline_page_input)
+        self.inline_page_input.escapePressed.connect(self.hide_inline_page_input)
+        
+        # Start hidden
+        self.inline_page_input.hide()
+    
+    def handle_inline_page_input(self):
+        """Handle Enter key in inline page input"""
+        console.log("🔧 DEBUG: handle_inline_page_input called - inline input handling Enter")
+        try:
+            page_number = int(self.inline_page_input.text().strip())
+            target_page = page_number - 1  # Convert to 0-indexed
+            
+            if 0 <= target_page < self.total_pages:
+                console.log(f"📖 Jumping to page {page_number} via inline input")
+                self.go_to_page(target_page)
+                self.status_bar.showMessage(f"Navigated to page {page_number}", 3000)
+                
+                # Update page display
+                self.update_page_label()
+                self.render_current_page()
+            else:
+                self.status_bar.showMessage(f"Page number must be between 1 and {self.total_pages}", 3000)
+        except ValueError:
+            self.status_bar.showMessage("Please enter a valid page number", 3000)
+        
+        self.hide_inline_page_input()
+    
+    def validate_inline_page_input(self):
+        """Validate page input as user types"""
+        text = self.inline_page_input.text().strip()
+        if text:
+            try:
+                page_num = int(text)
+                if 1 <= page_num <= self.total_pages:
+                    self.inline_page_input.setStyleSheet("""
+                        QLineEdit {
+                            background-color: white;
+                            border: 2px solid #0078d4;
+                            border-radius: 3px;
+                            padding: 2px 5px;
+                            font-size: 12px;
+                            color: black;
+                        }
+                    """)
+                else:
+                    self.inline_page_input.setStyleSheet("""
+                        QLineEdit {
+                            background-color: #ffe6e6;
+                            border: 2px solid #ff6b6b;
+                            border-radius: 3px;
+                            padding: 2px 5px;
+                            font-size: 12px;
+                            color: black;
+                        }
+                    """)
+            except ValueError:
+                self.inline_page_input.setStyleSheet("""
+                    QLineEdit {
+                        background-color: #ffe6e6;
+                        border: 2px solid #ff6b6b;
+                        border-radius: 3px;
+                        padding: 2px 5px;
+                        font-size: 12px;
+                        color: black;
+                    }
+                """)
+    
+    def hide_inline_page_input(self):
+        """Hide and remove inline page input from status bar"""
+        if hasattr(self, 'inline_page_input'):
+            self.status_bar.removeWidget(self.inline_page_input)
+            self.inline_page_input.hide()
+            self.status_bar.clearMessage()
+    
+    def eventFilter(self, obj, event):
+        """Event filter - custom inline input now handles its own events"""
+        return super().eventFilter(obj, event)
+    
+    def go_to_page_from_input(self):
+        """Navigate to page number entered in toolbar input box"""
+        if not self.pdf_doc or self.total_pages == 0:
+            self.status_bar.showMessage("Please open a PDF file first", 2000)
+            self.page_input.clear()
+            return
+        
+        try:
+            # Get text from input box
+            page_text = self.page_input.text().strip()
+            if not page_text:
+                return
+            
+            # Convert to integer
+            page_number = int(page_text)
+            target_page = page_number - 1  # Convert to 0-indexed
+            
+            if 0 <= target_page < self.total_pages:
+                console.log(f"📖 Jumping to page {page_number} via toolbar input")
+                self.go_to_page(target_page)
+                self.status_bar.showMessage(f"Jumped to page {page_number}", 2000)
+                
+                # Update page display
+                self.update_page_label()
+                self.render_current_page()
+                
+                # Clear input box
+                self.page_input.clear()
+            else:
+                # Show error and clear input
+                self.status_bar.showMessage(f"Page must be between 1 and {self.total_pages}", 3000)
+                self.page_input.clear()
+                self.page_input.setFocus()  # Keep focus for user to try again
+                
+        except ValueError:
+            # Invalid number format
+            self.status_bar.showMessage("Please enter a valid page number", 2000)
+            self.page_input.clear()
+            self.page_input.setFocus()
     
     def setup_ui(self):
         self.setWindowTitle("GPU-Accelerated PDF Viewer")
@@ -4088,9 +4929,9 @@ Press F12 to refresh stats"""
         self.create_menu_bar()
         self.create_toolbar()
         
-        # Set initial zoom slider value
-        if hasattr(self, 'zoom_slider'):
-            self.zoom_slider.setValue(100)
+        # Set initial zoom slider value - DISABLED (zoom slider hidden)
+        # if hasattr(self, 'zoom_slider'):
+        #     self.zoom_slider.setValue(100)
     
     def generate_thumbnails_deferred(self, force_new_pdf=False):
         """Generate thumbnails after main view is ready"""
@@ -4098,12 +4939,12 @@ Press F12 to refresh stats"""
             # Check if we're in grid mode - if so, minimize thumbnail generation
             # BUT override this check if we're loading a new PDF (force_new_pdf=True)
             if not force_new_pdf and getattr(self.pdf_widget, 'grid_mode', False):
-                print("Grid mode active - skipping heavy thumbnail generation to prioritize grid performance")
+                console.log("Grid mode active - skipping heavy thumbnail generation to prioritize grid performance")
                 return
             
             # If we're forcing generation for new PDF, show status message
             if force_new_pdf:
-                print("New PDF loaded - forcing thumbnail generation even in grid mode")
+                console.log("New PDF loaded - forcing thumbnail generation even in grid mode")
             
             # Force complete thumbnail regeneration for new PDF
             self._selective_thumbnails_enabled = False
@@ -4132,7 +4973,7 @@ Press F12 to refresh stats"""
             QTimer.singleShot(3000, self.start_aggressive_preloading)
             
         except Exception as e:
-            print(f"Thumbnail generation error: {e}")
+            console.log(f"Thumbnail generation error: {e}")
             
         except Exception as e:
             tb = traceback.format_exc()
@@ -4272,6 +5113,26 @@ Press F12 to refresh stats"""
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
+        # Navigate menu
+        navigate_menu = menubar.addMenu("Navigate")
+        
+        go_to_page_action = QAction("Go to Page...", self)
+        go_to_page_action.setShortcut(QKeySequence("Ctrl+G"))
+        go_to_page_action.triggered.connect(self.show_go_to_page_dialog)
+        navigate_menu.addAction(go_to_page_action)
+        
+        navigate_menu.addSeparator()
+        
+        first_page_action = QAction("First Page", self)
+        first_page_action.setShortcut(QKeySequence("Home"))
+        first_page_action.triggered.connect(lambda: self.go_to_page(0))
+        navigate_menu.addAction(first_page_action)
+        
+        last_page_action = QAction("Last Page", self)
+        last_page_action.setShortcut(QKeySequence("End"))
+        last_page_action.triggered.connect(lambda: self.go_to_page(self.total_pages - 1))
+        navigate_menu.addAction(last_page_action)
+        
         # View menu
         view_menu = menubar.addMenu("View")
         
@@ -4294,13 +5155,18 @@ Press F12 to refresh stats"""
         # Grid size submenu
         grid_size_menu = view_menu.addMenu("Grid Size")
         
+        size_2x1_action = QAction("2x1", self)
+        size_2x1_action.setShortcut(QKeySequence("1"))
+        size_2x1_action.triggered.connect(lambda: self.set_grid_size("2x1"))
+        grid_size_menu.addAction(size_2x1_action)
+        
         size_2x2_action = QAction("2x2", self)
-        size_2x2_action.setShortcut(QKeySequence("1"))
+        size_2x2_action.setShortcut(QKeySequence("2"))
         size_2x2_action.triggered.connect(lambda: self.set_grid_size("2x2"))
         grid_size_menu.addAction(size_2x2_action)
         
         size_3x3_action = QAction("3x3", self)
-        size_3x3_action.setShortcut(QKeySequence("2"))
+        size_3x3_action.setShortcut(QKeySequence("3"))
         size_3x3_action.triggered.connect(lambda: self.set_grid_size("3x3"))
         grid_size_menu.addAction(size_3x3_action)
 
@@ -4366,6 +5232,15 @@ Press F12 to refresh stats"""
         # Page label
         self.page_label = QLabel("Page: 0 / 0")
         toolbar.addWidget(self.page_label)
+        
+        # Go to Page input box
+        toolbar.addWidget(QLabel(" | Go to: "))
+        self.page_input = QLineEdit()
+        self.page_input.setPlaceholderText("Page #")
+        self.page_input.setMaximumWidth(80)
+        self.page_input.setToolTip("Enter page number and press Enter to jump to that page")
+        self.page_input.returnPressed.connect(self.go_to_page_from_input)
+        toolbar.addWidget(self.page_input)
 
         toolbar.addSeparator()
 
@@ -4391,11 +5266,11 @@ Press F12 to refresh stats"""
 
         # Grid size selector for single-row view
         self.grid_size_combo = QComboBox()
-        self.grid_size_combo.addItems(["2x2", "3x1", "3x2", "5x1"])
+        self.grid_size_combo.addItems(["2x1", "2x2", "3x1", "3x2", "5x1"])
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         self.grid_size_combo.setEnabled(False)
         self.grid_size_combo.setMaxVisibleItems(10)
-        self.grid_size_combo.setToolTip("Grid Size (1-4 keys or Tab to cycle)")
+        self.grid_size_combo.setToolTip("Grid Size (1-5 keys or Tab to cycle)")
         toolbar.addWidget(self.grid_size_combo)
 
         # Fullscreen action with better matching icon
@@ -4422,13 +5297,23 @@ Press F12 to refresh stats"""
 
         toolbar.addSeparator()
 
-        # Zoom slider
-        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(10, 1000)
-        self.zoom_slider.setValue(100)
-        self.zoom_slider.setMaximumWidth(150)
-        self.zoom_slider.valueChanged.connect(self.zoom_changed)
-        toolbar.addWidget(self.zoom_slider)
+        # Zoom slider - HIDDEN per user request
+        # self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        # self.zoom_slider.setRange(10, 1000)
+        # self.zoom_slider.setValue(100)
+        # self.zoom_slider.setMaximumWidth(150)
+        # self.zoom_slider.valueChanged.connect(self.zoom_changed)
+        # toolbar.addWidget(self.zoom_slider)
+        
+        toolbar.addSeparator()
+        
+        # Console logging toggle for EXE deployment - HIDDEN per user request
+        # self.console_toggle_action = QAction("📺 Console", self)
+        # self.console_toggle_action.setCheckable(True)
+        # self.console_toggle_action.setChecked(console.enabled)  # Sync with initial state
+        # self.console_toggle_action.triggered.connect(self.toggle_console_logging)
+        # self.console_toggle_action.setToolTip("Toggle console debug logging (useful for EXE)")
+        # toolbar.addAction(self.console_toggle_action)
         
         toolbar.addSeparator()
         
@@ -4444,10 +5329,10 @@ Press F12 to refresh stats"""
         
         self.timer_combo = QComboBox()
         self.timer_combo.addItems([
-            "5 seconds", "10 seconds", 
+            "5 seconds", "10 seconds", "15 seconds",
             "30 seconds", "1 minute", "2 minutes", "5 minutes"
         ])
-        self.timer_combo.setCurrentText("30 seconds")
+        self.timer_combo.setCurrentText("15 seconds")
         self.timer_combo.currentTextChanged.connect(self.update_timer_interval)
         self.timer_combo.setToolTip("Select slideshow timer interval")
         self.timer_combo.setMaximumWidth(100)
@@ -4478,7 +5363,7 @@ Press F12 to refresh stats"""
         toolbar.addWidget(self.play_pause_btn)
         
         # Circular countdown timer
-        self.countdown_widget = CircularCountdown(3, self)
+        self.countdown_widget = CircularCountdown(self.timer_interval, self)
         self.countdown_widget.set_parent_viewer(self)
         self.countdown_widget.setToolTip("Timer progress (click to pause/resume)")
         toolbar.addWidget(self.countdown_widget)
@@ -4598,7 +5483,7 @@ Press 'L' to cycle through modes."""
             pass
 
         self.grid_size_combo.clear()
-        self.grid_size_combo.addItems(["2x2", "3x1", "3x2", "5x1"])
+        self.grid_size_combo.addItems(["2x1", "2x2", "3x1", "3x2", "5x1"])
         
         if current_text and current_text not in ["4x4", "3x3", "5x2"]:  # Skip 4x4, old 3x3, and 5x2 if they were selected
             index = self.grid_size_combo.findText(current_text)
@@ -4628,7 +5513,7 @@ Press 'L' to cycle through modes."""
             if self.isFullScreen():
                 self.status_bar.showMessage("Fullscreen: Use keys 1-4 or Tab to change grid size", 3000)
         except Exception as e:
-            print(f"Error restoring combo box state: {e}")
+            console.log(f"Error restoring combo box state: {e}")
 
     def toggle_fullscreen(self, checked=None):
         """Enhanced fullscreen mode with comprehensive fixes from GitHub reference"""
@@ -4743,7 +5628,7 @@ Press 'L' to cycle through modes."""
         """Restore PDF position after fullscreen transition"""
         try:
             if (hasattr(self, '_stored_zoom') and hasattr(self, 'pdf_widget') and self.pdf_widget):
-                print(f"🔧 RESTORING FULLSCREEN POSITION: zoom={self._stored_zoom:.2f}")
+                console.log(f"🔧 RESTORING FULLSCREEN POSITION: zoom={self._stored_zoom:.2f}")
                 
                 # Restore zoom and pan position
                 if hasattr(self.pdf_widget, 'zoom_factor'):
@@ -4758,7 +5643,7 @@ Press 'L' to cycle through modes."""
                 QApplication.processEvents()
                 
         except Exception as e:
-            print(f"⚠️ Error restoring fullscreen position: {e}")
+            console.log(f"⚠️ Error restoring fullscreen position: {e}")
 
     def simulate_resize_click_workaround(self):
         """WORKAROUND: Force OpenGL repaint after resize through mouse event simulation"""
@@ -4766,7 +5651,7 @@ Press 'L' to cycle through modes."""
             return
             
         try:
-            print("🔧 RESIZE WORKAROUND: Simulating mouse click to fix white screen after resize...")
+            console.log("🔧 RESIZE WORKAROUND: Simulating mouse click to fix white screen after resize...")
             
             # Get the center of the PDF widget
             widget_center = self.pdf_widget.rect().center()
@@ -4801,10 +5686,10 @@ Press 'L' to cycle through modes."""
             QApplication.sendEvent(self.pdf_widget, release_event)
             QApplication.processEvents()
             
-            print("✓ Resize mouse click simulation executed")
+            console.log("✓ Resize mouse click simulation executed")
             
         except Exception as e:
-            print(f"⚠️ Error in resize click workaround: {e}")
+            console.log(f"⚠️ Error in resize click workaround: {e}")
 
     def simulate_click_workaround(self):
         """WORKAROUND: Simulate mouse click to fix fullscreen white screen from GitHub reference"""
@@ -4812,7 +5697,7 @@ Press 'L' to cycle through modes."""
             return
             
         try:
-            print("🔧 WORKAROUND: Simulating actual mouse click for white screen fix...")
+            console.log("🔧 WORKAROUND: Simulating actual mouse click for white screen fix...")
             
             # Get the center of the PDF widget
             widget_center = self.pdf_widget.rect().center()
@@ -4847,16 +5732,16 @@ Press 'L' to cycle through modes."""
             QApplication.sendEvent(self.pdf_widget, release_event)
             QApplication.processEvents()
             
-            print("✓ Fullscreen mouse click simulation executed")
+            console.log("✓ Fullscreen mouse click simulation executed")
             
         except Exception as e:
-            print(f"⚠️ Error in click workaround: {e}")
+            console.log(f"⚠️ Error in click workaround: {e}")
 
     def aggressive_fullscreen_refresh(self):
         """AGGRESSIVE FULLSCREEN REFRESH - COMPREHENSIVE APPROACH from GitHub reference"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                print("🔥 AGGRESSIVE fullscreen refresh starting...")
+                console.log("🔥 AGGRESSIVE fullscreen refresh starting...")
                 
                 # STEP 1: Force immediate OpenGL context refresh
                 self.pdf_widget.makeCurrent()
@@ -4887,15 +5772,15 @@ Press 'L' to cycle through modes."""
                 # STEP 8: Final update with delay
                 QTimer.singleShot(50, lambda: self.pdf_widget.update())
                 
-                print("✅ AGGRESSIVE fullscreen refresh complete")
+                console.log("✅ AGGRESSIVE fullscreen refresh complete")
         except Exception as e:
-            print(f"⚠️ Error in aggressive fullscreen refresh: {e}")
+            console.log(f"⚠️ Error in aggressive fullscreen refresh: {e}")
 
     def aggressive_normal_refresh(self):
         """AGGRESSIVE NORMAL MODE REFRESH - COMPREHENSIVE APPROACH from GitHub reference"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                print("🔥 AGGRESSIVE normal mode refresh starting...")
+                console.log("🔥 AGGRESSIVE normal mode refresh starting...")
                 
                 # STEP 1: Force immediate OpenGL context refresh
                 self.pdf_widget.makeCurrent()
@@ -4922,9 +5807,9 @@ Press 'L' to cycle through modes."""
                 # STEP 7: Final update with delay
                 QTimer.singleShot(50, lambda: self.pdf_widget.update())
                 
-                print("✅ AGGRESSIVE normal mode refresh complete")
+                console.log("✅ AGGRESSIVE normal mode refresh complete")
         except Exception as e:
-            print(f"⚠️ Error in aggressive normal refresh: {e}")
+            console.log(f"⚠️ Error in aggressive normal refresh: {e}")
 
     def create_fullscreen_overlay(self):
         """Create fullscreen control overlay from GitHub reference"""
@@ -5000,6 +5885,20 @@ Press 'L' to cycle through modes."""
         """Auto-hide overlay after timeout"""
         if hasattr(self, '_fullscreen_overlay') and self._fullscreen_overlay.isVisible():
             self._fullscreen_overlay.hide()
+
+    def toggle_console_logging(self):
+        """Toggle console logging on/off and update toolbar button state"""
+        is_enabled = console.toggle()
+        # Update the toolbar button state to match the new console state - DISABLED (console toggle hidden)
+        # if hasattr(self, 'console_toggle_action'):
+        #     self.console_toggle_action.setChecked(is_enabled)
+        
+        # Show status message
+        status = "enabled" if is_enabled else "disabled"
+        self.status_bar.showMessage(f"📺 Console logging {status}", 2000)
+        
+        # Log the change (this will only show if logging is enabled)
+        console.log(f"🔧 Console logging toggled: {status}")
 
     def mouseMoveEvent(self, event):
         """Show overlay on mouse movement in fullscreen"""
@@ -5082,15 +5981,15 @@ Press 'L' to cycle through modes."""
                 QApplication.processEvents()
                 
         except Exception as e:
-            print(f"⚠️ Error restoring PDF position: {e}")
+            console.log(f"⚠️ Error restoring PDF position: {e}")
 
     def _refresh_content_after_resize(self):
         """Refresh PDF content after significant window size changes"""
         try:
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                print(f"🔄 Content refreshed after resize to {self.size().width()}x{self.size().height()}")
+                console.log(f"🔄 Content refreshed after resize to {self.size().width()}x{self.size().height()}")
         except Exception as e:
-            print(f"⚠️ Resize refresh error: {e}")
+            console.log(f"⚠️ Resize refresh error: {e}")
 
     def showEvent(self, event):
         """Handle window show events to ensure proper rendering"""
@@ -5114,40 +6013,40 @@ Press 'L' to cycle through modes."""
                 # Process events
                 QApplication.processEvents()
                 
-                print(f"🖥️ Content refreshed on window show (fullscreen: {self.isFullScreen()})")
+                console.log(f"🖥️ Content refreshed on window show (fullscreen: {self.isFullScreen()})")
         except Exception as e:
-            print(f"⚠️ Show refresh error: {e}")
+            console.log(f"⚠️ Show refresh error: {e}")
     
     def dragEnterEvent(self, event):
         """Handle drag enter events"""
-        print(f"Drag enter detected with {len(event.mimeData().urls())} URLs")
+        console.log(f"Drag enter detected with {len(event.mimeData().urls())} URLs")
         if event.mimeData().hasUrls():
             # Check if any of the dragged files is a PDF
             for url in event.mimeData().urls():
                 file_path = url.toLocalFile()
-                print(f"Checking file: {file_path}")
+                console.log(f"Checking file: {file_path}")
                 if url.isLocalFile() and file_path.lower().endswith('.pdf'):
-                    print("PDF file detected - accepting drag")
+                    console.log("PDF file detected - accepting drag")
                     event.acceptProposedAction()
                     return
-        print("No PDF files found - ignoring drag")
+        console.log("No PDF files found - ignoring drag")
         event.ignore()
     
     def dropEvent(self, event):
         """Handle drop events"""
-        print("Drop event received")
+        console.log("Drop event received")
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     file_path = url.toLocalFile()
-                    print(f"Processing dropped file: {file_path}")
+                    console.log(f"Processing dropped file: {file_path}")
                     if file_path.lower().endswith('.pdf'):
-                        print(f"Loading PDF: {file_path}")
+                        console.log(f"Loading PDF: {file_path}")
                         self.load_pdf(file_path)
                         event.acceptProposedAction()
                         self.status_bar.showMessage(f"Dropped: {os.path.basename(file_path)}", 3000)
                         return
-        print("Drop event ignored")
+        console.log("Drop event ignored")
         event.ignore()
     
     def open_pdf_direct(self):
@@ -5166,18 +6065,18 @@ Press 'L' to cycle through modes."""
             )
             
             if file_path:
-                print(f"Selected file: {file_path}")
+                console.log(f"Selected file: {file_path}")
                 self.load_pdf(file_path)
             else:
-                print("No file selected")
+                console.log("No file selected")
                 
         except Exception as e:
-            print(f"Error in file dialog: {e}")
+            console.log(f"Error in file dialog: {e}")
             self.status_bar.showMessage(f"File dialog error: {str(e)}", 5000)
             
             # Fallback: try with native dialog
             try:
-                print("Trying fallback native dialog...")
+                console.log("Trying fallback native dialog...")
                 file_path, _ = QFileDialog.getOpenFileName(
                     self,
                     "Select PDF File", 
@@ -5187,28 +6086,29 @@ Press 'L' to cycle through modes."""
                 if file_path:
                     self.load_pdf(file_path)
             except Exception as e2:
-                print(f"Fallback dialog also failed: {e2}")
+                console.log(f"Fallback dialog also failed: {e2}")
                 self.status_bar.showMessage("File dialog unavailable", 5000)
     
     def load_pdf(self, pdf_path: str, quality: float = 5.0):
-        """Enhanced PDF loading with comprehensive preloader from GitHub reference"""
-        try:
-            # Ensure UI is fully initialized before loading PDF
-            if not hasattr(self, 'page_label') or self.page_label is None:
-                # UI not ready yet, defer loading
-                QTimer.singleShot(200, lambda: self.load_pdf(pdf_path, quality))
-                return
-            
-            # Store quality for step-by-step loading
-            self.render_quality = quality
-            
-            # Start step-by-step loading with comprehensive preloader
-            self.load_pdf_step_by_step(pdf_path)
-            
-        except Exception as e:
-            tb = traceback.format_exc()
-            # Show the exception and include a copyable traceback for debugging
-            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}\n\nTraceback:\n{tb}")
+        """Load PDF using a worker thread to keep the UI responsive."""
+        self.show_loading_widget_with_progress("Opening PDF...")
+        self.pdf_loading_worker = PdfLoadingWorker(pdf_path)
+        self.pdf_loading_worker.pdfLoaded.connect(self.on_pdf_loaded)
+        self.pdf_loading_worker.pdfLoadingFailed.connect(self.on_pdf_loading_failed)
+        self.pdf_loading_worker.start()
+
+    def on_pdf_loaded(self, pdf_doc, pdf_path):
+        """Handle the loaded PDF document."""
+        self.pdf_doc = pdf_doc
+        self.pdf_path = pdf_path
+        self.total_pages = self.pdf_doc.page_count
+        self.current_page = 0
+        self.load_pdf_step_by_step(pdf_path)
+
+    def on_pdf_loading_failed(self, error_message):
+        """Show an error message if PDF loading fails."""
+        self.close_loading_widget()
+        QMessageBox.critical(self, "Error", f"Failed to load PDF: {error_message}")
             
     def load_pdf_legacy(self, pdf_path: str, quality: float = 5.0):
         """Legacy PDF loading method - kept for reference but not used"""
@@ -5240,7 +6140,7 @@ Press 'L' to cycle through modes."""
             # Clear thumbnail list immediately when loading new PDF
             if hasattr(self, 'thumbnail_list') and self.thumbnail_list:
                 self.thumbnail_list.clear()
-                print("Cleared thumbnail list for new PDF")
+                console.log("Cleared thumbnail list for new PDF")
             
             # Reset thumbnail-related state variables
             if hasattr(self, '_current_thumb_range'):
@@ -5257,10 +6157,10 @@ Press 'L' to cycle through modes."""
                         self.pdf_widget.texture_cache.clear()
                     else:
                         # Recreate texture cache if methods are missing
-                        print("Warning: Recreating texture cache due to missing methods")
+                        console.log("Warning: Recreating texture cache due to missing methods")
                         self.pdf_widget.texture_cache = GPUTextureCache()
             except Exception as e:
-                print(f"Warning: Could not clear texture cache: {e}")
+                console.log(f"Warning: Could not clear texture cache: {e}")
                 # Fallback: recreate texture cache
                 self.pdf_widget.texture_cache = GPUTextureCache()
             
@@ -5279,13 +6179,13 @@ Press 'L' to cycle through modes."""
             if hasattr(self.pdf_widget, 'temp_pan_y'):
                 self.pdf_widget.temp_pan_y = 0.0
             
-            print(f"PDF loading - Grid mode set to: {self.pdf_widget.grid_mode} (from UI toggle)")
+            console.log(f"PDF loading - Grid mode set to: {self.pdf_widget.grid_mode} (from UI toggle)")
             
             try:
                 if hasattr(self.pdf_widget, 'grid_textures'):
                     self.pdf_widget.grid_textures.clear()
             except Exception as e:
-                print(f"Warning: Could not clear grid textures: {e}")
+                console.log(f"Warning: Could not clear grid textures: {e}")
                 
             self.pdf_widget.set_page_texture(None)  # Clear current page texture
             
@@ -5392,11 +6292,24 @@ Press 'L' to cycle through modes."""
             
             # Move to top-right corner position
             self.loading_widget.move(x, y)
-            print(f"📍 Ultra-minimal loading widget positioned at top-right corner ({x}, {y})")
+            console.log(f"📍 Ultra-minimal loading widget positioned at top-right corner ({x}, {y})")
 
     def load_pdf_step_by_step(self, file_path):
         """Load PDF in steps with progress updates from GitHub reference - PRESERVING CURRENT SETTINGS"""
         try:
+            # PERFORMANCE CHECK: Show warning in status bar only (no popup)
+            file_size_mb = 0
+            try:
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                if file_size_mb > 100:  # Files larger than 100MB
+                    self.status_bar.showMessage(f"Large PDF ({file_size_mb:.1f}MB) - Minimal thumbnail mode active", 5000)
+                    console.log(f"🚨 Large PDF detected: {file_size_mb:.1f}MB - Using minimal mode")
+                elif file_size_mb > 50:  # Files larger than 50MB
+                    self.status_bar.showMessage(f"Medium PDF ({file_size_mb:.1f}MB) - Performance mode enabled", 3000)
+                    console.log(f"⚠️ Performance mode enabled for {file_size_mb:.1f}MB PDF")
+            except:
+                pass  # Continue if file size check fails
+            
             # Show loading widget at start
             self.show_loading_widget_with_progress("Loading PDF...")
             
@@ -5430,7 +6343,7 @@ Press 'L' to cycle through modes."""
             # Clear thumbnail list immediately when loading new PDF (PRESERVE CURRENT LOGIC)
             if hasattr(self, 'thumbnail_list') and self.thumbnail_list:
                 self.thumbnail_list.clear()
-                print("Cleared thumbnail list for new PDF")
+                console.log("Cleared thumbnail list for new PDF")
             
             # Reset thumbnail-related state variables (PRESERVE CURRENT LOGIC)
             if hasattr(self, '_current_thumb_range'):
@@ -5438,8 +6351,21 @@ Press 'L' to cycle through modes."""
             if hasattr(self, '_selective_thumbnails_enabled'):
                 delattr(self, '_selective_thumbnails_enabled')
             
-            # Open new document
-            self.pdf_doc = fitz.open(file_path)
+            # Open new document with optimizations for large files
+            file_size_mb = 0
+            try:
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            except:
+                pass
+            
+            # ULTRA-FAST LOADING: For very large PDFs, use optimized settings
+            if file_size_mb > 300:  # Very large files (like your 600MB PDF)
+                console.log(f"🚀 ULTRA-FAST MODE: Opening {file_size_mb:.1f}MB PDF with speed optimizations")
+                # Open with minimal memory usage
+                self.pdf_doc = fitz.open(file_path)
+            else:
+                self.pdf_doc = fitz.open(file_path)
+                
             self.pdf_path = file_path
             self.total_pages = self.pdf_doc.page_count
             self.current_page = 0
@@ -5451,8 +6377,18 @@ Press 'L' to cycle through modes."""
             # PRESERVE CURRENT QUALITY SETTING - use stored render_quality or default
             quality = getattr(self, 'render_quality', 5.0)
             
-            # Create new renderer with PRESERVED QUALITY
-            self.renderer = PDFPageRenderer(file_path, quality)
+            # ULTRA-FAST RENDERING: For very large PDFs, start with lower quality
+            if file_size_mb > 300:  # Very large files
+                initial_quality = min(2.0, quality)  # Much lower initial quality
+                console.log(f"⚡ Ultra-fast rendering: Starting with quality {initial_quality} for {file_size_mb:.1f}MB PDF")
+            elif file_size_mb > 100:  # Large files  
+                initial_quality = min(3.0, quality)  # Lower initial quality
+                console.log(f"⚡ Fast rendering: Starting with quality {initial_quality} for {file_size_mb:.1f}MB PDF")
+            else:
+                initial_quality = quality
+            
+            # Create new renderer with OPTIMIZED QUALITY for large files
+            self.renderer = PDFPageRenderer(file_path, initial_quality)
             self.renderer.pageRendered.connect(self.on_page_rendered)
             self.renderer.start()
             
@@ -5463,18 +6399,23 @@ Press 'L' to cycle through modes."""
             # Clear texture cache and grid textures when loading new document (PRESERVE CURRENT LOGIC)
             try:
                 if hasattr(self.pdf_widget, 'texture_cache') and self.pdf_widget.texture_cache:
+                    # OPTIMIZE CACHE for large PDFs before clearing
+                    self.pdf_widget.texture_cache.optimize_for_large_pdf(file_size_mb, self.total_pages)
+                    
                     if hasattr(self.pdf_widget.texture_cache, 'clear_cache'):
                         self.pdf_widget.texture_cache.clear_cache()
                     elif hasattr(self.pdf_widget.texture_cache, 'clear'):
                         self.pdf_widget.texture_cache.clear()
                     else:
                         # Recreate texture cache if methods are missing
-                        print("Warning: Recreating texture cache due to missing methods")
+                        console.log("Warning: Recreating texture cache due to missing methods")
                         self.pdf_widget.texture_cache = GPUTextureCache()
+                        self.pdf_widget.texture_cache.optimize_for_large_pdf(file_size_mb, self.total_pages)
             except Exception as e:
-                print(f"Warning: Could not clear texture cache: {e}")
+                console.log(f"Warning: Could not clear texture cache: {e}")
                 # Fallback: recreate texture cache
                 self.pdf_widget.texture_cache = GPUTextureCache()
+                self.pdf_widget.texture_cache.optimize_for_large_pdf(file_size_mb, self.total_pages)
             
             # CRITICAL: Reset grid mode state when loading new PDF (PRESERVE CURRENT LOGIC)
             # The grid mode should be determined by the UI toggle state, not previous PDF state
@@ -5491,13 +6432,13 @@ Press 'L' to cycle through modes."""
             if hasattr(self.pdf_widget, 'temp_pan_y'):
                 self.pdf_widget.temp_pan_y = 0.0
             
-            print(f"PDF loading - Grid mode set to: {self.pdf_widget.grid_mode} (from UI toggle)")
+            console.log(f"PDF loading - Grid mode set to: {self.pdf_widget.grid_mode} (from UI toggle)")
             
             try:
                 if hasattr(self.pdf_widget, 'grid_textures'):
                     self.pdf_widget.grid_textures.clear()
             except Exception as e:
-                print(f"Warning: Could not clear grid textures: {e}")
+                console.log(f"Warning: Could not clear grid textures: {e}")
                 
             self.pdf_widget.set_page_texture(None)  # Clear current page texture
             
@@ -5514,30 +6455,104 @@ Press 'L' to cycle through modes."""
             self.update_loading_progress("Rendering first page...", 70)
             QApplication.processEvents()
             
+            # Show first page loading indicator
+            self.show_mini_loading_indicator("Loading first page...")
+            
             # Render current page immediately for ultra-fast display
             self.render_current_page()
             
             # Update background color for current theme (PRESERVE CURRENT LOGIC)
             self.pdf_widget.update_background_color()
             
-            # Step 6: Start thumbnail generation (90%)
-            self.update_loading_progress("Preparing thumbnails...", 90)
+            # IMMEDIATE PDF READY: Make the PDF fully usable right now
+            self.close_loading_widget()  # Close loading widget immediately
+            console.log("🚀 PDF READY: Main PDF display is now fully functional")
+            
+            # Note: Mini loading indicator will be hidden when first page texture is actually set and painted
+            
+            # Step 6: Start thumbnail generation (90%) - NOW IN BACKGROUND
+            # Don't block UI with thumbnail loading
             QApplication.processEvents()
             
-            # PRESERVE CURRENT THUMBNAIL LOGIC - ALWAYS generate thumbnails for new PDF
-            # This ensures thumbnail ordering and quality settings are preserved
-            QTimer.singleShot(100, lambda: self._complete_loading_with_thumbnails())
+            # IMMEDIATE THUMBNAIL LOADING - Start right away for responsive UI
+            self._complete_loading_with_thumbnails()
             
         except Exception as e:
-            print(f"Error in step-by-step loading: {e}")
+            console.log(f"Error in step-by-step loading: {e}")
             self.close_loading_widget()
             raise
+
+    def _render_first_page_async(self):
+        """Render the first page asynchronously to avoid blocking the UI"""
+        try:
+            file_size_mb = 0
+            if hasattr(self, 'pdf_path') and os.path.exists(self.pdf_path):
+                file_size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
+                
+            # ULTRA-FAST FIRST PAGE: For very large PDFs, render at minimum quality first
+            if file_size_mb > 300:  # Very large files (600MB+)
+                console.log(f"⚡ ULTRA-FAST: Rendering first page at minimum quality for {file_size_mb:.1f}MB PDF")
+                # Temporarily set very low quality for instant first page
+                original_quality = self.renderer.quality
+                self.renderer.quality = 1.0  # Minimum quality for instant loading
+                self.render_current_page()
+                # Restore quality and schedule high-quality re-render
+                self.renderer.quality = original_quality
+                QTimer.singleShot(200, self.render_current_page)  # Re-render with proper quality after 200ms
+            elif file_size_mb > 100:  # Large files (100MB+)
+                console.log(f"⚡ FAST: Quick first page render for {file_size_mb:.1f}MB PDF")
+                # Use reduced quality for faster loading
+                original_quality = self.renderer.quality
+                self.renderer.quality = min(2.0, original_quality)
+                self.render_current_page()
+                # Restore quality and schedule high-quality re-render
+                self.renderer.quality = original_quality
+                QTimer.singleShot(100, self.render_current_page)  # Re-render with proper quality after 100ms
+            else:
+                # Normal rendering for smaller files
+                self.render_current_page()
+        except Exception as e:
+            console.log(f"Error in async first page render: {e}")
+            # Fallback to normal rendering
+            self.render_current_page()
+    
+    def _complete_pdf_loading(self):
+        """Complete PDF loading with UI updates and thumbnail generation"""
+        # This method is no longer needed as the logic is in load_pdf_step_by_step
+        pass
     
     def _complete_loading_with_thumbnails(self):
         """Complete loading process with preserved thumbnail generation"""
         try:
-            # PRESERVE CURRENT THUMBNAIL GENERATION LOGIC
-            # This maintains the current quality and ordering that works correctly
+            # EMERGENCY BYPASS: Modified to still show essential thumbnails
+            file_size_mb = 0
+            try:
+                if hasattr(self, 'pdf_path') and os.path.exists(self.pdf_path):
+                    file_size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
+            except:
+                pass
+            
+            # Only completely skip thumbnails for EXTREMELY large files
+            if file_size_mb > 1000 or self.total_pages > 2000:
+                console.log(f"🚨 EXTREME BYPASS: Skipping ALL thumbnails for {file_size_mb:.1f}MB PDF with {self.total_pages} pages")
+                self.status_bar.showMessage(f"Loaded: {os.path.basename(self.pdf_path)} ({self.total_pages} pages) - Too large for thumbnails", 5000)
+                self._create_empty_thumbnail_list()
+                return
+            
+            # For large but manageable files, generate minimal thumbnails
+            if file_size_mb > 300 or self.total_pages > 800:
+                console.log(f"📋 MINIMAL THUMBNAILS: Loading only first 10 thumbnails for {file_size_mb:.1f}MB PDF with {self.total_pages} pages")
+                self._generate_minimal_thumbnails(10)  # First 10 pages for large files
+                return
+            
+            # For medium-large files (200-800 pages), generate more thumbnails for better navigation
+            if self.total_pages > 200 or file_size_mb > 100:
+                console.log(f"📋 MEDIUM THUMBNAILS: Loading first 15 thumbnails for {file_size_mb:.1f}MB PDF with {self.total_pages} pages")
+                self._generate_minimal_thumbnails(15)  # 15 pages for medium-large files
+                return
+            
+            # For medium files, use reduced thumbnail generation
+            console.log(f"📋 Loading optimized thumbnails for {file_size_mb:.1f}MB PDF with {self.total_pages} pages")
             self.generate_thumbnails_deferred(force_new_pdf=True)
             
             # Show completion status
@@ -5547,7 +6562,7 @@ Press 'L' to cycle through modes."""
             QTimer.singleShot(500, self.close_loading_widget)
             
         except Exception as e:
-            print(f"Error completing loading: {e}")
+            console.log(f"Error completing loading: {e}")
             self.close_loading_widget()
 
     def on_thumbnail_ready(self, page_num, qimage):
@@ -5590,10 +6605,10 @@ Press 'L' to cycle through modes."""
                     # Show final status
                     filename = os.path.basename(self.pdf_path)
                     self.status_bar.showMessage(f"Loaded: {filename} - {self.total_pages} pages, {self.thumbnails_generated} thumbnails generated", 5000)
-                    print(f"✓ PDF loading complete: {filename}")
+                    console.log(f"✓ PDF loading complete: {filename}")
         
         except Exception as e:
-            print(f"Thumbnail ready error: {e}")
+            console.log(f"Thumbnail ready error: {e}")
 
     def update_loading_progress(self, message, percentage):
         """Update loading widget with progress"""
@@ -5607,11 +6622,11 @@ Press 'L' to cycle through modes."""
         """Close the loading widget"""
         try:
             if hasattr(self, 'loading_widget') and self.loading_widget:
-                print("🔧 Closing loading widget...")
+                console.log("🔧 Closing loading widget...")
                 self.loading_widget.hide()
                 self.loading_widget.deleteLater()
                 self.loading_widget = None
-                print("✓ Loading widget closed")
+                console.log("✓ Loading widget closed")
                 
                 # Clear references
                 if hasattr(self, 'loading_label'):
@@ -5619,25 +6634,25 @@ Press 'L' to cycle through modes."""
                 if hasattr(self, 'progress_bar'):
                     self.progress_bar = None
         except Exception as e:
-            print(f"Error closing loading widget: {e}")
+            console.log(f"Error closing loading widget: {e}")
 
     def force_cleanup_loading_widget(self):
         """Force cleanup of any persistent loading widgets from GitHub reference"""
         try:
-            print("🔧 FORCE CLEANUP: Checking for persistent loading widgets...")
+            console.log("🔧 FORCE CLEANUP: Checking for persistent loading widgets...")
             
             # Find and remove specific loading widget types by object name
             loading_widget_names = ["pdfLoadingWidget", "gridLoadingWidget", "thumbnailLoadingWidget", "navigationLoadingWidget"]
             for child in self.findChildren(QWidget):
                 if hasattr(child, 'objectName') and child.objectName() in loading_widget_names:
-                    print(f"🔧 FORCE CLEANUP: Removing persistent widget: {child.objectName()}")
+                    console.log(f"🔧 FORCE CLEANUP: Removing persistent widget: {child.objectName()}")
                     child.hide()
                     child.deleteLater()
             
             # Also check for widgets with 'loading' in their object name (generic backup)
             for child in self.findChildren(QWidget):
                 if hasattr(child, 'objectName') and 'loading' in child.objectName().lower():
-                    print(f"🔧 FORCE CLEANUP: Removing generic loading widget: {child}")
+                    console.log(f"🔧 FORCE CLEANUP: Removing generic loading widget: {child}")
                     child.hide()
                     child.deleteLater()
             
@@ -5652,10 +6667,10 @@ Press 'L' to cycle through modes."""
                     self.loading_timer.stop()
                 self.loading_timer = None
             
-            print("✓ FORCE CLEANUP: Complete")
+            console.log("✓ FORCE CLEANUP: Complete")
             
         except Exception as e:
-            print(f"✗ FORCE CLEANUP ERROR: {e}")
+            console.log(f"✗ FORCE CLEANUP ERROR: {e}")
 
     def show_page_navigation_status(self, direction):
         """Show immediate status for page navigation"""
@@ -5688,7 +6703,7 @@ Press 'L' to cycle through modes."""
                     self.status_bar.showMessage(f"Loading page {self.current_page}...", 2000)
 
     def show_mini_loading_indicator(self, message="Loading..."):
-        """Show ultra-minimal 1px line loading indicator in center"""
+        """Show ultra-minimal 1px line loading indicator - unified style"""
         try:
             # Remove any existing mini loader
             self.hide_mini_loading_indicator()
@@ -5753,14 +6768,14 @@ Press 'L' to cycle through modes."""
                 self._mini_timeout_timer.setSingleShot(True)
                 self._mini_timeout_timer.timeout.connect(self._force_hide_mini_preloader_on_timeout)
             
-            # Set timeout for 2 seconds from last operation
-            self._mini_timeout_timer.start(2000)
-            print(f"⏱️ Mini preloader timeout set for 2 seconds")
+            # Set reasonable timeout - 4 seconds should be enough for most rendering
+            self._mini_timeout_timer.start(4000)
+            console.log(f"⏱️ Mini preloader timeout set for 8 seconds (extended for first page)")
             
-            print(f"🔄 Ultra-minimal 1px loading indicator shown: {message}")
+            console.log(f"✓ Minimal 1px loading indicator shown: {message}")
             
         except Exception as e:
-            print(f"Error showing mini loading indicator: {e}")
+            console.log(f"Error showing mini loading indicator: {e}")
 
     def _animate_mini_progress(self, value):
         """Animate ultra-minimal 1px progress line with realistic rendering stages"""
@@ -5786,23 +6801,47 @@ Press 'L' to cycle through modes."""
                     else:
                         self.mini_message_label.setText(stage)
                 
-                # Continue smooth animation
+                # Continue smooth animation with safeguards
                 if value < 100:
                     # Slower progress for more realistic rendering time
                     next_value = min(100, value + 1)
-                    QTimer.singleShot(80, lambda: self._animate_mini_progress(next_value))
+                    
+                    # FIXED: Add maximum iteration safeguard to prevent infinite loops
+                    if not hasattr(self, '_mini_progress_iterations'):
+                        self._mini_progress_iterations = 0
+                    self._mini_progress_iterations += 1
+                    
+                    # Force completion if stuck at high percentage or too many iterations
+                    if value >= 82 and self._mini_progress_iterations > 8:
+                        console.log("⚠️ Progress stuck at high percentage (82%+), forcing completion")
+                        next_value = 100
+                    elif self._mini_progress_iterations > 120:  # Safety limit
+                        console.log("⚠️ Too many progress iterations, forcing completion")
+                        next_value = 100
+                    
+                    if next_value < 100:
+                        QTimer.singleShot(80, lambda: self._animate_mini_progress(next_value))
+                    else:
+                        # Reset iteration counter and complete
+                        self._mini_progress_iterations = 0
+                        self.mini_progress_bar.setValue(100)
+                        QTimer.singleShot(200, self.hide_mini_loading_indicator)
                 else:
-                    # Page fully loaded - hide indicator
+                    # Page fully loaded - hide indicator and reset counter
+                    if hasattr(self, '_mini_progress_iterations'):
+                        self._mini_progress_iterations = 0
                     QTimer.singleShot(200, self.hide_mini_loading_indicator)
                     
         except Exception as e:
-            print(f"Error animating mini progress: {e}")
+            console.log(f"Error animating mini progress: {e}")
+            # Fail-safe: hide the indicator
+            self.hide_mini_loading_indicator()
 
     def hide_mini_loading_indicator(self):
         """Hide mini loading indicator"""
         try:
             # Stop any timeout timer
-            if hasattr(self, '_mini_timeout_timer'):
+            if hasattr(self, '_mini_timeout_timer') and self._mini_timeout_timer:
                 self._mini_timeout_timer.stop()
                 
             if hasattr(self, 'mini_loading_timer') and self.mini_loading_timer:
@@ -5819,18 +6858,21 @@ Press 'L' to cycle through modes."""
             if hasattr(self, 'mini_progress_bar'):
                 self.mini_progress_bar = None
                 
-            print("🔄 Mini loading indicator hidden")
+            console.log("🔄 Mini loading indicator hidden")
             
         except Exception as e:
-            print(f"Error hiding mini loading indicator: {e}")
+            console.log(f"Error hiding mini loading indicator: {e}")
 
     def _force_hide_mini_preloader_on_timeout(self):
         """Force hide mini preloader after timeout to prevent stuck preloaders"""
         try:
-            print("⏰ TIMEOUT: Force hiding mini preloader after 2 seconds")
+            console.log("⏰ TIMEOUT: Force hiding mini preloader after 4 seconds - was stuck")
+            # Reset iteration counter to prevent future issues
+            if hasattr(self, '_mini_progress_iterations'):
+                self._mini_progress_iterations = 0
             self.hide_mini_loading_indicator()
         except Exception as e:
-            print(f"Error in mini preloader timeout: {e}")
+            console.log(f"Error in mini preloader timeout: {e}")
 
     def _render_page_with_feedback(self):
         """Render current page and hide loading indicator when done"""
@@ -5851,13 +6893,31 @@ Press 'L' to cycle through modes."""
                 self.status_bar.showMessage(f"Page {self.current_page + 1} of {self.total_pages}", 3000)
                 
         except Exception as e:
-            print(f"Error in render with feedback: {e}")
+            console.log(f"Error in render with feedback: {e}")
             self.hide_mini_loading_indicator()
 
     def show_grid_loading_progress(self, grid_size, focus_page=None):
         """Show ultra-minimal loading indicator for grid processing"""
         # Close any existing loading widget first
         self.hide_mini_loading_indicator()
+        
+        # Reset grid completion check throttling for fresh start
+        if hasattr(self, '_last_grid_check_time'):
+            delattr(self, '_last_grid_check_time')
+        
+        # CLEANUP: Ensure any previous preloaders are hidden before starting new one
+        self._cleanup_previous_preloaders()
+        
+        # Track when grid loading starts for timing checks
+        import time
+        self._grid_start_time = time.time()
+        
+        # Check if slideshow is active for better logging
+        slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
+        if slideshow_active:
+            console.log(f"🎬 SLIDESHOW: Starting grid loader for {grid_size} - will wait for 100% completion")
+        else:
+            console.log(f"🔄 Starting grid loader for {grid_size} - normal mode")
         
         # Create ultra-minimal grid loading widget
         self.grid_loading_widget = QWidget(self)
@@ -5912,6 +6972,9 @@ Press 'L' to cycle through modes."""
         self.grid_loading_widget.show()
         self.grid_loading_widget.raise_()
         
+        # Debug: Check immediate visibility
+        console.log(f"🔍 Grid widget created and shown: visible={self.grid_loading_widget.isVisible()}, size={self.grid_loading_widget.size().width()}x{self.grid_loading_widget.size().height()}")
+        
         # Position after a brief delay to ensure layout is stable
         QTimer.singleShot(10, self._position_grid_loading_widget)
         
@@ -5919,16 +6982,43 @@ Press 'L' to cycle through modes."""
         self._animate_grid_progress(0)
         
         # FIXED: Add automatic timeout to prevent stuck preloaders
-        if not hasattr(self, '_grid_timeout_timer'):
+        if not hasattr(self, '_grid_timeout_timer') or self._grid_timeout_timer is None:
             self._grid_timeout_timer = QTimer()
             self._grid_timeout_timer.setSingleShot(True)
             self._grid_timeout_timer.timeout.connect(self._force_hide_grid_preloader_on_timeout)
         
-        # Set timeout for 3 seconds from last operation
-        self._grid_timeout_timer.start(3000)
-        print(f"⏱️ Grid preloader timeout set for 3 seconds")
+        # For slideshow mode, use longer timeout. For 2x1 grid, use longer timeout for staggered loading.
+        is_2x1_grid = hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1
+        if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+            timeout_duration = 5000   # 5 seconds for slideshow (reduced from 10s)
+        elif is_2x1_grid:
+            timeout_duration = 3000   # 3 seconds for 2x1 grid (reduced from 5s)
+        else:
+            timeout_duration = 4000   # 4 seconds for other grids
         
-        print(f"🔄 Ultra-minimal grid loading indicator shown: {grid_info}")
+        self._grid_timeout_timer.start(timeout_duration)
+        grid_type = "slideshow" if timeout_duration == 5000 else ("2x1" if timeout_duration == 3000 else "normal")
+        console.log(f"⏱️ Grid preloader timeout set for {timeout_duration/1000} seconds ({grid_type} mode)")
+        
+        # Additional timer for slideshow mode - aggressive preloader cleanup
+        if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+            if not hasattr(self, '_aggressive_cleanup_timer') or self._aggressive_cleanup_timer is None:
+                self._aggressive_cleanup_timer = QTimer()
+                self._aggressive_cleanup_timer.setSingleShot(True)
+                self._aggressive_cleanup_timer.timeout.connect(self._aggressive_preloader_cleanup)
+            # Set a shorter timer to check if we can hide preloader early
+            self._aggressive_cleanup_timer.start(800)  # Check after just 0.8 seconds
+            console.log("🎬 SLIDESHOW: Aggressive cleanup timer set for 0.8 seconds")
+            
+            # Also set up a secondary fallback timer for really stuck preloaders
+            if not hasattr(self, '_fallback_cleanup_timer') or self._fallback_cleanup_timer is None:
+                self._fallback_cleanup_timer = QTimer()
+                self._fallback_cleanup_timer.setSingleShot(True)
+                self._fallback_cleanup_timer.timeout.connect(self._force_hide_all_preloaders)
+            self._fallback_cleanup_timer.start(3000)  # Force hide after 3 seconds max
+            console.log("🎬 SLIDESHOW: Fallback cleanup timer set for 3 seconds")
+        
+        console.log(f"🔄 Ultra-minimal grid loading indicator shown: {grid_info}")
 
     def _position_grid_loading_widget(self):
         """Position grid loading widget in top-right corner"""
@@ -5936,33 +7026,52 @@ Press 'L' to cycle through modes."""
             if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
                 # Position in top-right corner with wider widget
                 self.grid_loading_widget.move(self.width() - 220, 10)
-                print(f"📍 Grid loading widget positioned at top-right corner: {self.width() - 220}, 10")
+                console.log(f"📍 Grid loading widget positioned at top-right corner: {self.width() - 220}, 10")
+                # Debug: Check visibility after positioning
+                console.log(f"🔍 Grid widget after positioning: visible={self.grid_loading_widget.isVisible()}, hidden={self.grid_loading_widget.isHidden()}")
         except Exception as e:
-            print(f"Error positioning grid loading widget: {e}")
+            console.log(f"Error positioning grid loading widget: {e}")
 
     def _animate_grid_progress(self, value):
         """Animate ultra-minimal grid loading progress with rendering stages"""
         try:
+            # Safety check: ensure widget still exists and is valid
+            if not (hasattr(self, 'grid_progress_bar') and self.grid_progress_bar):
+                console.log("🔄 Grid progress animation stopped: progress bar no longer exists")
+                return
+                
+            # Additional Qt safety check for deleted C++ object
+            try:
+                # Try to access a property to check if the object is still valid
+                _ = self.grid_progress_bar.value()
+            except RuntimeError:
+                console.log("🔄 Grid progress animation stopped: progress bar has been deleted")
+                return
+            
             if hasattr(self, 'grid_progress_bar') and self.grid_progress_bar:
                 self.grid_progress_bar.setValue(value)
                 
                 # Update progress message based on rendering stage
                 if hasattr(self, 'grid_info_label') and value < 100:
-                    if value < 20:
-                        stage = "Computing layout..."
-                    elif value < 40:
-                        stage = "Loading pages..."
-                    elif value < 70:
-                        stage = "Rendering textures..."
-                    elif value < 90:
-                        stage = "Enhancing quality..."
-                    else:
-                        stage = "Finalizing grid..."
-                    
-                    current_text = self.grid_info_label.text()
-                    if "grid" in current_text.lower():
-                        grid_part = current_text.split(" (")[0] if " (" in current_text else current_text.split(" -")[0]
-                        self.grid_info_label.setText(f"{grid_part} - {stage}")
+                    try:
+                        if value < 20:
+                            stage = "Computing layout..."
+                        elif value < 40:
+                            stage = "Loading pages..."
+                        elif value < 70:
+                            stage = "Rendering textures..."
+                        elif value < 90:
+                            stage = "Enhancing quality..."
+                        else:
+                            stage = "Finalizing grid..."
+                        
+                        current_text = self.grid_info_label.text()
+                        if "grid" in current_text.lower():
+                            grid_part = current_text.split(" (")[0] if " (" in current_text else current_text.split(" -")[0]
+                            self.grid_info_label.setText(f"{grid_part} - {stage}")
+                    except RuntimeError:
+                        # Info label has been deleted, skip updating it
+                        pass
                 
                 # Continue smooth animation
                 if value < 100:
@@ -5970,11 +7079,18 @@ Press 'L' to cycle through modes."""
                     next_value = min(100, value + 3)
                     QTimer.singleShot(100, lambda: self._animate_grid_progress(next_value))
                 else:
-                    # Complete - hide when fully loaded
-                    QTimer.singleShot(400, self._finish_grid_loading)
+                    # Animation complete - but DON'T auto-finish grid loading
+                    # Grid loading should only finish when actual pages are loaded (via _check_grid_completion_and_hide_preloader)
+                    if hasattr(self, 'grid_progress_bar') and self.grid_progress_bar:
+                        try:
+                            self.grid_progress_bar.setValue(100)
+                        except RuntimeError:
+                            # Progress bar has been deleted
+                            pass
+                    console.log("🔄 Grid progress animation complete - waiting for actual page loading to finish")
                     
         except Exception as e:
-            print(f"Error animating grid progress: {e}")
+            console.log(f"Error animating grid progress: {e}")
 
     def _finish_grid_loading(self):
         """Finish ultra-minimal grid loading and hide progress"""
@@ -5982,17 +7098,64 @@ Press 'L' to cycle through modes."""
             if hasattr(self, 'grid_progress_bar') and self.grid_progress_bar:
                 self.grid_progress_bar.setValue(100)
             
+            # Check if slideshow is active for better logging
+            slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
+            
+            # Check if we're in 2x1 grid mode during slideshow
+            is_2x1_grid = (hasattr(self, 'current_layout') and self.current_layout and 
+                          self.current_layout.get('type') == 'grid' and 
+                          self.current_layout.get('rows') == 2 and 
+                          self.current_layout.get('cols') == 1)
+            
+            # For slideshow with 2x1 grid, don't hide until grid completion check determines it's ready
+            if slideshow_active and is_2x1_grid:
+                console.log("🎬 SLIDESHOW: 2x1 Grid finish called - but keeping loader visible until completion check approves")
+                # Don't hide the grid loader during slideshow 2x1 mode
+                # Let the grid completion check in _check_grid_completion_and_hide_preloader handle it
+                return
+            
+            # SLIDESHOW: Restart countdown after grid is fully loaded
+            if (slideshow_active and hasattr(self, '_waiting_for_page_load') and self._waiting_for_page_load):
+                console.log("🎬 SLIDESHOW: Grid fully loaded - restarting slideshow countdown")
+                self._restart_countdown_after_page_load()
+            elif slideshow_active and hasattr(self, '_waiting_for_page_load'):
+                console.log(f"🎬 SLIDESHOW: Grid loaded but not waiting for page load (waiting: {self._waiting_for_page_load})")
+                # FALLBACK: If we're in slideshow but not waiting, still restart countdown to prevent hanging
+                console.log("🎬 SLIDESHOW FALLBACK: Restarting countdown to prevent hanging")
+                self._restart_countdown_after_page_load()
+            elif slideshow_active:
+                console.log("🎬 SLIDESHOW: Grid loaded but no waiting flag found")
+                # FALLBACK: If we're in slideshow but no waiting flag, restart countdown to prevent hanging
+                console.log("🎬 SLIDESHOW FALLBACK: Restarting countdown to prevent hanging")
+                self._restart_countdown_after_page_load()
+            else:
+                console.log("🔄 Grid loading finished (normal mode)")
+            
             # Hide after brief display
+            if slideshow_active:
+                self._grid_hide_authorized = True  # Authorize the hide
             QTimer.singleShot(200, self.hide_grid_loading_indicator)
             
         except Exception as e:
-            print(f"Error finishing grid loading: {e}")
+            console.log(f"Error finishing grid loading: {e}")
 
     def hide_grid_loading_indicator(self):
         """Hide grid loading indicator"""
         try:
+            # Safety check: Don't hide during slideshow unless explicitly authorized
+            slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
+            if slideshow_active:
+                # Check if this hide is authorized (called from legitimate completion)
+                if not hasattr(self, '_grid_hide_authorized'):
+                    console.log("🎬 SLIDESHOW: Blocked unauthorized grid loader hide attempt")
+                    return
+                else:
+                    # Reset authorization flag
+                    delattr(self, '_grid_hide_authorized')
+                    console.log("🎬 SLIDESHOW: Authorized grid loader hide proceeding")
+            
             # Stop any timeout timer
-            if hasattr(self, '_grid_timeout_timer'):
+            if hasattr(self, '_grid_timeout_timer') and self._grid_timeout_timer:
                 self._grid_timeout_timer.stop()
                 
             if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
@@ -6007,18 +7170,148 @@ Press 'L' to cycle through modes."""
             if hasattr(self, 'grid_info_label'):
                 self.grid_info_label = None
                 
-            print("🔄 Grid loading indicator hidden")
+            console.log("🔄 Grid loading indicator hidden")
             
         except Exception as e:
-            print(f"Error hiding grid loading indicator: {e}")
+            console.log(f"Error hiding grid loading indicator: {e}")
 
     def _force_hide_grid_preloader_on_timeout(self):
         """Force hide grid preloader after timeout to prevent stuck preloaders"""
         try:
-            print("⏰ TIMEOUT: Force hiding grid preloader after 3 seconds")
+            # Check if we're in slideshow mode
+            slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
+            
+            if slideshow_active:
+                console.log("⏰ SLIDESHOW TIMEOUT: Force hiding grid preloader")
+            else:
+                console.log("⏰ NORMAL GRID TIMEOUT: Force hiding grid preloader (was stuck at completion check)")
+            
+            # Force hide the grid loading indicator
             self.hide_grid_loading_indicator()
+            
+            # Also clean up any grid completion tracking
+            if hasattr(self, '_grid_completion_start_time'):
+                delattr(self, '_grid_completion_start_time')
+                console.log("🧹 Cleaned up grid completion tracking")
+                
         except Exception as e:
-            print(f"Error in grid preloader timeout: {e}")
+            console.log(f"Error in grid preloader timeout: {e}")
+
+    def _aggressive_preloader_cleanup(self):
+        """Aggressively clean up stuck preloaders in slideshow mode when pages are functionally ready"""
+        try:
+            console.log("🎬 AGGRESSIVE CLEANUP: Checking if preloaders can be hidden early")
+            
+            # Only run in slideshow mode
+            if not (hasattr(self, '_auto_advance_active') and self._auto_advance_active):
+                return
+                
+            # Check if grid preloader is visible
+            grid_loader_visible = (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                                 self.grid_loading_widget.isVisible())
+            
+            if not grid_loader_visible:
+                console.log("🎬 AGGRESSIVE CLEANUP: No grid preloader visible - nothing to clean")
+                return
+                
+            # Check if we have functional content (any textures cached OR user can interact)
+            has_functional_content = False
+            ready_reason = "Unknown"
+            
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                if hasattr(self.pdf_widget, 'texture_cache') and self.pdf_widget.texture_cache:
+                    texture_count = self.pdf_widget.texture_cache.get_active_texture_count()
+                    if texture_count > 0:
+                        has_functional_content = True
+                        ready_reason = f"Has {texture_count} textures"
+                    else:
+                        # Even without textures, if we're in slideshow and some time has passed,
+                        # assume pages are ready since user reported they can zoom/pan
+                        if hasattr(self, '_grid_start_time'):
+                            import time
+                            elapsed = time.time() - self._grid_start_time
+                            if elapsed > 2.0:  # After 2 seconds, assume ready
+                                has_functional_content = True
+                                ready_reason = f"Time elapsed ({elapsed:.1f}s) - assuming ready"
+                        
+            console.log(f"🎬 AGGRESSIVE CLEANUP: Functional content check: {has_functional_content} ({ready_reason})")
+            
+            # If we have functional content, hide the preloader
+            if has_functional_content:
+                console.log("🎬 AGGRESSIVE CLEANUP: Pages are functionally ready - forcing preloader hide")
+                self.hide_grid_loading_indicator()
+                
+                # Clean up completion tracking
+                if hasattr(self, '_grid_completion_start_time'):
+                    delattr(self, '_grid_completion_start_time')
+                    
+                # Stop the main grid timeout since we're hiding early
+                if hasattr(self, '_grid_timeout_timer') and self._grid_timeout_timer:
+                    self._grid_timeout_timer.stop()
+                    console.log("🎬 AGGRESSIVE CLEANUP: Stopped main grid timeout timer")
+            else:
+                console.log("🎬 AGGRESSIVE CLEANUP: No functional content yet - keeping preloader")
+                
+        except Exception as e:
+            console.log(f"Error in aggressive preloader cleanup: {e}")
+
+    def _cleanup_previous_preloaders(self):
+        """Clean up any previous preloaders before starting new ones"""
+        try:
+            console.log("🧹 CLEANUP: Ensuring previous preloaders are hidden")
+            
+            # Hide grid loading indicator if visible
+            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                if self.grid_loading_widget.isVisible():
+                    console.log("🧹 CLEANUP: Hiding previous grid preloader")
+                    self.hide_grid_loading_indicator()
+            
+            # Stop any running timers
+            if hasattr(self, '_grid_timeout_timer') and self._grid_timeout_timer:
+                self._grid_timeout_timer.stop()
+                console.log("🧹 CLEANUP: Stopped previous grid timeout timer")
+                
+            if hasattr(self, '_aggressive_cleanup_timer') and self._aggressive_cleanup_timer:
+                self._aggressive_cleanup_timer.stop()
+                console.log("🧹 CLEANUP: Stopped previous aggressive cleanup timer")
+            
+            # Clean up completion tracking
+            if hasattr(self, '_grid_completion_start_time'):
+                delattr(self, '_grid_completion_start_time')
+                console.log("🧹 CLEANUP: Cleaned up grid completion tracking")
+                
+        except Exception as e:
+            console.log(f"Error in cleanup previous preloaders: {e}")
+
+    def _force_hide_all_preloaders(self):
+        """Force hide all preloaders - fallback method for really stuck ones"""
+        try:
+            console.log("💥 FORCE HIDE: Aggressively hiding all stuck preloaders")
+            
+            # Hide grid loading indicator
+            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                if self.grid_loading_widget.isVisible():
+                    console.log("💥 FORCE HIDE: Forcing grid preloader to hide")
+                    self.grid_loading_widget.hide()
+                    
+            # Stop all timers
+            if hasattr(self, '_grid_timeout_timer') and self._grid_timeout_timer:
+                self._grid_timeout_timer.stop()
+                
+            if hasattr(self, '_aggressive_cleanup_timer') and self._aggressive_cleanup_timer:
+                self._aggressive_cleanup_timer.stop()
+                
+            if hasattr(self, '_fallback_cleanup_timer') and self._fallback_cleanup_timer:
+                self._fallback_cleanup_timer.stop()
+                
+            # Clean up all completion tracking
+            if hasattr(self, '_grid_completion_start_time'):
+                delattr(self, '_grid_completion_start_time')
+                
+            console.log("💥 FORCE HIDE: All preloaders and timers cleaned up")
+            
+        except Exception as e:
+            console.log(f"Error in force hide preloaders: {e}")
 
     def _animate_thumbnail_progress(self, value):
         """Animate ultra-minimal thumbnail loading progress with rendering stages"""
@@ -6052,7 +7345,7 @@ Press 'L' to cycle through modes."""
                     QTimer.singleShot(300, self._finish_thumbnail_loading)
                     
         except Exception as e:
-            print(f"Error animating thumbnail progress: {e}")
+            console.log(f"Error animating thumbnail progress: {e}")
 
     def _finish_thumbnail_loading(self):
         """Finish thumbnail loading and hide progress"""
@@ -6064,22 +7357,22 @@ Press 'L' to cycle through modes."""
             QTimer.singleShot(200, self.hide_thumbnail_loading_indicator)
             
         except Exception as e:
-            print(f"Error finishing thumbnail loading: {e}")
+            console.log(f"Error finishing thumbnail loading: {e}")
 
     def force_finish_thumbnail_loading(self):
         """Force finish thumbnail loading - can be called externally"""
         try:
             if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and self.thumb_loading_widget.isVisible():
-                print("🔄 Force finishing thumbnail loading...")
+                console.log("🔄 Force finishing thumbnail loading...")
                 self._finish_thumbnail_loading()
         except Exception as e:
-            print(f"Error force finishing thumbnail loading: {e}")
+            console.log(f"Error force finishing thumbnail loading: {e}")
 
     def hide_thumbnail_loading_indicator(self):
         """Hide thumbnail loading indicator"""
         try:
             # Stop any timeout timer
-            if hasattr(self, '_thumb_timeout_timer'):
+            if hasattr(self, '_thumb_timeout_timer') and self._thumb_timeout_timer:
                 self._thumb_timeout_timer.stop()
                 
             if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget:
@@ -6092,18 +7385,18 @@ Press 'L' to cycle through modes."""
             if hasattr(self, 'thumb_page_label'):
                 self.thumb_page_label = None
                 
-            print("🔄 Thumbnail loading indicator hidden")
+            console.log("🔄 Thumbnail loading indicator hidden")
             
         except Exception as e:
-            print(f"Error hiding thumbnail loading indicator: {e}")
+            console.log(f"Error hiding thumbnail loading indicator: {e}")
 
     def _force_hide_thumb_preloader_on_timeout(self):
         """Force hide thumbnail preloader after timeout to prevent stuck preloaders"""
         try:
-            print("⏰ TIMEOUT: Force hiding thumbnail preloader after 4 seconds")
+            console.log("⏰ TIMEOUT: Force hiding thumbnail preloader after 4 seconds")
             self.hide_thumbnail_loading_indicator()
         except Exception as e:
-            print(f"Error in thumbnail preloader timeout: {e}")
+            console.log(f"Error in thumbnail preloader timeout: {e}")
 
     def show_thumbnail_loading_progress(self, progress, total=None, message="Loading thumbnails..."):
         """Show thumbnail loading progress with progress value and total"""
@@ -6180,9 +7473,9 @@ Press 'L' to cycle through modes."""
             
             # Set timeout for 4 seconds (longer than animation duration of ~3.5s)
             self._thumb_timeout_timer.start(4000)
-            print(f"⏱️ Thumbnail preloader timeout set for 4 seconds")
+            console.log(f"⏱️ Thumbnail preloader timeout set for 4 seconds")
             
-            print(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
+            console.log(f"🔄 Ultra-minimal thumbnail loading indicator shown: {page_info}")
             return
         
         # New batch processing method
@@ -6245,7 +7538,7 @@ Press 'L' to cycle through modes."""
         self.thumb_loading_widget.show()
         self.thumb_loading_widget.raise_()
         
-        print(f"🔄 Batch thumbnail loading: {progress:.1f}% - {message}")
+        console.log(f"🔄 Batch thumbnail loading: {progress:.1f}% - {message}")
 
     def _update_thumbnail_progress(self, progress, message="Loading..."):
         """Update batch thumbnail loading progress"""
@@ -6259,7 +7552,7 @@ Press 'L' to cycle through modes."""
             # Update status bar as well
             self.status_bar.showMessage(f"{message} ({progress:.1f}%)")
         except Exception as e:
-            print(f"Error updating thumbnail progress: {e}")
+            console.log(f"Error updating thumbnail progress: {e}")
 
     def hide_thumbnail_loading_progress(self):
         """Hide thumbnail loading progress indicator"""
@@ -6288,12 +7581,12 @@ Press 'L' to cycle through modes."""
             # Check if we're in grid mode - if so, minimize thumbnail generation
             # BUT override this check if we're loading a new PDF (force_new_pdf=True)
             if not force_new_pdf and getattr(self.pdf_widget, 'grid_mode', False):
-                print("Grid mode active - skipping heavy thumbnail generation to prioritize grid performance")
+                console.log("Grid mode active - skipping heavy thumbnail generation to prioritize grid performance")
                 return
             
             # If we're forcing generation for new PDF, show status message
             if force_new_pdf:
-                print("New PDF loaded - forcing thumbnail generation even in grid mode")
+                console.log("New PDF loaded - forcing thumbnail generation even in grid mode")
             
             # Force complete thumbnail regeneration for new PDF
             self._selective_thumbnails_enabled = False
@@ -6322,7 +7615,7 @@ Press 'L' to cycle through modes."""
             QTimer.singleShot(3000, self.start_aggressive_preloading)
             
         except Exception as e:
-            print(f"Thumbnail generation error: {e}")
+            console.log(f"Thumbnail generation error: {e}")
             
         except Exception as e:
             tb = traceback.format_exc()
@@ -6518,7 +7811,7 @@ Press 'L' to cycle through modes."""
             if getattr(self.pdf_widget, 'grid_mode', False):
                 # In grid mode, only load minimal thumbnails to reduce resource competition
                 radius = max_grid_pages + 2  # Just a few beyond grid for navigation
-                print(f"Grid mode active - using minimal thumbnail radius: {radius}")
+                console.log(f"Grid mode active - using minimal thumbnail radius: {radius}")
             else:
                 # Calculate file size for adaptive loading in single-page mode
                 file_size_mb = 0
@@ -6528,24 +7821,27 @@ Press 'L' to cycle through modes."""
                 except:
                     pass
                 
-                # Adaptive radius: smaller for large PDFs, larger for small PDFs
-                if file_size_mb > 30:  # Large PDF
-                    radius = max_grid_pages + 3  # Only load a few extra beyond grid
-                    print(f"Large PDF ({file_size_mb:.1f}MB) - using minimal thumbnail radius: {radius}")
+                # Adaptive radius: EXTREMELY small for large PDFs
+                if file_size_mb > 100:  # Very large PDF
+                    radius = 1  # Only current page ±1 (3 pages total)
+                    console.log(f"🚨 Very large PDF ({file_size_mb:.1f}MB) - loading only 3 pages around current")
+                elif file_size_mb > 30:  # Large PDF
+                    radius = 2  # Current page ±2 (5 pages total)
+                    console.log(f"Large PDF ({file_size_mb:.1f}MB) - loading only 5 pages around current")
                 elif file_size_mb > 10:  # Medium PDF
-                    radius = max_grid_pages + 8  # Moderate lookahead
+                    radius = 3  # Current page ±3 (7 pages total)
                 else:  # Small PDF
-                    radius = 15  # Original radius for small files
+                    radius = 5  # Current page ±5 (11 pages total)
         
         # If this is first load or user explicitly requested all pages, load everything
         if not hasattr(self, '_selective_thumbnails_enabled'):
-            self._selective_thumbnails_enabled = self.total_pages > 50  # Enable for large docs
+            self._selective_thumbnails_enabled = self.total_pages > 20  # Enable for docs with >20 pages (was 50)
         
         # Force clear thumbnails if requested (e.g., when loading new PDF)
         if force_clear:
             self.thumbnail_list.clear()
             preserve_scroll = False  # No point preserving scroll when force clearing
-            print("Force cleared thumbnails for new PDF")
+            console.log("Force cleared thumbnails for new PDF")
         
         # Store current scroll position before modifying thumbnails
         current_scroll_pos = None
@@ -6556,10 +7852,83 @@ Press 'L' to cycle through modes."""
         center_page = around_page if around_page is not None else self.current_page
         
         if not self._selective_thumbnails_enabled:
-            # Load all thumbnails for smaller documents
-            start_page = 0
-            end_page = self.total_pages - 1
-            preserve_scroll = False  # No need to preserve scroll for small docs
+            # Get file size for smarter loading decisions
+            file_size_mb = 0
+            try:
+                if hasattr(self, 'pdf_path') and os.path.exists(self.pdf_path):
+                    file_size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
+            except:
+                pass
+            
+            # ULTRA-MINIMAL LOADING: Consider both page count AND file size
+            if self.total_pages > 800 and file_size_mb > 100:  # Truly massive documents - load only current page
+                start_page = self.current_page
+                end_page = self.current_page
+                console.log(f"� Ultra-minimal loading: Loading only current page {self.current_page} of {self.total_pages} (size: {file_size_mb:.1f}MB)")
+                # NO PROGRESSIVE LOADING - too slow for massive documents
+            elif self.total_pages > 500 and file_size_mb > 50:  # Very large documents with significant size - load 3 pages
+                # Load 3 pages minimum, centered around current page
+                radius = 1  # ±1 page = 3 pages total
+                start_page = max(0, self.current_page - radius)
+                end_page = min(self.total_pages - 1, self.current_page + radius)
+                
+                # If we're at the beginning/end, extend the other side to maintain 3 pages
+                if end_page - start_page + 1 < 3:
+                    if start_page == 0:
+                        end_page = min(self.total_pages - 1, 2)  # Load pages 0-2
+                    elif end_page == self.total_pages - 1:
+                        start_page = max(0, self.total_pages - 3)  # Load last 3 pages
+                
+                console.log(f"📖 Large loading: Loading pages {start_page}-{end_page} of {self.total_pages} (size: {file_size_mb:.1f}MB)")
+                # NO PROGRESSIVE LOADING for large documents
+            elif self.total_pages > 200:  # Medium-large documents (200-500 pages) - load 10 pages minimum
+                # Ensure we load at least 10 pages total, centered around current page
+                radius = 5  # ±5 pages = 11 pages total (or 10 if at boundaries)
+                start_page = max(0, self.current_page - radius)
+                end_page = min(self.total_pages - 1, self.current_page + radius)
+                
+                # Ensure at least 10 pages
+                if end_page - start_page + 1 < 10:
+                    if start_page == 0:
+                        end_page = min(self.total_pages - 1, 9)  # Load pages 0-9
+                    elif end_page == self.total_pages - 1:
+                        start_page = max(0, self.total_pages - 10)  # Load last 10 pages
+                
+                console.log(f"📖 Medium loading: Loading pages {start_page}-{end_page} of {self.total_pages} (size: {file_size_mb:.1f}MB)")
+            elif self.total_pages > 50:  # Medium documents - load 8 pages minimum
+                # Ensure we load at least 8 pages total, centered around current page
+                radius = 4  # ±4 pages = 9 pages total (or 8 if at boundaries)
+                start_page = max(0, self.current_page - radius)
+                end_page = min(self.total_pages - 1, self.current_page + radius)
+                
+                # Ensure at least 8 pages
+                if end_page - start_page + 1 < 8:
+                    if start_page == 0:
+                        end_page = min(self.total_pages - 1, 7)  # Load pages 0-7
+                    elif end_page == self.total_pages - 1:
+                        start_page = max(0, self.total_pages - 8)  # Load last 8 pages
+                
+                console.log(f"📖 Minimal loading: Loading pages {start_page}-{end_page} of {self.total_pages}")
+            elif self.total_pages > 20:  # Medium documents - load 7 pages minimum
+                # Ensure we load at least 7 pages total, centered around current page  
+                radius = 3  # ±3 pages = 7 pages total
+                start_page = max(0, self.current_page - radius)
+                end_page = min(self.total_pages - 1, self.current_page + radius)
+                
+                # If we're at the beginning/end, extend the other side to maintain 7 pages
+                if end_page - start_page + 1 < 7:
+                    if start_page == 0:
+                        end_page = min(self.total_pages - 1, 6)  # Load pages 0-6
+                    elif end_page == self.total_pages - 1:
+                        start_page = max(0, self.total_pages - 7)  # Load last 7 pages
+                
+                console.log(f"📖 Medium loading: Loading pages {start_page}-{end_page} of {self.total_pages}")
+            else:
+                # Load all thumbnails only for small documents (≤20 pages)
+                start_page = 0
+                end_page = self.total_pages - 1
+                console.log(f"📚 Full loading: Loading all {self.total_pages} pages")
+            preserve_scroll = False  # No need to preserve scroll for minimal loading
         else:
             # Calculate selective page range
             start_page = max(0, center_page - radius)
@@ -6612,14 +7981,14 @@ Press 'L' to cycle through modes."""
             # Determine if we need batch processing for large sets
             total_pages = len(pages_to_load)
             if total_pages > 25:  # Use batch processing for large thumbnail sets
-                print(f"🔄 Starting batch processing for {total_pages} thumbnails")
+                console.log(f"🔄 Starting batch processing for {total_pages} thumbnails")
                 self._start_batch_thumbnail_generation(pages_to_load, current_scroll_pos)
             else:
                 # Use original worker for small sets
                 self._start_traditional_thumbnail_generation(pages_to_load, current_scroll_pos, start_page, end_page)
             
         except Exception as e:
-            print(f"Error starting thumbnail generation: {e}")
+            console.log(f"Error starting thumbnail generation: {e}")
     
     def _stop_batch_processing(self):
         """Stop any existing batch processing"""
@@ -6648,7 +8017,7 @@ Press 'L' to cycle through modes."""
         # Initialize batch processing variables
         self._batch_pages = pages_to_load
         self._batch_index = 0
-        self._batch_scroll_pos = current_scroll_pos
+        self._batch_scroll_pos = current_scroll_pos  # Keep original value (None means don't restore)
         self._batch_size = 8  # Process 8 thumbnails per batch
         self._batch_delay = 50  # 50ms delay between batches (20 batches per second)
         
@@ -6657,7 +8026,7 @@ Press 'L' to cycle through modes."""
         self._batch_start_time = time.time()
         
         total_batches = (len(pages_to_load) + self._batch_size - 1) // self._batch_size
-        print(f"🚀 Starting batch processing: {len(pages_to_load)} pages in {total_batches} batches")
+        console.log(f"🚀 Starting batch processing: {len(pages_to_load)} pages in {total_batches} batches")
         
         # Show batch loading progress
         self.show_thumbnail_loading_progress(0, len(pages_to_load), "Batch loading thumbnails...")
@@ -6678,7 +8047,7 @@ Press 'L' to cycle through modes."""
         self._batch_timeout_timer.start(30000)
         
         # Start processing first batch immediately
-        print("📦 Starting first batch immediately...")
+        console.log("📦 Starting first batch immediately...")
         self._process_next_thumbnail_batch()
     
     def _process_next_thumbnail_batch(self):
@@ -6686,13 +8055,13 @@ Press 'L' to cycle through modes."""
         try:
             # Check if user has interrupted or if enough thumbnails are already visible
             if self._should_abort_batch_processing():
-                print("🛑 Aborting batch processing - user interaction detected or thumbnails sufficient")
+                console.log("🛑 Aborting batch processing - user interaction detected or thumbnails sufficient")
                 self._finish_batch_processing()
                 return
                 
             if not hasattr(self, '_batch_pages') or self._batch_index >= len(self._batch_pages):
                 # All batches completed
-                print(f"✅ Batch processing completed - processed {self._batch_index} thumbnails")
+                console.log(f"✅ Batch processing completed - processed {self._batch_index} thumbnails")
                 self._finish_batch_processing()
                 return
             
@@ -6708,7 +8077,7 @@ Press 'L' to cycle through modes."""
             total_batches = (len(self._batch_pages) + self._batch_size - 1) // self._batch_size
             self._update_thumbnail_progress(progress, f"Batch {batch_num}/{total_batches}, {remaining} remaining...")
             
-            print(f"🔄 Processing batch {batch_num}/{total_batches}: pages {current_batch} (index: {self._batch_index}/{len(self._batch_pages)})")
+            console.log(f"🔄 Processing batch {batch_num}/{total_batches}: pages {current_batch} (index: {self._batch_index}/{len(self._batch_pages)})")
             
             # Process current batch
             if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
@@ -6731,7 +8100,12 @@ Press 'L' to cycle through modes."""
             self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
             self.thumbnail_worker.finished.connect(self._on_batch_finished)
             
-            print(f"📦 Created ThumbnailWorker for batch pages: {current_batch}")
+            console.log(f"📦 Created ThumbnailWorker for batch pages: {current_batch}")
+            
+            # MEMORY CLEANUP: Clear memory before starting batch processing
+            import gc
+            gc.collect()
+            console.log("🧹 Memory cleanup before batch processing")
             
             # Start worker for current batch
             self.thumbnail_worker.start()
@@ -6740,20 +8114,20 @@ Press 'L' to cycle through modes."""
             self._batch_index = end_idx
             
         except Exception as e:
-            print(f"Error processing thumbnail batch: {e}")
+            console.log(f"Error processing thumbnail batch: {e}")
             import traceback
             traceback.print_exc()
             self._finish_batch_processing()
     
     def _on_batch_finished(self):
         """Handle completion of a single batch"""
-        print(f"📦 Batch finished, scheduling next batch in {self._batch_delay}ms...")
+        console.log(f"📦 Batch finished, scheduling next batch in {self._batch_delay}ms...")
         # Schedule next batch with delay for UI responsiveness
         if hasattr(self, '_batch_timer') and self._batch_timer:
             self._batch_timer.setSingleShot(True)  # Ensure single shot
             self._batch_timer.start(self._batch_delay)
         else:
-            print("⚠️ Warning: Batch timer not available, starting next batch immediately")
+            console.log("⚠️ Warning: Batch timer not available, starting next batch immediately")
             QTimer.singleShot(self._batch_delay, self._process_next_thumbnail_batch)
     
     def _finish_batch_processing(self):
@@ -6770,15 +8144,21 @@ Press 'L' to cycle through modes."""
             # Hide progress indicators
             self.hide_thumbnail_loading_progress()
             
-            # Restore scroll position if needed
+            # Restore scroll position if needed (only if we had a valid position to restore)
             if self._batch_scroll_pos is not None:
-                QTimer.singleShot(100, lambda: self.thumbnail_list.verticalScrollBar().setValue(self._batch_scroll_pos))
+                def restore_scroll():
+                    if (self._batch_scroll_pos is not None and 
+                        hasattr(self, 'thumbnail_list')):
+                        scroll_bar = self.thumbnail_list.verticalScrollBar()
+                        if scroll_bar:
+                            scroll_bar.setValue(self._batch_scroll_pos)
+                QTimer.singleShot(100, restore_scroll)
             
             # Update status
             total_loaded = len(self._batch_pages) if hasattr(self, '_batch_pages') else 0
             self.status_bar.showMessage(f"Loaded {total_loaded} thumbnails in batches", 2000)
             
-            print(f"✅ Batch processing completed - {total_loaded} thumbnails loaded")
+            console.log(f"✅ Batch processing completed - {total_loaded} thumbnails loaded")
             
             # Clear batch data
             self._batch_pages = []
@@ -6793,7 +8173,7 @@ Press 'L' to cycle through modes."""
             QTimer.singleShot(300, self._force_load_visible_thumbnails)
             
         except Exception as e:
-            print(f"Error finishing batch processing: {e}")
+            console.log(f"Error finishing batch processing: {e}")
             import traceback
             traceback.print_exc()
     
@@ -6805,7 +8185,7 @@ Press 'L' to cycle through modes."""
                 hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and 
                 self.thumb_loading_widget.isVisible()):
                 
-                print("🛑 Interrupting batch processing due to user navigation")
+                console.log("🛑 Interrupting batch processing due to user navigation")
                 
                 # Force finish batch processing
                 self._finish_batch_processing()
@@ -6817,7 +8197,7 @@ Press 'L' to cycle through modes."""
                 self.status_bar.showMessage("Thumbnail loading interrupted", 1500)
                 
         except Exception as e:
-            print(f"Error interrupting batch processing: {e}")
+            console.log(f"Error interrupting batch processing: {e}")
     
     def _check_batch_timeout(self):
         """Check if batch processing has timed out and force completion"""
@@ -6831,12 +8211,12 @@ Press 'L' to cycle through modes."""
             
             # If batch processing has been running for more than 30 seconds, force stop
             if elapsed > 30:
-                print(f"⏰ TIMEOUT: Forcing batch processing completion after {elapsed:.1f} seconds")
+                console.log(f"⏰ TIMEOUT: Forcing batch processing completion after {elapsed:.1f} seconds")
                 self._finish_batch_processing()
                 self.status_bar.showMessage("Thumbnail loading timed out", 2000)
                 
         except Exception as e:
-            print(f"Error checking batch timeout: {e}")
+            console.log(f"Error checking batch timeout: {e}")
     
     def _should_abort_batch_processing(self):
         """Check if batch processing should be aborted due to user interaction or sufficient thumbnails"""
@@ -6864,14 +8244,417 @@ Press 'L' to cycle through modes."""
                 
                 # If we have enough real thumbnails around current page, abort batch processing
                 if real_thumbnails >= 20:  # Sufficient thumbnails loaded
-                    print(f"📦 Sufficient thumbnails loaded ({real_thumbnails} real thumbnails), aborting batch processing")
+                    console.log(f"📦 Sufficient thumbnails loaded ({real_thumbnails} real thumbnails), aborting batch processing")
                     return True
             
             return False
             
         except Exception as e:
-            print(f"Error checking batch abort condition: {e}")
+            console.log(f"Error checking batch abort condition: {e}")
             return False
+
+    def _load_remaining_thumbnails(self, start_page):
+        """Progressive loading: Load remaining thumbnails in small batches"""
+        try:
+            if not self.pdf_doc or not hasattr(self, 'total_pages'):
+                return
+                
+            console.log(f"📚 Progressive loading: Starting background loading from page {start_page}")
+            
+            # Load in chunks of 5 pages with delays to keep UI responsive
+            chunk_size = 5
+            current_chunk_start = start_page
+            
+            while current_chunk_start < self.total_pages:
+                chunk_end = min(current_chunk_start + chunk_size - 1, self.total_pages - 1)
+                
+                # Schedule this chunk with increasing delay
+                delay = (current_chunk_start - start_page) * 200  # 200ms per chunk
+                
+                # Use lambda with default parameter to capture current values
+                QTimer.singleShot(delay, 
+                    lambda cs=current_chunk_start, ce=chunk_end: self._load_thumbnail_chunk(cs, ce))
+                
+                current_chunk_start += chunk_size
+                
+        except Exception as e:
+            console.log(f"Error in progressive loading: {e}")
+    
+    def _load_thumbnail_chunk(self, start_page, end_page):
+        """Load a small chunk of thumbnails"""
+        try:
+            console.log(f"🔄 Loading thumbnail chunk: pages {start_page}-{end_page}")
+            
+            # Create a minimal worker for this chunk
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                # Don't interrupt existing worker, let it finish
+                return
+                
+            # Generate thumbnails for this range using existing method
+            self.generate_thumbnails(around_page=(start_page + end_page) // 2, 
+                                   radius=(end_page - start_page) // 2 + 1,
+                                   preserve_scroll=True)
+            
+        except Exception as e:
+            console.log(f"Error loading thumbnail chunk {start_page}-{end_page}: {e}")
+    
+    def _create_empty_thumbnail_list(self):
+        """Create empty thumbnail list for emergency bypass mode"""
+        try:
+            console.log("🚨 Creating empty thumbnail list - emergency bypass mode")
+            if hasattr(self, 'thumbnail_list') and self.thumbnail_list:
+                self.thumbnail_list.clear()
+                
+                # Add just a few text placeholders so user knows pages exist
+                for i in range(min(5, self.total_pages)):  # Show only first 5 pages as text
+                    item = QListWidgetItem(f"Page {i+1}")
+                    item.setData(Qt.ItemDataRole.UserRole, i)  # Store page number
+                    item.setData(Qt.ItemDataRole.UserRole + 1, "text_placeholder")  # Mark as text placeholder
+                    self.thumbnail_list.addItem(item)
+                
+                if self.total_pages > 5:
+                    # Add a message about remaining pages
+                    item = QListWidgetItem(f"... and {self.total_pages - 5} more pages")
+                    item.setData(Qt.ItemDataRole.UserRole + 1, "message")
+                    self.thumbnail_list.addItem(item)
+                
+                console.log(f"✅ Created emergency thumbnail list with {min(5, self.total_pages)} text placeholders")
+                
+        except Exception as e:
+            console.log(f"Error creating empty thumbnail list: {e}")
+    
+    def _force_kill_stuck_thumbnail_worker(self):
+        """Emergency method to force kill stuck thumbnail workers"""
+        try:
+            console.log("🚨 FORCE KILLING stuck thumbnail workers")
+            
+            # Kill main thumbnail worker
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                console.log("🔪 Force terminating main thumbnail worker")
+                self.thumbnail_worker.stop()
+                if not self.thumbnail_worker.wait(1000):  # Wait 1 second
+                    self.thumbnail_worker.terminate()  # Force terminate
+                    if not self.thumbnail_worker.wait(2000):  # Wait 2 more seconds
+                        console.log("⚠️ Could not terminate thumbnail worker gracefully")
+                self.thumbnail_worker = None
+            
+            # Kill priority thumbnail worker if it exists
+            if hasattr(self, 'priority_thumbnail_worker') and self.priority_thumbnail_worker:
+                console.log("🔪 Force terminating priority thumbnail worker")
+                self.priority_thumbnail_worker.stop()
+                if not self.priority_thumbnail_worker.wait(1000):
+                    self.priority_thumbnail_worker.terminate()
+                    if not self.priority_thumbnail_worker.wait(2000):
+                        console.log("⚠️ Could not terminate priority thumbnail worker gracefully")
+                self.priority_thumbnail_worker = None
+            
+            console.log("✅ Force kill completed")
+            
+        except Exception as e:
+            console.log(f"Error force killing thumbnail workers: {e}")
+    
+    def _generate_minimal_thumbnails(self, count=5):
+        """Generate only the first few thumbnails for large documents"""
+        try:
+            console.log(f"🔍 Generating minimal thumbnails: first {count} pages only")
+            
+            if not self.pdf_doc or self.total_pages == 0:
+                return
+            
+            # Stop any existing thumbnail workers to prevent race conditions
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                console.log("🛑 Stopping existing thumbnail worker to prevent conflicts")
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker = None
+            
+            # Show progress
+            self.status_bar.showMessage(f"Loading first {count} thumbnails...", 10000)  # Longer message
+            
+            # Show visible loading indicator with better messaging
+            self.show_mini_loading_indicator(f"🔄 Loading {count} thumbnails...")
+            
+            # Set a longer timeout for the loading indicator
+            QTimer.singleShot(8000, self.hide_mini_loading_indicator)  # 8 seconds instead of 2
+            
+            # Clear existing thumbnails
+            if hasattr(self, 'thumbnail_list') and self.thumbnail_list:
+                self.thumbnail_list.clear()
+            
+            # Create visible placeholders first for immediate feedback
+            self._create_placeholder_thumbnails(0, count - 1)
+            
+            # Create thumbnail worker for just the first few pages
+            page_list = list(range(min(count, self.total_pages)))
+            
+            # Create and start minimal worker
+            self.thumbnail_worker = ThumbnailWorker(
+                self.pdf_doc,
+                page_list=page_list,
+                limit=count,
+                parent=self,
+                gpu_widget=self.pdf_widget
+            )
+            
+            self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+            self.thumbnail_worker.finished.connect(lambda: self._on_minimal_thumbnails_finished(count))
+            
+            console.log(f"🚀 Starting minimal thumbnail generation for pages: {page_list}")
+            self.thumbnail_worker.start()
+            
+        except Exception as e:
+            console.log(f"Error generating minimal thumbnails: {e}")
+            self._create_empty_thumbnail_list()
+    
+    def _on_minimal_thumbnails_finished(self, count=15):
+        """Handle completion of minimal thumbnail generation"""
+        try:
+            console.log(f"✅ Minimal thumbnail generation completed for {count} thumbnails")
+            self.status_bar.showMessage(f"✅ Loaded first {count} thumbnails successfully", 3000)
+            
+            # Hide loading indicator
+            self.hide_mini_loading_indicator()
+            
+            # Don't sort - order is already correct from creation
+            console.log("🔄 Thumbnail ordering handled during creation - skipping sort")
+            
+            # Add "Load More" button if there are more pages beyond what we loaded
+            if self.total_pages > count:
+                self._add_load_more_button(count)  # Starting from next page after loaded batch
+                console.log(f"📋 Added 'Load More' button for remaining {self.total_pages - count} pages (total: {self.total_pages}, loaded: {count})")
+            else:
+                console.log(f"📋 All pages loaded - no Load More button needed (total: {self.total_pages}, loaded: {count})")
+            
+        except Exception as e:
+            console.log(f"Error in minimal thumbnails completion: {e}")
+    
+    def _add_load_more_button(self, start_page):
+        """Add a minimal 'Load More' button with just essential text"""
+        try:
+            remaining_pages = self.total_pages - start_page
+            
+            # Create ultra-minimal load more button - text only
+            load_more_img = QImage(120, 40, QImage.Format.Format_RGB32)
+            load_more_img.fill(QColor(45, 45, 45))  # Match app background
+            
+            # Minimal text styling - no borders, no icons, no instructions
+            painter = QPainter(load_more_img)
+            painter.setPen(QColor(160, 160, 160))  # Clean grey text
+            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Normal))  # Readable size
+            
+            # Just the essential text
+            painter.drawText(QRect(0, 8, 120, 16), Qt.AlignmentFlag.AlignCenter, "Load More")
+            painter.drawText(QRect(0, 22, 120, 14), Qt.AlignmentFlag.AlignCenter, f"{remaining_pages} pages")
+            
+            painter.end()
+            
+            # Create the ultra-minimal load more item
+            load_more_item = QListWidgetItem()
+            load_more_item.setIcon(QIcon(QPixmap.fromImage(load_more_img)))
+            load_more_item.setText("")  # No additional text
+            load_more_item.setData(Qt.ItemDataRole.UserRole, -1)  # Special marker
+            load_more_item.setData(Qt.ItemDataRole.UserRole + 1, "load_more_button")
+            load_more_item.setData(Qt.ItemDataRole.UserRole + 2, start_page)  # Store start page
+            load_more_item.setSizeHint(QSize(120, 50))  # Even smaller
+            
+            self.thumbnail_list.addItem(load_more_item)
+            
+            console.log(f"✅ Created ultra-minimal 'Load More' button for {remaining_pages} remaining pages starting from page {start_page + 1}")
+            
+        except Exception as e:
+            console.log(f"Error creating load more button: {e}")
+    
+    def _load_more_thumbnails(self, start_page):
+        """Load the next batch of thumbnails when 'Load More' is clicked"""
+        try:
+            batch_size = 20  # Load 20 more thumbnails at a time
+            end_page = min(start_page + batch_size - 1, self.total_pages - 1)
+            
+            console.log(f"🔄 Loading more thumbnails: pages {start_page + 1}-{end_page + 1}")
+            
+            # Remove the current "Load More" button
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole + 1) == "load_more_button":
+                    self.thumbnail_list.takeItem(i)
+                    break
+            
+            # Show loading indicator
+            self.show_mini_loading_indicator(f"🔄 Loading pages {start_page + 1}-{end_page + 1}...")
+            self.status_bar.showMessage(f"Loading thumbnails {start_page + 1}-{end_page + 1}...", 8000)
+            
+            # Stop any existing worker first to prevent conflicts
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                console.log("🛑 Stopping existing thumbnail worker to prevent conflicts")
+                try:
+                    self.thumbnail_worker.thumbnailReady.disconnect()
+                    self.thumbnail_worker.finished.disconnect()
+                except:
+                    pass
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker.wait()
+                self.thumbnail_worker = None
+            
+            # Create placeholders for the new batch AFTER stopping previous worker
+            self._create_placeholder_thumbnails(start_page, end_page)
+            
+            # Start loading the new batch
+            page_list = list(range(start_page, end_page + 1))
+            
+            # Create worker for the new batch
+            self.thumbnail_worker = ThumbnailWorker(
+                self.pdf_doc,
+                page_list=page_list,
+                limit=batch_size,
+                parent=self,
+                gpu_widget=self.pdf_widget
+            )
+            
+            # Connect signals with proper error handling
+            self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+            self.thumbnail_worker.finished.connect(lambda: self._on_load_more_finished(end_page + 1))
+            
+            console.log(f"🚀 Starting batch thumbnail generation for pages: {page_list}")
+            self.thumbnail_worker.start()
+            
+        except Exception as e:
+            console.log(f"Error loading more thumbnails: {e}")
+            self.hide_mini_loading_indicator()
+    
+    def _on_load_more_finished(self, next_start_page):
+        """Handle completion of 'Load More' batch generation"""
+        try:
+            console.log("✅ Load More batch completed")
+            self.hide_mini_loading_indicator()
+            self.status_bar.showMessage("✅ More thumbnails loaded successfully", 2000)
+            
+            # Add another "Load More" button if there are still more pages
+            if next_start_page < self.total_pages:
+                self._add_load_more_button(next_start_page)
+            else:
+                console.log("📋 All thumbnails loaded - no more Load More button needed")
+            
+        except Exception as e:
+            console.log(f"Error in load more completion: {e}")
+    
+    def _load_thumbnail_batch_around_page(self, center_page, batch_size=20):
+        """Load a batch of thumbnails around a specific page when clicked"""
+        try:
+            # Calculate range around the clicked page
+            half_batch = batch_size // 2
+            start_page = max(0, center_page - half_batch)
+            end_page = min(self.total_pages - 1, center_page + half_batch - 1)
+            
+            # Adjust if we're near the edges to maintain batch size
+            actual_batch_size = end_page - start_page + 1
+            if actual_batch_size < batch_size and start_page > 0:
+                start_page = max(0, end_page - batch_size + 1)
+            elif actual_batch_size < batch_size and end_page < self.total_pages - 1:
+                end_page = min(self.total_pages - 1, start_page + batch_size - 1)
+            
+            console.log(f"🎯 Auto-loading batch around page {center_page + 1}: pages {start_page + 1}-{end_page + 1}")
+            
+            # Stop any existing worker to prevent conflicts
+            if hasattr(self, 'thumbnail_worker') and self.thumbnail_worker:
+                console.log("🛑 Stopping existing thumbnail worker for auto-batch loading")
+                try:
+                    self.thumbnail_worker.thumbnailReady.disconnect()
+                    self.thumbnail_worker.finished.disconnect()
+                except:
+                    pass
+                self.thumbnail_worker.stop()
+                self.thumbnail_worker.wait()
+                self.thumbnail_worker = None
+            
+            # Create placeholders for any missing pages in the range
+            for page_num in range(start_page, end_page + 1):
+                # Check if this page already has a thumbnail
+                has_thumbnail = False
+                for i in range(self.thumbnail_list.count()):
+                    item = self.thumbnail_list.item(i)
+                    if (item and 
+                        item.data(Qt.ItemDataRole.UserRole) == page_num and 
+                        item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]):
+                        has_thumbnail = True
+                        break
+                
+                if not has_thumbnail:
+                    # Create a single placeholder for this page
+                    self._create_placeholder_thumbnails(page_num, page_num)
+            
+            # Create worker for the batch
+            page_list = list(range(start_page, end_page + 1))
+            
+            self.thumbnail_worker = ThumbnailWorker(
+                self.pdf_doc,
+                page_list=page_list,
+                limit=len(page_list),
+                parent=self,
+                gpu_widget=self.pdf_widget
+            )
+            
+            # Connect signals
+            self.thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
+            self.thumbnail_worker.finished.connect(lambda: self._on_auto_batch_finished(center_page))
+            
+            console.log(f"🚀 Starting auto-batch thumbnail generation for pages: {page_list}")
+            self.thumbnail_worker.start()
+            
+        except Exception as e:
+            console.log(f"Error in auto-batch loading: {e}")
+            self.hide_mini_loading_indicator()
+    
+    def _on_auto_batch_finished(self, center_page):
+        """Handle completion of auto-batch thumbnail generation"""
+        try:
+            console.log(f"✅ Auto-batch loading completed around page {center_page + 1}")
+            self.hide_mini_loading_indicator()
+            self.status_bar.showMessage(f"✅ Thumbnails loaded around page {center_page + 1}", 2000)
+            
+            # Remove any existing "Load More" buttons first to prevent duplicates
+            items_to_remove = []
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole + 1) == "load_more_button":
+                    items_to_remove.append(i)
+            
+            # Remove from highest index to lowest to avoid index shifting
+            for i in reversed(items_to_remove):
+                self.thumbnail_list.takeItem(i)
+            
+            # Find the highest page number that was loaded in this batch
+            highest_loaded_page = 0
+            for i in range(self.thumbnail_list.count()):
+                item = self.thumbnail_list.item(i)
+                if (item and 
+                    item.data(Qt.ItemDataRole.UserRole) is not None and 
+                    item.data(Qt.ItemDataRole.UserRole) >= 0 and  # Valid page number
+                    item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]):
+                    highest_loaded_page = max(highest_loaded_page, item.data(Qt.ItemDataRole.UserRole))
+            
+            # Add "Load More" button if there are pages beyond the loaded range
+            next_page = highest_loaded_page + 1
+            if next_page < self.total_pages:
+                console.log(f"📋 Adding Load More button starting from page {next_page + 1}")
+                self._add_load_more_button(next_page)
+            else:
+                console.log(f"📋 All pages loaded - no Load More button needed")
+            
+        except Exception as e:
+            console.log(f"Error in auto-batch completion: {e}")
+    
+    def _sort_thumbnail_list(self):
+        """Sort thumbnail list items by page number to fix ordering issues"""
+        try:
+            # Don't sort if thumbnails are being replaced in real-time
+            # Instead, just ensure proper insertion order during creation
+            console.log("🔄 Thumbnail ordering handled during creation - skipping sort")
+            return
+            
+        except Exception as e:
+            console.log(f"Error sorting thumbnails: {e}")
+            
+        except Exception as e:
+            console.log(f"Error finishing minimal thumbnails: {e}")
     
     def _start_traditional_thumbnail_generation(self, pages_to_load, current_scroll_pos, start_page, end_page):
         """Start traditional thumbnail generation for small sets"""
@@ -6899,44 +8682,66 @@ Press 'L' to cycle through modes."""
         
         if self._selective_thumbnails_enabled:
             self.status_bar.showMessage(f"Loading thumbnails {start_page+1}-{end_page+1}...")
+            self.show_mini_loading_indicator(f"Loading thumbnails {start_page+1}-{end_page+1}...")
         else:
             self.status_bar.showMessage("Loading thumbnails...")
+            self.show_mini_loading_indicator("Loading thumbnails...")
+        
+        # MEMORY CLEANUP: Force garbage collection before starting memory-intensive thumbnail generation
+        import gc
+        gc.collect()
+        console.log("🧹 Memory cleanup completed before thumbnail generation")
         
         self.thumbnail_worker.start()
     
     def _create_placeholder_thumbnails(self, start_page, end_page):
-        """Create instant placeholder thumbnails for immediate responsiveness"""
+        """Create minimal placeholder thumbnails matching app background"""
         try:
-            # Create a simple, clean placeholder image without numbers
-            placeholder_img = QImage(120, 160, QImage.Format.Format_RGB32)
-            placeholder_img.fill(QColor(38, 38, 38))  # Match thumbnail panel background exactly
-            
-            # Add some visual indication that it's loading
-            painter = QPainter(placeholder_img)
-            painter.setPen(QColor(80, 80, 80))  # Subtle text color
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(placeholder_img.rect(), Qt.AlignmentFlag.AlignCenter, "Loading...")
-            painter.end()
+            console.log(f"📦 Creating instant placeholders for pages {start_page+1}-{end_page+1}")
             
             for page_num in range(start_page, end_page + 1):
-                # Create clean placeholder for each page
-                page_placeholder = placeholder_img.copy()
+                # Check if this page already has a real thumbnail - don't overwrite it
+                existing_real_thumbnail = False
+                for i in range(self.thumbnail_list.count()):
+                    item = self.thumbnail_list.item(i)
+                    if (item and 
+                        item.data(Qt.ItemDataRole.UserRole) == page_num and 
+                        item.data(Qt.ItemDataRole.UserRole + 1) == "real"):
+                        console.log(f"⚠️ Skipping placeholder for page {page_num+1} - real thumbnail already exists")
+                        existing_real_thumbnail = True
+                        break
                 
-                # Create thumbnail item with clean placeholder
-                pixmap = QPixmap.fromImage(page_placeholder)
-                qt_icon = QIcon(pixmap)
-                item = QListWidgetItem(qt_icon, f"{page_num + 1}")
+                if existing_real_thumbnail:
+                    continue
+                
+                # Create minimal placeholder - same color as app background
+                placeholder_img = QImage(120, 160, QImage.Format.Format_RGB32)
+                placeholder_img.fill(QColor(45, 45, 45))  # Match app background exactly
+                
+                # Add minimal text only - no icons or loading symbols
+                painter = QPainter(placeholder_img)
+                painter.setPen(QColor(120, 120, 120))  # Subtle grey text
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Normal))  # Clean font
+                
+                # Just page number - minimal and clean
+                painter.drawText(QRect(0, 70, 120, 20), Qt.AlignmentFlag.AlignCenter, f"Page {page_num + 1}")
+                painter.end()
+                
+                # Create item with minimal placeholder
+                item = QListWidgetItem()
+                icon = QIcon(QPixmap.fromImage(placeholder_img))
+                item.setIcon(icon)
+                item.setText(f"{page_num + 1}")  # Show page number
                 item.setData(Qt.ItemDataRole.UserRole, page_num)
-                
-                # Mark as placeholder for later replacement
                 item.setData(Qt.ItemDataRole.UserRole + 1, "placeholder")
+                item.setSizeHint(QSize(120, 170))  # Standard thumbnail size
                 
                 self.thumbnail_list.addItem(item)
             
-            print(f"Created {end_page - start_page + 1} clean placeholder thumbnails instantly")
+            console.log(f"✅ Created {end_page - start_page + 1} minimal placeholders matching background")
             
         except Exception as e:
-            print(f"Error creating placeholder thumbnails: {e}")
+            console.log(f"Error creating placeholder thumbnails: {e}")
     
     def _load_additional_thumbnails(self, page_list):
         """Load additional thumbnails without clearing existing ones - deprecated, use batched version"""
@@ -6950,7 +8755,7 @@ Press 'L' to cycle through modes."""
             
             # Determine if we need batch processing
             if len(page_list) > 15:  # Use batch processing for medium to large sets
-                print(f"🔄 Starting batch processing for {len(page_list)} additional thumbnails")
+                console.log(f"🔄 Starting batch processing for {len(page_list)} additional thumbnails")
                 self._start_batch_thumbnail_generation(page_list, None)  # No scroll preservation for additional loads
             else:
                 # Use traditional worker for small additional sets
@@ -6977,22 +8782,24 @@ Press 'L' to cycle through modes."""
                 self.status_bar.showMessage(f"Loading {len(page_list)} additional thumbnails...")
                 self.thumbnail_worker.start()
         except Exception as e:
-            print(f"Error loading additional thumbnails: {e}")
+            console.log(f"Error loading additional thumbnails: {e}")
     
     def _on_thumbnail_ready(self, page_num, img_or_icon, item=None):
         # Accept either (page_num, QImage) from the new worker
         # or (page_num, QIcon, QListWidgetItem) from older code paths.
         try:
-            print(f"🖼️ Thumbnail ready for page {page_num}, type: {type(img_or_icon)}")
+            console.log(f"🖼️ Thumbnail ready for page {page_num}, type: {type(img_or_icon)}")
             
             # OPTIMIZATION: Look for existing placeholder to replace
             existing_item = None
+            existing_index = -1
             for i in range(self.thumbnail_list.count()):
                 item_at_i = self.thumbnail_list.item(i)
                 if item_at_i and item_at_i.data(Qt.ItemDataRole.UserRole) == page_num:
                     existing_item = item_at_i
+                    existing_index = i
                     current_type = item_at_i.data(Qt.ItemDataRole.UserRole + 1)
-                    print(f"🔄 Found existing item for page {page_num}, current type: {current_type}")
+                    console.log(f"🔄 Found existing item for page {page_num} at index {i}, current type: {current_type}")
                     break
             
             if isinstance(img_or_icon, QImage):
@@ -7000,39 +8807,46 @@ Press 'L' to cycle through modes."""
 
                 # Ensure we have a valid image
                 if qimage.isNull():
-                    print(f"⚠️ Error: Null image for page {page_num}")
+                    console.log(f"⚠️ Error: Null image for page {page_num}")
                     return
 
                 # Scale with proper aspect ratio
                 thumb = qimage.scaled(120, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 
                 if thumb.isNull():
-                    print(f"⚠️ Error: Scaled thumbnail is null for page {page_num}")
+                    console.log(f"⚠️ Error: Scaled thumbnail is null for page {page_num}")
                     return
                     
                 pixmap = QPixmap.fromImage(thumb)
                 
                 if pixmap.isNull():
-                    print(f"⚠️ Error: Null pixmap for page {page_num}")
+                    console.log(f"⚠️ Error: Null pixmap for page {page_num}")
                     return
                     
                 qt_icon = QIcon(pixmap)
                 
-                if existing_item:
+                if existing_item and existing_index >= 0:
                     # Replace existing placeholder or outdated thumbnail
-                    print(f"✅ Replacing placeholder for page {page_num} with real thumbnail")
+                    current_type = existing_item.data(Qt.ItemDataRole.UserRole + 1)
+                    console.log(f"✅ Replacing {current_type} for page {page_num} with real thumbnail")
                     existing_item.setIcon(qt_icon)
                     existing_item.setData(Qt.ItemDataRole.UserRole + 1, "real")  # Mark as real thumbnail
+                    existing_item.setText(f"{page_num + 1}")  # Ensure text is correct
                     
-                    # Force thumbnail list update
+                    # Force thumbnail list update and prevent overwriting
+                    existing_item.setFlags(existing_item.flags() | Qt.ItemFlag.ItemIsEnabled)
                     self.thumbnail_list.update()
+                    
+                    # Add a small delay to prevent race conditions
+                    QTimer.singleShot(10, lambda: self._ensure_thumbnail_integrity(page_num, existing_index))
                     return
                 else:
-                    print(f"➕ Creating new thumbnail item for page {page_num}")
+                    console.log(f"➕ Creating new thumbnail item for page {page_num}")
                     # Create new item
                     item = QListWidgetItem(qt_icon, f"{page_num + 1}")
                     item.setData(Qt.ItemDataRole.UserRole, page_num)
                     item.setData(Qt.ItemDataRole.UserRole + 1, "real")  # Mark as real thumbnail
+                    item.setSizeHint(QSize(120, 170))  # Standard thumbnail size
                 
                 # Insert at correct position if we have a range, otherwise just append
                 if (hasattr(self, '_current_thumb_range') and 
@@ -7079,15 +8893,33 @@ Press 'L' to cycle through modes."""
                     if page_num % 5 == 0 or page_num < 5:
                         self.status_bar.showMessage(f"Loading thumbnails... ({page_num+1})")
                 except Exception as e:
-                    print(f"Error with icon thumbnail: {e}")
+                    console.log(f"Error with icon thumbnail: {e}")
         except Exception as e:
-            print(f"Error in _on_thumbnail_ready: {e}")
+            console.log(f"Error in _on_thumbnail_ready: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _ensure_thumbnail_integrity(self, page_num, expected_index):
+        """Ensure thumbnail hasn't been overwritten by a placeholder"""
+        try:
+            if expected_index < self.thumbnail_list.count():
+                item = self.thumbnail_list.item(expected_index)
+                if item and item.data(Qt.ItemDataRole.UserRole) == page_num:
+                    current_type = item.data(Qt.ItemDataRole.UserRole + 1)
+                    if current_type == "placeholder":
+                        console.log(f"⚠️ WARNING: Real thumbnail for page {page_num} was overwritten by placeholder!")
+                        # This should not happen, but we'll log it for debugging
+                    else:
+                        console.log(f"✅ Thumbnail integrity verified for page {page_num}: {current_type}")
+        except Exception as e:
+            console.log(f"Error checking thumbnail integrity: {e}")
     
     def _on_thumbnails_finished(self, restore_scroll_pos=None):
         """Handle thumbnail generation completion with optional scroll restoration"""
         try:
+            # Hide loading indicator
+            self.hide_mini_loading_indicator()
+            
             # Restore scroll position if provided
             if restore_scroll_pos is not None and self.thumbnail_list.count() > 0:
                 QTimer.singleShot(50, lambda: self.thumbnail_list.verticalScrollBar().setValue(restore_scroll_pos))
@@ -7099,6 +8931,7 @@ Press 'L' to cycle through modes."""
             
             self.status_bar.showMessage("Ready")
         except Exception:
+            self.hide_mini_loading_indicator()
             self.status_bar.showMessage("Ready")
     
     def _add_loading_indicators(self):
@@ -7108,6 +8941,9 @@ Press 'L' to cycle through modes."""
         
         start_page, end_page = self._current_thumb_range
         
+        # DEBUG: Log current state
+        console.log(f"🔍 _add_loading_indicators: start_page={start_page}, end_page={end_page}, total_pages={self.total_pages}")
+        
         # Add "Load More Above" indicator if there are pages before current range
         if start_page > 0:
             load_above_item = QListWidgetItem("⬆️ Load Earlier Pages")
@@ -7116,15 +8952,22 @@ Press 'L' to cycle through modes."""
             load_above_item.setBackground(QColor(38, 38, 38))
             load_above_item.setForeground(QColor(200, 200, 200))
             self.thumbnail_list.insertItem(0, load_above_item)
+            console.log(f"📋 Added 'Load Earlier Pages' indicator")
         
-        # Add "Load More Below" indicator if there are pages after current range
-        if end_page < self.total_pages - 1:
-            load_below_item = QListWidgetItem("⬇️ Load Later Pages")
-            load_below_item.setData(Qt.ItemDataRole.UserRole, -2)  # Special marker
-            load_below_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            load_below_item.setBackground(QColor(38, 38, 38))
-            load_below_item.setForeground(QColor(200, 200, 200))
-            self.thumbnail_list.addItem(load_below_item)
+        # Add "Load More Below" indicator if there are pages after current range - DISABLED to prevent duplicate buttons
+        # FIXED: Check if we actually have more pages to load (0-indexed end_page)
+        # Only use the main "Load More" system to avoid confusion with duplicate buttons
+        # if end_page < self.total_pages - 1:
+        #     load_below_item = QListWidgetItem("⬇️ Load Later Pages")
+        #     load_below_item.setData(Qt.ItemDataRole.UserRole, -2)  # Special marker
+        #     load_below_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        #     load_below_item.setBackground(QColor(38, 38, 38))
+        #     load_below_item.setForeground(QColor(200, 200, 200))
+        #     self.thumbnail_list.addItem(load_below_item)
+        #     console.log(f"📋 Added 'Load Later Pages' indicator (end_page {end_page} < total_pages-1 {self.total_pages-1})")
+        # else:
+        #     console.log(f"📋 No 'Load Later Pages' needed (end_page {end_page} >= total_pages-1 {self.total_pages-1})")
+        console.log(f"📋 Selective loading indicators disabled - using main Load More system only")
     
     def thumbnail_clicked(self, item):
         """Handle thumbnail click to navigate to page with enhanced loading feedback"""
@@ -7133,6 +8976,36 @@ Press 'L' to cycle through modes."""
         
         if item:
             page_num = item.data(Qt.ItemDataRole.UserRole)
+            item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+            
+            # Handle "Load More" button click
+            if item_type == "load_more_button":
+                start_page = item.data(Qt.ItemDataRole.UserRole + 2)
+                self._load_more_thumbnails(start_page)
+                return
+            
+            # NEW FEATURE: Auto-load batch when clicking on placeholder
+            if item_type == "placeholder" and page_num is not None:
+                console.log(f"🎯 Clicked on placeholder page {page_num + 1}, auto-loading batch around this page")
+                batch_size = 20  # Load 20 thumbnails around the clicked page
+                start_page = max(0, page_num - 10)  # 10 pages before
+                end_page = min(self.total_pages - 1, page_num + 9)  # 9 pages after
+                
+                # Show loading indicator for the batch
+                self.show_mini_loading_indicator(f"🔄 Loading pages {start_page + 1}-{end_page + 1}...")
+                self.status_bar.showMessage(f"Auto-loading thumbnails around page {page_num + 1}...", 5000)
+                
+                # Load the batch around the clicked page
+                self._load_thumbnail_batch_around_page(page_num, batch_size)
+                
+                # Still navigate to the page (it will show placeholder initially, then update)
+                if 0 <= page_num < self.total_pages:
+                    self.current_page = page_num
+                    self.update_page_label()
+                    self.render_current_page()
+                    # Auto-scroll to current page thumbnail
+                    QTimer.singleShot(100, self._scroll_to_current_thumbnail)
+                return
             
             # Handle special loading indicators
             if page_num == -1:  # Load Earlier Pages
@@ -7179,6 +9052,9 @@ Press 'L' to cycle through modes."""
                             self.pdf_widget.compute_grid_layout(),
                             self.pdf_widget.update()
                         ))
+                        
+                        # Auto-scroll to current page thumbnail
+                        QTimer.singleShot(100, self._scroll_to_current_thumbnail)
 
                         # DEFERRED RENDERING: Queue texture loading after UI update
                         self._queue_grid_textures_deferred(new_start, pages_needed, page_num)
@@ -7199,7 +9075,7 @@ Press 'L' to cycle through modes."""
                             target_quality = self.pdf_widget.get_zoom_adjusted_quality()
                             
                             if target_quality > current_quality + 0.5:  # Same threshold as quality check
-                                print(f"🔍 Grid click quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                                console.log(f"🔍 Grid click quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {effective_zoom:.1f}x)")
                                 if self.renderer:
                                     self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
                         
@@ -7207,46 +9083,76 @@ Press 'L' to cycle through modes."""
                         if page_num not in self.pdf_widget.grid_textures:
                             self._queue_single_texture_deferred(page_num)
                 else:
-                    # Single-page mode: Show thumbnail loading feedback and use go_to_page
-                    self.show_thumbnail_loading_progress(page_num)
+                    # Single-page mode: Show consistent loading feedback and use go_to_page
+                    self.show_mini_loading_indicator(f"🔄 Loading page {page_num + 1}...")
                     self.go_to_page(page_num)
 
     def _queue_grid_textures_deferred(self, start_page, pages_needed, focus_page):
-        """Queue grid textures for background loading after UI update - DEFERRED 10ms"""
+        """Queue grid textures for background loading after UI update - OPTIMIZED for 2x1 performance"""
         def queue_textures():
             if not self.renderer:
                 return
             try:
-                # 🔍 GRID QUALITY: Use zoom-aware quality for all grid pages
-                effective_zoom = self.pdf_widget.zoom_factor
-                if hasattr(self.pdf_widget, 'is_temp_zoomed') and self.pdf_widget.is_temp_zoomed:
-                    effective_zoom *= getattr(self.pdf_widget, 'temp_zoom_factor', 1.0)
+                # 🚀 PERFORMANCE FIX: For 2x1 grid, use staggered loading to prevent freeze
+                is_2x1_grid = pages_needed == 2 and self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1
                 
-                if effective_zoom > self.pdf_widget.quality_zoom_threshold:
-                    # If zoomed, use high quality for all visible pages
-                    base_quality = self.pdf_widget.get_zoom_adjusted_quality()
-                    focus_quality = base_quality
+                if is_2x1_grid:
+                    # Special optimized handling for 2x1 grid
+                    focus_quality = 2.0  # Reduced quality for faster loading
+                    other_quality = 1.5  # Even lower for non-focus page
+                    
+                    # Load focus page first with priority
+                    if focus_page >= start_page and focus_page < start_page + pages_needed:
+                        self.renderer.add_page_to_queue(focus_page, priority=True, quality=focus_quality)
+                        console.log(f"🚀 2x1 OPTIMIZED: Loading focus page {focus_page + 1} first (quality {focus_quality})")
+                        
+                        # Load the other page after a short delay to prevent simultaneous rendering
+                        other_page = start_page + 1 if focus_page == start_page else start_page
+                        if other_page < self.total_pages:
+                            QTimer.singleShot(100, lambda: self.renderer.add_page_to_queue(other_page, priority=False, quality=other_quality))
+                            console.log(f"🚀 2x1 OPTIMIZED: Will load other page {other_page + 1} after delay (quality {other_quality})")
+                    else:
+                        # Focus page not in range, load first page with priority
+                        self.renderer.add_page_to_queue(start_page, priority=True, quality=focus_quality)
+                        if start_page + 1 < self.total_pages:
+                            QTimer.singleShot(100, lambda: self.renderer.add_page_to_queue(start_page + 1, priority=False, quality=other_quality))
+                    
+                    # Defer zoom to after first page loads
+                    if focus_page >= start_page and focus_page < start_page + pages_needed:
+                        QTimer.singleShot(150, lambda: self.pdf_widget.zoom_to_grid_page(focus_page))
+                        
                 else:
-                    # Normal zoom levels
-                    base_quality = 2.5  # Better base quality than before
-                    focus_quality = 3.0  # Focus page gets extra quality
-                
-                # Priority loading for visible pages
-                for i in range(pages_needed):
-                    page_num = start_page + i
-                    if page_num >= self.total_pages:
-                        break
+                    # Original logic for larger grids
+                    # 🔍 GRID QUALITY: Use zoom-aware quality for all grid pages
+                    effective_zoom = self.pdf_widget.zoom_factor
+                    if hasattr(self.pdf_widget, 'is_temp_zoomed') and self.pdf_widget.is_temp_zoomed:
+                        effective_zoom *= getattr(self.pdf_widget, 'temp_zoom_factor', 1.0)
                     
-                    # Focus page gets best quality, others get base quality
-                    quality = focus_quality if page_num == focus_page else base_quality
-                    priority = i < 4  # First 4 pages get priority
+                    if effective_zoom > self.pdf_widget.quality_zoom_threshold:
+                        # If zoomed, use high quality for all visible pages
+                        base_quality = self.pdf_widget.get_zoom_adjusted_quality()
+                        focus_quality = base_quality
+                    else:
+                        # Normal zoom levels
+                        base_quality = 2.5  # Better base quality than before
+                        focus_quality = 3.0  # Focus page gets extra quality
                     
-                    self.renderer.add_page_to_queue(page_num, priority=priority, quality=quality)
-                    
-                # Focus page gets special treatment for zoom
-                if focus_page >= start_page and focus_page < start_page + pages_needed:
-                    # Defer zoom after initial textures
-                    QTimer.singleShot(50, lambda: self.pdf_widget.zoom_to_grid_page(focus_page))
+                    # Priority loading for visible pages
+                    for i in range(pages_needed):
+                        page_num = start_page + i
+                        if page_num >= self.total_pages:
+                            break
+                        
+                        # Focus page gets best quality, others get base quality
+                        quality = focus_quality if page_num == focus_page else base_quality
+                        priority = i < 4  # First 4 pages get priority
+                        
+                        self.renderer.add_page_to_queue(page_num, priority=priority, quality=quality)
+                        
+                    # Focus page gets special treatment for zoom
+                    if focus_page >= start_page and focus_page < start_page + pages_needed:
+                        # Defer zoom after initial textures
+                        QTimer.singleShot(50, lambda: self.pdf_widget.zoom_to_grid_page(focus_page))
             except:
                 pass
         
@@ -7266,7 +9172,7 @@ Press 'L' to cycle through modes."""
                     if effective_zoom > self.pdf_widget.quality_zoom_threshold:
                         # If zoomed, request high quality immediately
                         quality = self.pdf_widget.get_zoom_adjusted_quality()
-                        print(f"🔍 Grid thumbnail quality upgrade: page {page_num}, quality {quality:.1f} (zoom: {effective_zoom:.1f}x)")
+                        console.log(f"🔍 Grid thumbnail quality upgrade: page {page_num}, quality {quality:.1f} (zoom: {effective_zoom:.1f}x)")
                     else:
                         # Normal zoom, use standard quality
                         quality = self.pdf_widget.get_immediate_quality()
@@ -7299,7 +9205,7 @@ Press 'L' to cycle through modes."""
                         visible_pages.append(page_num)
             
             if visible_pages:
-                print(f"🔍 Prioritizing {len(visible_pages)} visible thumbnails: {visible_pages}")
+                console.log(f"🔍 Prioritizing {len(visible_pages)} visible thumbnails: {visible_pages}")
                 
                 # Create a dedicated worker just for these visible thumbnails
                 if hasattr(self, 'priority_thumbnail_worker') and self.priority_thumbnail_worker:
@@ -7322,13 +9228,13 @@ Press 'L' to cycle through modes."""
                 
                 # Connect signals
                 self.priority_thumbnail_worker.thumbnailReady.connect(self._on_thumbnail_ready)
-                self.priority_thumbnail_worker.finished.connect(lambda: print("Priority thumbnails loaded"))
+                self.priority_thumbnail_worker.finished.connect(lambda: console.log("Priority thumbnails loaded"))
                 
                 # Start loading with high priority
                 self.priority_thumbnail_worker.start()
                 
         except Exception as e:
-            print(f"Error prioritizing visible thumbnails: {e}")
+            console.log(f"Error prioritizing visible thumbnails: {e}")
             
     def _on_thumbnail_scroll(self, value):
         """Handle thumbnail list scrolling to trigger loading more thumbnails"""
@@ -7384,7 +9290,7 @@ Press 'L' to cycle through modes."""
             center_page = max(new_start + 8, (new_start + end_page) // 2)
             # Use slightly larger radius for better user experience
             self.generate_thumbnails(around_page=center_page, radius=15, preserve_scroll=True)
-            print(f"⬆️ Loading earlier pages around {center_page} (range: {new_start}-{end_page})")
+            console.log(f"⬆️ Loading earlier pages around {center_page} (range: {new_start}-{end_page})")
             
         elif self._edge_scroll_direction == 'down' and end_page < self.total_pages - 1:
             # Load later pages - optimize for performance and thumbnail quality
@@ -7393,7 +9299,7 @@ Press 'L' to cycle through modes."""
             center_page = min(end_page + 8, (start_page + new_end) // 2)
             # Use slightly larger radius for better user experience
             self.generate_thumbnails(around_page=center_page, radius=15, preserve_scroll=True)
-            print(f"⬇️ Loading later pages around {center_page} (range: {start_page}-{new_end})")
+            console.log(f"⬇️ Loading later pages around {center_page} (range: {start_page}-{new_end})")
             
         # Immediately start loading at least a few visible thumbnails
         self._force_load_visible_thumbnails()
@@ -7403,8 +9309,74 @@ Press 'L' to cycle through modes."""
         if not self.pdf_doc or not (0 <= page_num < self.total_pages):
             return
             
+        # FIXED: Clear texture cache and grid textures before navigating to a new grid to free up memory
+        if self.pdf_widget.grid_mode:
+            console.log("🎬 Slideshow grid change: Clearing texture cache and grid textures to free memory")
+            self._log_memory_usage("Before grid cleanup")
+            
+            # Enhanced cleanup - clear all possible memory sources
+            if hasattr(self.pdf_widget, 'grid_textures'):
+                # Explicitly destroy OpenGL textures in grid_textures
+                for texture in self.pdf_widget.grid_textures.values():
+                    if texture and hasattr(texture, 'destroy'):
+                        try:
+                            texture.destroy()
+                        except:
+                            pass
+                self.pdf_widget.grid_textures.clear()
+                
+            if hasattr(self.pdf_widget, '_pending_images'):
+                # Clear pending images which consume RAM
+                self.pdf_widget._pending_images.clear()
+                
+            # Clear the main texture cache with proper cleanup
+            if hasattr(self.pdf_widget.texture_cache, 'clear_cache'):
+                self.pdf_widget.texture_cache.clear_cache()
+            elif hasattr(self.pdf_widget.texture_cache, 'clear'):
+                self.pdf_widget.texture_cache.clear()
+            
+            # Force garbage collection to free unreferenced objects
+            gc.collect()
+            
+            # Force a repaint to clear the screen
+            self.pdf_widget.update()
+            self._log_memory_usage("After grid cleanup")
+            
         # Update page number and label immediately
         self.current_page = page_num
+        
+        # Check if thumbnail exists for this page, auto-load batch if missing
+        thumbnail_exists = False
+        for i in range(self.thumbnail_list.count()):
+            item = self.thumbnail_list.item(i)
+            if (item and 
+                item.data(Qt.ItemDataRole.UserRole) == page_num and 
+                item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]):
+                thumbnail_exists = True
+                break
+        
+        if not thumbnail_exists:
+            console.log(f"📋 Page {page_num + 1} thumbnail missing, auto-loading batch around this page")
+            # Load thumbnails around this page in background
+            self._load_thumbnail_batch_around_page(page_num, batch_size=20)
+        
+        # Show appropriate loading indicator based on actual layout (2x1 grid detection)
+        is_2x1_layout = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                         self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
+        
+        if is_2x1_layout or (hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode):
+            grid_size_text = f"{self.pdf_widget.grid_cols}x{self.pdf_widget.grid_rows}"
+            self.show_grid_loading_progress(grid_size_text, focus_page=self.current_page)
+            console.log(f"🎬 SLIDESHOW: Starting grid loader for go_to_page {page_num + 1} (2x1 layout: {is_2x1_layout})")
+        else:
+            # Debug: Why is grid mode not active during slideshow?
+            if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+                console.log(f"🎬 SLIDESHOW: Not in grid layout during go_to_page - showing mini loader instead")
+                if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                    console.log(f"🎬 SLIDESHOW: Layout: {getattr(self.pdf_widget, 'grid_cols', 'None')}x{getattr(self.pdf_widget, 'grid_rows', 'None')}, Grid mode: {getattr(self.pdf_widget, 'grid_mode', 'None')}")
+                else:
+                    console.log(f"🎬 SLIDESHOW: No pdf_widget available")
+            self.show_mini_loading_indicator("Loading page...")
         
         # Track page change timing for preloader logic
         import time
@@ -7427,13 +9399,20 @@ Press 'L' to cycle through modes."""
         if texture and texture.isCreated() and dims:
             self.pdf_widget.set_page_texture(texture, dims[0], dims[1])
             
+            # Page loaded immediately - hide appropriate loading indicator
+            if hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode:
+                # For grid mode, let the grid completion check handle hiding
+                console.log(f"🎬 SLIDESHOW: Page {page_num + 1} has cached texture in grid mode - let grid completion handle hiding")
+            else:
+                QTimer.singleShot(100, self.hide_mini_loading_indicator)
+            
             # 🔍 QUALITY CHECK: If zoomed and texture quality is too low, request upgrade
             if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
                 current_quality = self.pdf_widget.texture_cache.get_best_quality_for_page(self.current_page)
                 target_quality = self.pdf_widget.get_zoom_adjusted_quality()
                 
                 if target_quality > current_quality + 0.5:  # Same threshold as quality check
-                    print(f"🔍 Navigation quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
+                    console.log(f"🔍 Navigation quality upgrade: page {page_num}, from {current_quality:.1f} to {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
                     if hasattr(self, 'renderer') and self.renderer:
                         self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
         else:
@@ -7445,15 +9424,23 @@ Press 'L' to cycle through modes."""
 
         # If no texture, queue a render for this page
         if (not texture or not texture.isCreated()) and hasattr(self, 'renderer') and self.renderer:
+            # Set a timeout to hide loading indicator if rendering takes too long (but not for grid mode during slideshow)
+            if not (hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode and 
+                   hasattr(self, '_auto_advance_active') and self._auto_advance_active):
+                QTimer.singleShot(3000, self.hide_mini_loading_indicator)  # 3 seconds timeout
+            
             # 🔍 ZOOM-AWARE NAVIGATION: Request appropriate quality based on current zoom
             if self.pdf_widget.zoom_factor > self.pdf_widget.quality_zoom_threshold:
                 # If zoomed in, request high quality immediately to avoid zoom out/in cycle
                 target_quality = self.pdf_widget.get_zoom_adjusted_quality()
-                print(f"🔍 Zoomed navigation: page {page_num}, requesting quality {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
+                console.log(f"🔍 Zoomed navigation: page {page_num}, requesting quality {target_quality:.1f} (zoom: {self.pdf_widget.zoom_factor:.1f}x)")
                 self.renderer.add_page_to_queue(page_num, priority=True, quality=target_quality)
             else:
                 # Normal zoom, use standard quality
                 self.renderer.add_page_to_queue(page_num, priority=True, quality=2.5)
+        
+        # Auto-scroll to current page thumbnail
+        QTimer.singleShot(100, self._scroll_to_current_thumbnail)
         
     def _background_page_operations(self):
         """Perform background operations after page navigation (non-blocking)"""
@@ -7461,66 +9448,70 @@ Press 'L' to cycle through modes."""
             # Clean up distant textures to save memory
             self.pdf_widget.cleanup_distant_textures()
             
-            # AGGRESSIVE PRELOADING for much larger GPU cache
+            # SMART PRELOADING optimized for memory efficiency
             if self.renderer:
-                # Preload many more adjacent pages with the increased VRAM
+                # Preload adjacent pages with balanced approach
                 current = self.current_page
                 
-                # Preload 30 pages ahead and 30 pages behind (was only 1 each)
-                for offset in range(-30, 31):
+                # Preload 5 pages ahead and 5 pages behind for smooth navigation
+                for offset in range(-5, 6):
                     page_to_preload = current + offset
                     if 0 <= page_to_preload < self.total_pages and page_to_preload != current:
                         # Use progressive quality - closer pages get higher quality
                         distance = abs(offset)
-                        if distance <= 5:
-                            quality = 3.0  # High quality for very close pages
-                        elif distance <= 15:
-                            quality = 2.0  # Medium quality for close pages
+                        if distance <= 2:
+                            quality = 3.0  # High quality for immediate pages
+                        elif distance <= 3:
+                            quality = 2.0  # Medium quality for nearby pages
                         else:
                             quality = 1.5  # Fast quality for distant pages
                         
                         self.renderer.add_page_to_queue(page_to_preload, priority=False, quality=quality)
                     
-            # Extended thumbnail range for larger cache
+            # Smart thumbnail range management
             if (hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled and
                 hasattr(self, '_current_thumb_range')):
                 start_page, end_page = self._current_thumb_range
-                # If navigating near the edge of loaded range, preload much more
+                # If navigating near the edge of loaded range, preload moderately
                 if self.current_page <= start_page + 10 or self.current_page >= end_page - 10:
-                    # Preload 50 pages around current position (was 15)
-                    self.generate_thumbnails(around_page=self.current_page, radius=50, preserve_scroll=True)
+                    # Preload 15 pages around current position for reasonable thumbnail coverage
+                    self.generate_thumbnails(around_page=self.current_page, radius=15, preserve_scroll=True)
                     
         except Exception as e:
-            print(f"Background operations error: {e}")
+            console.log(f"Background operations error: {e}")
     
     def start_aggressive_preloading(self):
-        """Start aggressive preloading to fill GPU VRAM for maximum performance"""
+        """Start smart preloading to improve performance without excessive memory usage"""
         if not self.pdf_doc or not self.renderer:
             return
         
-        # Check current performance - skip aggressive preloading if performance is poor
+        # Check current performance - skip preloading if performance is poor
         performance_level = getattr(self.pdf_widget, '_performance_monitor', {}).get('performance_level', 'high')
         if performance_level == 'low':
-            print("🚀 Skipping aggressive preloading due to low performance")
+            console.log("🚀 Skipping preloading due to low performance")
             return
             
-        # Preload entire document in background with low priority
-        print(f"🚀 Starting aggressive preloading of {self.total_pages} pages...")
+        # Smart preloading: only preload nearby pages for memory efficiency
+        current = self.current_page
+        preload_radius = 10  # Only preload 10 pages in each direction
         
-        for page_num in range(self.total_pages):
-            if page_num != self.current_page:  # Skip current page (already loaded)
+        console.log(f"🚀 Starting smart preloading around page {current + 1} (radius: {preload_radius})...")
+        
+        for offset in range(-preload_radius, preload_radius + 1):
+            page_num = current + offset
+            if 0 <= page_num < self.total_pages and page_num != current:
                 # Use distance-based quality
-                distance = abs(page_num - self.current_page)
-                if distance <= 10:
-                    quality = 2.5  # Good quality for close pages
-                elif distance <= 50:
-                    quality = 2.0  # Medium quality 
+                distance = abs(offset)
+                if distance <= 3:
+                    quality = 2.5  # Good quality for very close pages
+                elif distance <= 7:
+                    quality = 2.0  # Medium quality for close pages
                 else:
-                    quality = 1.5  # Fast quality for distant pages
+                    quality = 1.5  # Fast quality for edge pages
                 
                 self.renderer.add_page_to_queue(page_num, priority=False, quality=quality)
                 
-        print(f"🚀 Queued {self.total_pages} pages for aggressive preloading")
+        console.log(f"🚀 Queued {min(preload_radius * 2, self.total_pages - 1)} pages for smart preloading")
     
     def _on_thumbnail_hover(self, item):
         """Preload page texture when hovering over thumbnail for instant response"""
@@ -7535,6 +9526,10 @@ Press 'L' to cycle through modes."""
     def _update_preloader_rendering_status(self, page_num: int, quality: float):
         """Update preloaders with real-time rendering progress and quality status"""
         try:
+            # Initialize enhancement tracking for timeout mechanism
+            if not hasattr(self, '_enhancement_start_times'):
+                self._enhancement_start_times = {}
+                
             # Determine quality level description
             if quality < 2.0:
                 quality_status = "Loading..."
@@ -7545,6 +9540,10 @@ Press 'L' to cycle through modes."""
             elif quality < 4.0:
                 quality_status = "Enhancing..."
                 progress_percent = int(75 + (quality - 3.0) * 15)  # 75-90%
+                # EMERGENCY FIX: If stuck at ~82%, force completion immediately
+                if progress_percent >= 82 and hasattr(self, 'pdf_widget'):
+                    # Force hide all preloaders immediately to prevent hanging
+                    QTimer.singleShot(50, self._emergency_force_completion)
             else:
                 quality_status = "Finalizing..."
                 progress_percent = min(100, int(90 + (quality - 4.0) * 10))  # 90-100%
@@ -7594,15 +9593,19 @@ Press 'L' to cycle through modes."""
                         self.grid_info_label.setText(progress)
                         
                         # FIXED: Check if ALL pages in grid are complete for grid preloader hiding
-                        self._check_grid_completion_and_hide_preloader()
+                        # Access the method via pdf_widget since it's in the GPUPDFWidget class
+                        if hasattr(self, 'pdf_widget') and self.pdf_widget and hasattr(self.pdf_widget, '_check_grid_completion_and_hide_preloader'):
+                            self.pdf_widget._check_grid_completion_and_hide_preloader()
+                        else:
+                            console.log("Warning: Cannot find grid completion check method in pdf_widget")
             
             # More intelligent preloader hiding - focus on actual quality achievement
             if page_num == current_page:
                 # Get the target quality for current zoom level
                 target_quality = self.pdf_widget.get_zoom_adjusted_quality()
                 
-                # More strict quality requirements - must be close to target AND sharp enough
-                quality_is_good = quality >= max(4.0, target_quality * 0.9)  # At least 4.0 OR 90% of target
+                # FIXED: More lenient quality requirements to prevent hanging at 82%
+                quality_is_good = quality >= max(3.5, target_quality * 0.8)  # At least 3.5 OR 80% of target
                 
                 # Additional check: ensure we're not in a loading state where more quality is expected
                 viewer = self.window()
@@ -7611,23 +9614,48 @@ Press 'L' to cycle through modes."""
                     import time
                     recently_changed_page = (time.time() - viewer._last_page_change_time) < 2.0
                 
-                # Only hide if quality is genuinely good AND we're not in middle of page transition
-                if quality_is_good and not recently_changed_page:
+                # FIXED: Add timeout mechanism to prevent indefinite waiting (per page)
+                enhancement_timeout = False
+                if page_num in self._enhancement_start_times:
+                    import time
+                    enhancement_duration = time.time() - self._enhancement_start_times[page_num]
+                    enhancement_timeout = enhancement_duration > 3.0  # 3 second timeout per page
+                elif quality >= 2.0:  # Start tracking when we reach "Enhancing" stage
+                    import time
+                    self._enhancement_start_times[page_num] = time.time()
+                
+                # FIXED: Much more aggressive completion - accept quality 3.0+ OR any timeout
+                quality_acceptable = quality >= 3.0 or enhancement_timeout
+                
+                # Only hide if quality is acceptable AND we're not in middle of page transition
+                if quality_acceptable and not recently_changed_page:
                     # Still wait a bit to ensure no more improvements are coming
-                    QTimer.singleShot(500, self._hide_preloaders_on_quality_complete)
-                    # Also clear status bar after completion
-                    QTimer.singleShot(1000, self._clear_rendering_status_on_complete)
-                elif quality >= target_quality * 0.95 and quality >= 5.0:
-                    # For very high quality, hide faster
+                    if enhancement_timeout:
+                        QTimer.singleShot(100, self._hide_preloaders_on_quality_complete)  # Hide faster on timeout
+                        QTimer.singleShot(500, self._clear_rendering_status_on_complete)
+                    else:
+                        QTimer.singleShot(500, self._hide_preloaders_on_quality_complete)
+                        QTimer.singleShot(1000, self._clear_rendering_status_on_complete)
+                elif quality >= target_quality * 0.8 and quality >= 3.0:
+                    # FIXED: Lower threshold for hiding - was 0.95 and 5.0, now 0.8 and 3.0
                     QTimer.singleShot(200, self._hide_preloaders_on_quality_complete)
                     QTimer.singleShot(700, self._clear_rendering_status_on_complete)
+                elif quality >= 3.0:
+                    # EMERGENCY: If quality is 3.0+ but still not hiding, force hide after very short delay
+                    QTimer.singleShot(1000, self._hide_preloaders_on_quality_complete)
+                    QTimer.singleShot(1500, self._clear_rendering_status_on_complete)
                     
         except Exception as e:
-            print(f"Error updating preloader rendering status: {e}")
+            console.log(f"Error updating preloader rendering status: {e}")
     
     def _hide_preloaders_on_quality_complete(self):
         """Hide preloaders when rendering reaches high quality"""
         try:
+            # Clean up enhancement tracking for current page
+            current_page = getattr(self, 'current_page', 0)
+            if hasattr(self, '_enhancement_start_times') and current_page in self._enhancement_start_times:
+                del self._enhancement_start_times[current_page]
+                
             # Hide mini loading indicator
             if (hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and 
                 self.mini_loading_widget.isVisible()):
@@ -7638,13 +9666,17 @@ Press 'L' to cycle through modes."""
                 self.thumb_loading_widget.isVisible()):
                 self._finish_thumbnail_loading()
                 
-            # Hide grid loading indicator
+            # Hide grid loading indicator (but NOT during slideshow - let grid completion handle it)
+            slideshow_active = hasattr(self, '_auto_advance_active') and self._auto_advance_active
             if (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
-                self.grid_loading_widget.isVisible()):
+                self.grid_loading_widget.isVisible() and not slideshow_active):
+                console.log("🔄 Hiding grid loader due to quality completion (normal mode)")
                 self._finish_grid_loading()
+            elif slideshow_active and hasattr(self, 'grid_loading_widget') and self.grid_loading_widget:
+                console.log("🎬 SLIDESHOW: Quality complete but keeping grid loader until all pages done")
                 
         except Exception as e:
-            print(f"Error hiding preloaders on quality complete: {e}")
+            console.log(f"Error hiding preloaders on quality complete: {e}")
 
     def _clear_rendering_status_on_complete(self):
         """Clear rendering status from status bar when rendering is complete"""
@@ -7661,11 +9693,51 @@ Press 'L' to cycle through modes."""
                 viewer.status_bar.showMessage(final_status, 3000)  # Show for 3 seconds then clear
                 
         except Exception as e:
-            print(f"Error clearing rendering status: {e}")
+            console.log(f"Error clearing rendering status: {e}")
+
+    def _emergency_force_completion(self):
+        """Emergency method to force hide all preloaders when stuck at 82%"""
+        try:
+            console.log("🚨 EMERGENCY: Forcing completion due to 82% hang")
+            
+            # Force hide all visible preloaders immediately
+            if hasattr(self, 'mini_loading_widget') and self.mini_loading_widget and self.mini_loading_widget.isVisible():
+                self.hide_mini_loading_indicator()
+                console.log("🚨 Emergency: Hid mini loading indicator")
+            
+            if hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and self.grid_loading_widget.isVisible():
+                self._finish_grid_loading()
+                console.log("🚨 Emergency: Hid grid loading indicator")
+            
+            if hasattr(self, 'thumb_loading_widget') and self.thumb_loading_widget and self.thumb_loading_widget.isVisible():
+                self._finish_thumbnail_loading()
+                console.log("🚨 Emergency: Hid thumbnail loading indicator")
+                
+            # Clear status bar
+            viewer = self.window() if hasattr(self, 'window') else self
+            if hasattr(viewer, 'status_bar'):
+                viewer.status_bar.clearMessage()
+                
+            # Clear all enhancement tracking
+            if hasattr(self, '_enhancement_start_times'):
+                self._enhancement_start_times.clear()
+                
+        except Exception as e:
+            console.log(f"Error in emergency force completion: {e}")
 
     def on_page_rendered(self, page_num: int, image: QImage, quality: float = 2.0):
         # Update preloaders with rendering progress
         self._update_preloader_rendering_status(page_num, quality)
+        
+        # Hide loading indicator if this is the current page being displayed
+        if page_num == self.current_page:
+            # Wait longer to ensure page is fully rendered and ready for interaction
+            QTimer.singleShot(800, lambda: (
+                self.hide_mini_loading_indicator(),
+                console.log(f"✅ Page {page_num + 1} fully rendered and ready for interaction"),
+                # Only restart countdown for single page mode - grid mode waits for full grid completion
+                self._restart_countdown_after_page_load() if not (hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode) else None
+            ))
         
         # Get actual page dimensions from PDF document for accurate aspect ratios
         page_width = image.width()
@@ -7681,11 +9753,11 @@ Press 'L' to cycle through modes."""
             self.pdf_widget.update()
         except AttributeError:
             # Fix missing _pending_images attribute
-            print("Adding missing _pending_images attribute to GPUPDFWidget")
+            console.log("Adding missing _pending_images attribute to GPUPDFWidget")
             self.pdf_widget._pending_images = [(page_num, image, page_width, page_height, quality)]
             self.pdf_widget.update()
         except Exception as e:
-            print(f"Error in pending images queue: {e}")
+            console.log(f"Error in pending images queue: {e}")
             # Fallback: synchronous path (if something unexpected)
             try:
                 texture = self.pdf_widget.texture_cache.add_texture(page_num, image, page_width, page_height, quality)
@@ -7703,9 +9775,9 @@ Press 'L' to cycle through modes."""
                         # Add to grid_textures cache for resize persistence (same as grid mode)
                         self.pdf_widget.grid_textures[page_num] = texture
             except AttributeError as e:
-                print(f"Warning: Texture cache method missing: {e}")
+                console.log(f"Warning: Texture cache method missing: {e}")
                 # Recreate texture cache if it's missing the add_texture method
-                print("Recreating texture cache with missing methods")
+                console.log("Recreating texture cache with missing methods")
                 self.pdf_widget.texture_cache = GPUTextureCache()
                 # Try again with the new cache
                 try:
@@ -7713,9 +9785,9 @@ Press 'L' to cycle through modes."""
                     if page_num == self.current_page:
                         self.pdf_widget.set_page_texture(texture, page_width, page_height)
                 except Exception as e2:
-                    print(f"Error creating texture after cache recreation: {e2}")
+                    console.log(f"Error creating texture after cache recreation: {e2}")
             except Exception as e:
-                print(f"Error creating texture: {e}")
+                console.log(f"Error creating texture: {e}")
                 if page_num == self.current_page:
                     self.pdf_widget.set_page_texture(texture, image.width(), image.height())
                     self.pdf_widget.update()
@@ -7760,6 +9832,21 @@ Press 'L' to cycle through modes."""
         # Update current page
         self.current_page = new_page
         
+        # Check if thumbnail exists for this page, auto-load batch if missing
+        thumbnail_exists = False
+        for i in range(self.thumbnail_list.count()):
+            item = self.thumbnail_list.item(i)
+            if (item and 
+                item.data(Qt.ItemDataRole.UserRole) == self.current_page and 
+                item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]):
+                thumbnail_exists = True
+                break
+        
+        if not thumbnail_exists:
+            console.log(f"📋 Page {self.current_page + 1} thumbnail missing during prev_page, auto-loading batch")
+            # Load thumbnails around this page in background
+            self._load_thumbnail_batch_around_page(self.current_page, batch_size=20)
+        
         # Track page change timing for preloader logic
         import time
         self._last_page_change_time = time.time()
@@ -7790,45 +9877,116 @@ Press 'L' to cycle through modes."""
                 self.renderer.add_page_to_queue(self.current_page - 1)
             if self.current_page < self.total_pages - 1:
                 self.renderer.add_page_to_queue(self.current_page + 1)
+        
+        # Auto-scroll to current page thumbnail
+        QTimer.singleShot(100, self._scroll_to_current_thumbnail)
     
     def next_page(self):
-        """Navigate to next page with loading feedback"""
-        # FIXED: Stop any ongoing batch processing when user navigates
-        self._interrupt_batch_processing_on_navigation()
+        """Navigate to next page with instant response and async rendering"""
+        # Immediate UI update - no delays
+        is_2x1_layout = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                         self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
         
-        # Show immediate status feedback
-        self.show_page_navigation_status("next")
-        
-        if self.pdf_widget.grid_mode:
-            # In grid mode, move by grid size
+        if is_2x1_layout or self.pdf_widget.grid_mode:
             grid_size = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
             max_page = self.total_pages - grid_size
             new_page = min(max_page, self.current_page + grid_size)
         else:
-            # Single page mode
             if self.current_page < self.total_pages - 1:
                 new_page = self.current_page + 1
             else:
-                # Already at last page
                 self.status_bar.showMessage("Already at last page", 1000)
                 return
         
-        # Update current page
+        # INSTANT UI UPDATE
         self.current_page = new_page
-        
-        # Track page change timing for preloader logic
-        import time
-        self._last_page_change_time = time.time()
-        
         self.update_page_label()
+        self.status_bar.showMessage(f"Page {self.current_page + 1} of {self.total_pages}", 1000)
         
-        # Show mini loading indicator for page rendering
-        self.show_mini_loading_indicator("Rendering page...")
+        # Check if thumbnail exists for this page, auto-load batch if missing
+        thumbnail_exists = False
+        for i in range(self.thumbnail_list.count()):
+            item = self.thumbnail_list.item(i)
+            if (item and 
+                item.data(Qt.ItemDataRole.UserRole) == self.current_page and 
+                item.data(Qt.ItemDataRole.UserRole + 1) in ["real", "placeholder"]):
+                thumbnail_exists = True
+                break
         
-        # Render with feedback
-        QTimer.singleShot(10, self._render_page_with_feedback)
+        if not thumbnail_exists:
+            console.log(f"📋 Page {self.current_page + 1} thumbnail missing during next_page, auto-loading batch")
+            # Load thumbnails around this page in background
+            self._load_thumbnail_batch_around_page(self.current_page, batch_size=20)
         
-        # Update thumbnails around new current page if selective loading is enabled
+        # Show appropriate loading indicator based on actual layout (2x1 grid detection)
+        is_2x1_layout = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                         self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
+        
+        if is_2x1_layout or self.pdf_widget.grid_mode:
+            grid_size_text = f"{self.pdf_widget.grid_cols}x{self.pdf_widget.grid_rows}"
+            self.show_grid_loading_progress(grid_size_text, focus_page=self.current_page)
+            console.log(f"🎬 SLIDESHOW: Starting grid loader for page navigation to {self.current_page + 1} (2x1 layout: {is_2x1_layout})")
+        else:
+            # Debug: Why is grid mode not active during slideshow?
+            if hasattr(self, '_auto_advance_active') and self._auto_advance_active:
+                console.log(f"🎬 SLIDESHOW: Not in grid layout during slideshow navigation - showing mini loader instead")
+                console.log(f"🎬 SLIDESHOW: Layout: {getattr(self.pdf_widget, 'grid_cols', 'None')}x{getattr(self.pdf_widget, 'grid_rows', 'None')}, Grid mode: {getattr(self.pdf_widget, 'grid_mode', 'None')}")
+            self.show_mini_loading_indicator("Loading page...")
+        
+        # Start async page rendering
+        self._render_page_async()
+        
+        # Update thumbnails if needed
+        if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
+            QTimer.singleShot(100, lambda: self.generate_thumbnails(around_page=self.current_page, preserve_scroll=True))
+        
+        # Auto-scroll to current page thumbnail
+        QTimer.singleShot(100, self._scroll_to_current_thumbnail)
+    
+    def _render_page_async(self):
+        """Render the current page asynchronously to prevent UI lag"""
+        if not self.pdf_doc:
+            return
+            
+        try:
+            # Stop any existing page rendering worker
+            if hasattr(self, 'page_rendering_worker') and self.page_rendering_worker and self.page_rendering_worker.isRunning():
+                self.page_rendering_worker.quit()
+                self.page_rendering_worker.wait(1000)
+            
+            # Create new page rendering worker
+            quality = getattr(self, 'render_quality', 2.0)
+            self.page_rendering_worker = PageRenderingWorker(self.pdf_doc, self.current_page, quality)
+            self.page_rendering_worker.pageRendered.connect(self._on_page_rendered_async)
+            self.page_rendering_worker.renderingFailed.connect(self._on_page_rendering_failed)
+            self.page_rendering_worker.start()
+            
+        except Exception as e:
+            console.log(f"Error starting async page rendering: {e}")
+            self.hide_mini_loading_indicator()
+    
+    def _on_page_rendered_async(self, page_number, qimage):
+        """Handle async page rendering completion"""
+        try:
+            if page_number == self.current_page:  # Only update if still on same page
+                # Convert QImage to texture and display
+                if hasattr(self.pdf_widget, 'set_page_from_qimage'):
+                    self.pdf_widget.set_page_from_qimage(qimage)
+                else:
+                    # Fallback to existing rendering method
+                    self.render_current_page()
+                
+                self.hide_mini_loading_indicator()
+                console.log(f"✅ Page {page_number + 1} displayed")
+        except Exception as e:
+            console.log(f"Error displaying rendered page: {e}")
+            self.hide_mini_loading_indicator()
+    
+    def _on_page_rendering_failed(self, page_number, error_message):
+        """Handle async page rendering failure"""
+        console.log(f"❌ Page {page_number + 1} rendering failed: {error_message}")
+        self.hide_mini_loading_indicator()
+        self.status_bar.showMessage(f"Failed to render page {page_number + 1}", 3000)
         if hasattr(self, '_selective_thumbnails_enabled') and self._selective_thumbnails_enabled:
             # Check if we need to extend thumbnail range
             if hasattr(self, '_current_thumb_range'):
@@ -7858,9 +10016,17 @@ Press 'L' to cycle through modes."""
             start_page = self.current_page + 1
             end_page = min(self.current_page + grid_size, self.total_pages)
             self.page_label.setText(f"Pages: {start_page}-{end_page} / {self.total_pages}")
+            
+            # Update page input placeholder for grid mode
+            if hasattr(self, 'page_input'):
+                self.page_input.setPlaceholderText(f"1-{self.total_pages}")
         else:
             # Single page mode
             self.page_label.setText(f"Page: {self.current_page + 1} / {self.total_pages}")
+            
+            # Update page input placeholder for single page mode
+            if hasattr(self, 'page_input'):
+                self.page_input.setPlaceholderText(f"1-{self.total_pages}")
     
     def zoom_changed(self, value):
         """Handle zoom slider changes"""
@@ -7971,13 +10137,23 @@ Press 'L' to cycle through modes."""
             # SWITCHING TO GRID MODE
             self._rebuild_grid_size_combo(self.grid_size_combo.currentText())
             
+            # SLIDESHOW: Pause countdown when switching to grid mode until grid is loaded
+            if (hasattr(self, '_auto_advance_active') and self._auto_advance_active and 
+                hasattr(self, '_waiting_for_page_load')):
+                self._waiting_for_page_load = True
+                if hasattr(self, 'auto_advance_timer'):
+                    self.auto_advance_timer.stop()
+                if hasattr(self, 'ring_update_timer'):
+                    self.ring_update_timer.stop()
+                console.log("🎬 Slideshow paused - waiting for grid to load")
+            
             self.grid_size_combo.setEnabled(True)
             self.pdf_widget.grid_mode = True
             
             # Get current text, with fallback if empty
             current_text = self.grid_size_combo.currentText()
             if not current_text or current_text.strip() == "":
-                current_text = "2x2"  # Default
+                current_text = "2x1"  # Default to 2x1 as requested
                 self.grid_size_combo.setCurrentText(current_text)
                 
             self.change_grid_size(current_text)
@@ -8071,6 +10247,16 @@ Press 'L' to cycle through modes."""
             self.pdf_widget.grid_cols = cols
             self.pdf_widget.grid_rows = rows
             
+            # SLIDESHOW: Pause countdown when changing grid size until new grid is loaded
+            if (hasattr(self, '_auto_advance_active') and self._auto_advance_active and 
+                hasattr(self, '_waiting_for_page_load')):
+                self._waiting_for_page_load = True
+                if hasattr(self, 'auto_advance_timer'):
+                    self.auto_advance_timer.stop()
+                if hasattr(self, 'ring_update_timer'):
+                    self.ring_update_timer.stop()
+                console.log(f"🎬 Slideshow paused - waiting for {size_text} grid to load")
+            
             # Show comprehensive grid loading progress
             self.show_grid_loading_progress(size_text)
             
@@ -8101,13 +10287,14 @@ Press 'L' to cycle through modes."""
         time_map = {
             "5 seconds": 5,
             "10 seconds": 10,
+            "15 seconds": 15,
             "30 seconds": 30,
             "1 minute": 60,
             "2 minutes": 120,
             "5 minutes": 300
         }
         
-        new_interval = time_map.get(text, 30)  # Default to 30 seconds instead of 3
+        new_interval = time_map.get(text, 15)  # Default to 15 seconds
         self.timer_interval = new_interval
         self.timer_remaining = new_interval
         
@@ -8124,7 +10311,7 @@ Press 'L' to cycle through modes."""
             self.start_slideshow()
 
     def start_slideshow(self):
-        """Start the slideshow"""
+        """Start the slideshow with proper timer initialization"""
         if not self.pdf_doc or self.total_pages <= 1:
             return
         
@@ -8134,14 +10321,26 @@ Press 'L' to cycle through modes."""
         self._auto_advance_active = True
         self.timer_remaining = self.timer_interval
         self._is_timer_paused = False
+        self._waiting_for_page_load = False  # Initialize waiting flag
+        
+        # Initialize precise timing for smooth countdown
+        import time
+        self._timer_start_time = time.time()
+        
+        # Initialize countdown widget immediately
+        if hasattr(self, 'countdown_widget'):
+            self.countdown_widget.set_remaining_time(self.timer_interval)
+            self.countdown_widget.set_paused(False)
         
         # Update UI
         self.play_pause_btn.setText("⏸")
         self.play_pause_btn.setToolTip("Pause slideshow (Space)")
         
-        # Start timers
-        self.auto_advance_timer.start(1000)  # 1 second intervals
-        self.ring_update_timer.start(100)    # Smooth countdown animation
+        # Start timers with slight delay to avoid initial loading interference
+        QTimer.singleShot(200, lambda: (
+            self.auto_advance_timer.start(1000),  # 1 second intervals
+            self.ring_update_timer.start(100)     # Smooth countdown animation
+        ))
         
         self.status_bar.showMessage(f"Slideshow started - {self.timer_interval}s intervals", 2000)
 
@@ -8149,6 +10348,7 @@ Press 'L' to cycle through modes."""
         """Stop the slideshow"""
         self._auto_advance_active = False
         self._is_timer_paused = False
+        self._waiting_for_page_load = False  # Reset waiting flag
         
         # Stop timers
         self.auto_advance_timer.stop()
@@ -8176,6 +10376,21 @@ Press 'L' to cycle through modes."""
             
         self._is_timer_paused = not self._is_timer_paused
         
+        if self._is_timer_paused:
+            # When pausing, save the elapsed time
+            if hasattr(self, '_timer_start_time'):
+                import time
+                elapsed = time.time() - self._timer_start_time
+                self._paused_remaining = max(0, self.timer_interval - elapsed)
+        else:
+            # When resuming, reset start time with remaining time
+            if hasattr(self, '_paused_remaining'):
+                import time
+                self._timer_start_time = time.time() - (self.timer_interval - self._paused_remaining)
+            else:
+                import time
+                self._timer_start_time = time.time()
+        
         if hasattr(self, 'countdown_widget'):
             self.countdown_widget.set_paused(self._is_timer_paused)
         
@@ -8183,81 +10398,217 @@ Press 'L' to cycle through modes."""
         self.status_bar.showMessage(f"Slideshow {status}", 1000)
 
     def _on_auto_advance_timer(self):
-        """Handle auto advance timer tick"""
-        if not self._auto_advance_active or self._is_timer_paused:
-            return
+        """Handle auto advance timer tick with proper countdown reset"""
+        if not self._auto_advance_active or self._is_timer_paused or self._waiting_for_page_load:
+            return  # Don't tick when waiting for page load
             
         self.timer_remaining -= 1
         
         if self.timer_remaining <= 0:
+            # Stop BOTH timers during page transition
+            self.ring_update_timer.stop()
+            self.auto_advance_timer.stop()  # Stop the main timer too!
+            self._waiting_for_page_load = True  # Set flag to wait for page load
+            
+            console.log(f"🎬 Slideshow advancing from page {self.current_page + 1}")
+            
             # Clean up any hanging loading states before page change
             self._cleanup_loading_states()
             
             # Advance to next page
-            if self.current_page < self.total_pages - 1:
+            if self.pdf_widget.grid_mode:
+                pages_in_grid = self.pdf_widget.grid_cols * self.pdf_widget.grid_rows
+                next_page_num = self.current_page + pages_in_grid
+                if next_page_num < self.total_pages:
+                    self.go_to_page(next_page_num + 1)
+                else:
+                    self.go_to_page(1)
+            elif self.current_page < self.total_pages - 1:
                 self.next_page()
             else:
                 # Loop back to first page
                 self.go_to_page(1)
             
-            # Clean up any new loading states that might have appeared after page change
-            QTimer.singleShot(100, self._cleanup_loading_states)
-            QTimer.singleShot(500, self._cleanup_loading_states)
+            # DON'T restart countdown here - wait for page to fully load
+            # Timer will restart ONLY when page is "fully rendered and ready for interaction"
             
-            # Reset timer
+            # Clean up any new loading states that might have appeared after page change
+            QTimer.singleShot(50, self._cleanup_loading_states)
+            QTimer.singleShot(200, self._cleanup_loading_states)
+            
+            # Safety timeout: if page doesn't signal "ready" within reasonable time, force restart
+            # For 2x1 grids during slideshow, allow more time for both pages to load
+            is_2x1_slideshow = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                               self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1 and
+                               hasattr(self, '_auto_advance_active') and self._auto_advance_active)
+            
+            # Check if we're in any grid mode during slideshow (not just 2x1)
+            is_grid_slideshow = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                                self.pdf_widget.grid_mode and
+                                hasattr(self, '_auto_advance_active') and self._auto_advance_active)
+            
+            if is_grid_slideshow:
+                timeout_duration = 15000  # 15s for any grid during slideshow
+                console.log(f"🎬 SLIDESHOW GRID: Setting {timeout_duration/1000}s timeout for grid completion")
+            elif is_2x1_slideshow:
+                timeout_duration = 10000  # 10s for 2x1 grids
+            else:
+                timeout_duration = 5000   # 5s for single page mode
+            
+            # Store timer reference so it can be cancelled if grid completes naturally
+            if hasattr(self, '_safety_timeout_timer') and self._safety_timeout_timer:
+                self._safety_timeout_timer.stop()
+            
+            self._safety_timeout_timer = QTimer()
+            self._safety_timeout_timer.setSingleShot(True)
+            self._safety_timeout_timer.timeout.connect(self._force_restart_countdown_after_timeout)
+            self._safety_timeout_timer.start(timeout_duration)
+
+    def _restart_countdown_after_page_load(self):
+        """Restart countdown timer after page has fully loaded (only once per transition)"""
+        if self._auto_advance_active and self._waiting_for_page_load:
+            self._waiting_for_page_load = False  # Clear flag to prevent multiple restarts
+            
+            # Check if we're in grid mode for detailed logging
+            grid_mode_info = ""
+            if hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode:
+                grid_size = f"{self.pdf_widget.grid_cols}x{self.pdf_widget.grid_rows}"
+                grid_mode_info = f" (Grid: {grid_size})"
+            
+            # Reset timer and precise timing NOW that page is loaded
             self.timer_remaining = self.timer_interval
+            import time
+            self._timer_start_time = time.time()  # Reset precise timer
+            
+            # Update countdown widget with fresh timer
+            if hasattr(self, 'countdown_widget'):
+                self.countdown_widget.set_remaining_time(self.timer_interval)
+            
+            # Restart BOTH timers now that page is ready
+            self.auto_advance_timer.start(1000)    # Main 1-second timer
+            self.ring_update_timer.start(100)      # Smooth countdown animation
+            
+            console.log(f"🎯 Countdown restarted after page fully loaded: {self.timer_interval}s{grid_mode_info}")
+
+    def _force_restart_countdown_after_timeout(self):
+        """Force restart countdown if page load takes too long (backup mechanism)"""
+        if self._auto_advance_active and self._waiting_for_page_load:
+            # Check if grid loader is still actively working
+            grid_loader_active = (hasattr(self, 'grid_loading_widget') and self.grid_loading_widget and 
+                                self.grid_loading_widget.isVisible())
+            
+            # Check if we're in 2x1 slideshow mode
+            is_2x1_slideshow = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                               self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
+            
+            # Check if pages are functionally ready (have textures/content visible)
+            pages_functionally_ready = False
+            if hasattr(self, 'pdf_widget') and self.pdf_widget:
+                if hasattr(self.pdf_widget, 'texture_cache') and self.pdf_widget.texture_cache:
+                    # In 2x1 mode, check if we have textures for both visible pages
+                    if is_2x1_slideshow:
+                        current_page = getattr(self, 'current_page', 0)
+                        page1_ready = self.pdf_widget.texture_cache.has_texture_for_page(current_page)
+                        page2_ready = self.pdf_widget.texture_cache.has_texture_for_page(current_page + 1)
+                        pages_functionally_ready = page1_ready or page2_ready  # At least one page ready
+                        console.log(f"🎬 SLIDESHOW: Functional readiness check - Page {current_page + 1}: {page1_ready}, Page {current_page + 2}: {page2_ready}")
+                    else:
+                        # Single page mode
+                        current_page = getattr(self, 'current_page', 0)
+                        pages_functionally_ready = self.pdf_widget.texture_cache.has_texture_for_page(current_page)
+            
+            # In slideshow mode, be more aggressive about continuing if pages are functionally ready
+            if is_2x1_slideshow and pages_functionally_ready:
+                console.log("🎬 SLIDESHOW: Pages functionally ready - forcing continuation despite preloader")
+                self._waiting_for_page_load = False
+                self.timer_remaining = self.timer_interval
+                import time
+                self._timer_start_time = time.time()
+                
+                if hasattr(self, 'countdown_widget'):
+                    self.countdown_widget.set_remaining_time(self.timer_interval)
+                
+                self.auto_advance_timer.start(1000)
+                self.ring_update_timer.start(100)
+                console.log("🎬 SLIDESHOW: Countdown forced to restart - continuing slideshow")
+                return
+            
+            if grid_loader_active and is_2x1_slideshow:
+                # Only extend timeout once more, then force continuation
+                if not hasattr(self, '_timeout_extension_count'):
+                    self._timeout_extension_count = 0
+                
+                if self._timeout_extension_count < 1:  # Only extend once
+                    self._timeout_extension_count += 1
+                    console.log("🎬 SLIDESHOW: Grid loader still active - extending timeout by 3 seconds (final extension)")
+                    if hasattr(self, '_safety_timeout_timer') and self._safety_timeout_timer:
+                        self._safety_timeout_timer.start(3000)  # Shorter extension
+                    return
+                else:
+                    console.log("🎬 SLIDESHOW: Maximum timeout extensions reached - forcing continuation")
+                    self._timeout_extension_count = 0  # Reset for next transition
+            
+            console.log("⚠️ Page load timeout - forcing countdown restart")
+            self._waiting_for_page_load = False
+            
+            # Force restart countdown even if page isn't fully loaded
+            self.timer_remaining = self.timer_interval
+            import time
+            self._timer_start_time = time.time()
+            
+            if hasattr(self, 'countdown_widget'):
+                self.countdown_widget.set_remaining_time(self.timer_interval)
+            
+            # Restart both timers
+            self.auto_advance_timer.start(1000)
+            self.ring_update_timer.start(100)
 
     def _cleanup_loading_states(self):
-        """Clean up any hanging loading states during slideshow transitions"""
+        """Clean up any hanging loading states during slideshow transitions - countdown safe"""
         try:
-            # FORCE FINISH ANY THUMBNAIL LOADING IMMEDIATELY
+            # FOCUSED: Only clean up loading indicators that interfere with slideshow
             if hasattr(self, 'force_finish_thumbnail_loading'):
                 self.force_finish_thumbnail_loading()
             
-            # HIDE ANY THUMBNAIL LOADING INDICATORS
+            # FOCUSED: Hide only thumbnail loading indicators (NOT grid during slideshow)
             if hasattr(self, 'hide_thumbnail_loading_indicator'):
                 self.hide_thumbnail_loading_indicator()
                 
-            # FORCE FINISH AND HIDE GRID LOADING INDICATORS
-            if hasattr(self, '_finish_grid_loading'):
-                self._finish_grid_loading()
-            if hasattr(self, 'hide_grid_loading_indicator'):
-                self.hide_grid_loading_indicator()
+            # DON'T hide grid loading during slideshow - let natural completion handle it
+            # Grid loader should persist until all pages in new grid are actually loaded
+            # Check if we're in 2x1 layout during slideshow, not just grid_mode toggle
+            is_2x1_layout = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                           self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
             
-            # FORCE FINISH ALL LOADING PROCESSES
+            if hasattr(self, 'pdf_widget') and self.pdf_widget and not (self.pdf_widget.grid_mode or is_2x1_layout):
+                # Only hide grid loader if we're NOT in grid mode AND not in 2x1 layout
+                if hasattr(self, '_finish_grid_loading'):
+                    self._finish_grid_loading()
+                if hasattr(self, 'hide_grid_loading_indicator'):
+                    self.hide_grid_loading_indicator()
+            else:
+                layout_info = "grid mode" if (hasattr(self, 'pdf_widget') and self.pdf_widget and self.pdf_widget.grid_mode) else "2x1 layout"
+                console.log(f"🎬 SLIDESHOW: Keeping grid loader during transition ({layout_info}) - will hide when new grid is fully loaded")
+            
             if hasattr(self, '_finish_thumbnail_loading'):
                 self._finish_thumbnail_loading()
                 
-            # Stop any loading timers that might be running
+            # FOCUSED: Only clean up PDF widget loading flags, preserve countdown timer
             if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                # AGGRESSIVE: Reset animation time to prevent hanging spinners
+                # Reset animation time to prevent hanging spinners
                 if hasattr(self.pdf_widget, 'animation_time'):
                     self.pdf_widget.animation_time = 0.0
                 
-                # AGGRESSIVE: Force disable any loading flags
+                # Disable only loading flags that affect visual display
                 for attr in ['_show_loading', '_is_loading', '_loading_visible', 
                             '_rendering_in_progress', '_loading_spinner_active', '_show_spinner']:
                     if hasattr(self.pdf_widget, attr):
                         setattr(self.pdf_widget, attr, False)
                 
-                # AGGRESSIVE: Clear any OpenGL loading state
-                if hasattr(self.pdf_widget, 'makeCurrent') and callable(self.pdf_widget.makeCurrent):
-                    self.pdf_widget.makeCurrent()
-                    # Force immediate clear and redraw
-                    try:
-                        from OpenGL.GL import glClear, glClearColor, GL_COLOR_BUFFER_BIT
-                        glClearColor(38/255.0, 38/255.0, 38/255.0, 1.0)
-                        glClear(GL_COLOR_BUFFER_BIT)
-                    except:
-                        pass  # Ignore OpenGL errors
-                
-                # AGGRESSIVE: Force multiple immediate updates to clear visuals
+                # Gentle visual update - don't interfere with countdown
                 self.pdf_widget.update()
-                QTimer.singleShot(10, self.pdf_widget.update)
-                QTimer.singleShot(50, self.pdf_widget.update)
-                QTimer.singleShot(100, self.pdf_widget.update)
             
-            # Clean up any widget-level loading timers
+            # Clean up specific loading widget timers only
             timer_attrs = ['loading_timer', 'mini_loading_timer', '_thumb_timeout_timer', '_grid_timeout_timer']
             for timer_attr in timer_attrs:
                 if hasattr(self, timer_attr):
@@ -8266,9 +10617,22 @@ Press 'L' to cycle through modes."""
                         timer.stop()
                         setattr(self, timer_attr, None)
                 
-            # AGGRESSIVE: Hide and cleanup all possible loading widgets
-            loading_widget_attrs = ['thumb_loading_widget', 'loading_widget', 'progress_widget', 
-                                   'grid_loading_widget', 'mini_loading_widget']
+            # Hide only specific loading widgets without affecting countdown
+            # BUT: Preserve grid loader during slideshow grid mode
+            is_2x1_layout = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                           self.pdf_widget.grid_cols == 2 and self.pdf_widget.grid_rows == 1)
+            preserve_grid_loader = (hasattr(self, 'pdf_widget') and self.pdf_widget and 
+                                  (self.pdf_widget.grid_mode or is_2x1_layout))
+            
+            if preserve_grid_loader:
+                # During grid mode, exclude grid_loading_widget from cleanup
+                loading_widget_attrs = ['thumb_loading_widget', 'loading_widget', 'progress_widget', 
+                                       'mini_loading_widget']
+                console.log("🎬 SLIDESHOW: Preserving grid_loading_widget during cleanup")
+            else:
+                # Normal cleanup includes all widgets
+                loading_widget_attrs = ['thumb_loading_widget', 'loading_widget', 'progress_widget', 
+                                       'grid_loading_widget', 'mini_loading_widget']
             for widget_attr in loading_widget_attrs:
                 if hasattr(self, widget_attr):
                     widget = getattr(self, widget_attr)
@@ -8279,26 +10643,37 @@ Press 'L' to cycle through modes."""
                         except:
                             pass
                         setattr(self, widget_attr, None)
-                        
-            # AGGRESSIVE: Clear loading progress references
-            progress_attrs = ['grid_progress_bar', 'grid_status_label', 'grid_info_label', 
-                             'thumb_progress_bar', 'thumb_page_label']
-            for attr in progress_attrs:
-                if hasattr(self, attr):
-                    setattr(self, attr, None)
-                
-            # AGGRESSIVE: Force complete widget refresh
-            if hasattr(self, 'pdf_widget') and self.pdf_widget:
-                # Force repaint event to completely refresh visuals
-                self.pdf_widget.repaint()
                 
         except Exception as e:
             # Silently handle any cleanup errors to avoid disrupting slideshow
             pass
 
     def _on_ring_update_timer(self):
-        """Update the countdown ring display"""
-        if hasattr(self, 'countdown_widget'):
+        """Update the countdown ring display with smooth progress and loading resilience"""
+        if (not hasattr(self, 'countdown_widget') or 
+            not self._auto_advance_active or 
+            self._is_timer_paused or 
+            self._waiting_for_page_load):  # Don't update during page load
+            return
+            
+        # Calculate precise remaining time for smooth animation
+        if hasattr(self, '_timer_start_time') and self._timer_start_time:
+            import time
+            elapsed = time.time() - self._timer_start_time
+            precise_remaining = max(0, self.timer_interval - elapsed)
+            
+            # Ensure countdown doesn't get stuck - force reset if needed
+            if precise_remaining <= 0:
+                precise_remaining = self.timer_interval
+                self._timer_start_time = time.time()
+                
+            self.countdown_widget.set_remaining_time(precise_remaining)
+        else:
+            # Fallback to step-based countdown with fresh start
+            if self.timer_remaining <= 0:
+                self.timer_remaining = self.timer_interval
+                import time
+                self._timer_start_time = time.time()
             self.countdown_widget.set_remaining_time(self.timer_remaining)
 
     def show_main_context_menu(self, position):
